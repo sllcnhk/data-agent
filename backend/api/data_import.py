@@ -302,7 +302,31 @@ async def get_job_status(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. 历史任务列表
+# 6. 删除任务记录
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.delete("/jobs/{job_id}")
+async def delete_job(
+    job_id: str,
+    current_user=Depends(require_permission("data", "import")),
+    db: Session = Depends(get_db),
+):
+    """删除指定导入任务记录（不影响已导入的数据）"""
+    from backend.models.import_job import ImportJob
+
+    job = db.query(ImportJob).filter(ImportJob.id == job_id).first()
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"任务不存在: {job_id}",
+        )
+    db.delete(job)
+    db.commit()
+    return {"success": True}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. 历史任务列表
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/jobs")

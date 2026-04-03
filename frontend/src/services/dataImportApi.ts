@@ -156,4 +156,9 @@ export const dataImportApi = {
     });
     return res.data?.data;
   },
+
+  /** 删除任务记录（不影响已导入数据） */
+  deleteJob: async (jobId: string): Promise<void> => {
+    await apiClient.delete(`/data-import/jobs/${jobId}`);
+  },
 };

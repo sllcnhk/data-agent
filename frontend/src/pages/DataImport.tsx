@@ -21,6 +21,7 @@ import {
   Input,
   message,
   Pagination,
+  Popconfirm,
   Popover,
   Progress,
   Row,
@@ -39,6 +40,7 @@ import {
   CheckCircleOutlined,
   CloseCircleOutlined,
   CloudUploadOutlined,
+  DeleteOutlined,
   ImportOutlined,
   LoadingOutlined,
   ReloadOutlined,
@@ -354,6 +356,35 @@ const DataImportPage: React.FC = () => {
           </Popover>
         ) : null,
     },
+    {
+      title: '操作',
+      width: 60,
+      render: (_: any, r: ImportJobStatus) => (
+        <Popconfirm
+          title="确认删除该任务记录？"
+          description="仅删除记录，不影响已导入的数据。"
+          onConfirm={async () => {
+            try {
+              await dataImportApi.deleteJob(r.job_id);
+              message.success('已删除');
+              loadHistory(historyPage);
+            } catch (e: any) {
+              message.error(`删除失败: ${e?.response?.data?.detail ?? e.message}`);
+            }
+          }}
+          okText="删除"
+          okButtonProps={{ danger: true }}
+          cancelText="取消"
+        >
+          <Button
+            type="text"
+            danger
+            size="small"
+            icon={<DeleteOutlined />}
+          />
+        </Popconfirm>
+      ),
+    },
   ];
 
 
@@ -437,6 +468,11 @@ const DataImportPage: React.FC = () => {
             </Upload.Dragger>
             <div style={{ marginTop: 24 }}>
               <Button onClick={() => setStep(0)} style={{ marginRight: 8 }}>上一步</Button>
+              {uploadId && (
+                <Button type="primary" onClick={() => setStep(2)}>
+                  下一步
+                </Button>
+              )}
             </div>
           </div>
         )}
