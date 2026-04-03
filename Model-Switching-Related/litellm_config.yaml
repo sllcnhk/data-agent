@@ -1,0 +1,50 @@
+model_list:
+  # ── Anthropic Claude（直连官方） ──────────────────────────────
+  - model_name: claude-sonnet-46
+    litellm_params:
+      model: claude/claude-sonnet-4-6
+      api_key: sk-ant-YOUR_ANTHROPIC_KEY_HERE
+
+  - model_name: claude-opus-46
+    litellm_params:
+      model: claude/claude-opus-4-6
+      api_key: sk-ant-YOUR_ANTHROPIC_KEY_HERE
+
+  # ── 阿里云千问 Qwen ───────────────────────────────────────────
+  - model_name: qwen-coder-plus
+    litellm_params:
+      model: openai/qwen-coder-plus
+      api_key: sk-YOUR_DASHSCOPE_KEY_HERE
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+  - model_name: qwen-coder-turbo
+    litellm_params:
+      model: openai/qwen-coder-turbo
+      api_key: sk-YOUR_DASHSCOPE_KEY_HERE
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+  - model_name: qwen-max
+    litellm_params:
+      model: openai/qwen-max
+      api_key: sk-YOUR_DASHSCOPE_KEY_HERE
+      api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+  # ── DeepSeek ─────────────────────────────────────────────────
+  - model_name: deepseek-coder
+    litellm_params:
+      model: openai/deepseek-coder
+      api_key: sk-YOUR_DEEPSEEK_KEY_HERE
+      api_base: https://api.deepseek.com/v1
+
+  - model_name: deepseek-chat
+    litellm_params:
+      model: openai/deepseek-chat
+      api_key: sk-YOUR_DEEPSEEK_KEY_HERE
+      api_base: https://api.deepseek.com/v1
+
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+
+general_settings:
+  master_key: "local-proxy-secret"

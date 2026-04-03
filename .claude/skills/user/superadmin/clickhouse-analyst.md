@@ -1,0 +1,297 @@
+# SKILL: clickhouse-analyst
+# 触发词: clickhouse, 外呼, 呼叫, 接通, answering machine, 计费, billing, policyid, 阶梯计费, 账单
+
+## 角色定位
+ClickHouse 外呼业务数据分析专家，熟悉多区域 SaaS 平台（SG/IDN/BR/MY/THAI/MX/SG-AZURE）的数据库结构、计费规则体系与外呼通话指标分析。
+
+---
+
+## 一、环境映射
+
+| 环境标识 | 区域 | ClickHouse 服务器 |
+|---------|------|-----------------|
+| SG | 新加坡 | clickhouse-sg |
+| IDN | 印度尼西亚 | clickhouse-idn |
+| BR | 巴西 | clickhouse-br |
+| MY | 马来西亚 | clickhouse-my |
+| THAI | 泰国 | clickhouse-thai |
+| MX | 墨西哥 | clickhouse-mx |
+| SG-AZURE | 新加坡(Azure) | clickhouse-sg-azure |
+
+- 所有环境主数据库名：`crm`
+- 遍历所有环境时，依次对每个环境执行相同查询逻辑
+
+---
+
+## 二、核心业务表
+
+### 1. 外呼通话记录表
+```
+crm.realtime_dwd_crm_call_record
+```
+| 关键字段 | 说明 |
+|---------|------|
+| `enterprise_id` | 企业ID |
+| `call_start_time` | 通话开始时间（分区/过滤字段） |
+| `call_code` | 通话结果编码（Nullable(String) 类型） |
+| `call_code_type` | 通话结果类型编码（Int 类型） |
+| `call_duration` | 通话总时长 |
+| `ai_call_duration` | AI通话时长 |
+| `agent_call_duration` | 坐席通话时长 |
+| `template_code` | 话术模板编码 |
+
+**call_code 枚举值说明：**
+| call_code | 业务含义 |
+|-----------|---------|
+| `'19'` | 未接通/拒接 |
+| `'5'` | 其他未接通 |
+| `'486'` | SIP 486 忙音 |
+| `'903'` | 超时/无应答 |
+
+> ⚠️ **重要**：`call_code` 字段类型为 `Nullable(String)`，过滤时必须使用字符串字面量，**不可用整数**（会导致 Code 386 类型错误）。
+
+**call_code_type 枚举值说明（用于 Connected/AM 判断，优先使用此字段）：**
+| call_code_type | 业务含义 |
+|----------------|---------|
+| `1`, `16` | **Connected（接通）** — 使用 `call_code_type IN (1, 16)` |
+| `22` | **Answering Machine（答录机/AM）** — 使用 `call_code_type = 22` |
+
+> ⚠️ **重要**：`call_code_type` 为整数类型，过滤时直接使用整数，**不加引号**。
+
+---
+
+### 2. 企业计费规则表
+```
+crm.realtime_ods_cost_data_payment_rule_ent
+```
+| 关键字段 | 说明 |
+|---------|------|
+| `enterprise_id` | 企业ID |
+| `enterprise_name` | 企业名称 |
+| `policy_id` | 计费策略ID |
+| `rule` | 计费规则 JSON 字段（核心） |
+| `create_time` / `update_time` | 规则创建/更新时间 |
+
+> ⚠️ **重要**：同一 `enterprise_id` 可能存在多行规则记录，**只取最新规则**（按 `update_time` 或 `create_time` 降序取第一条）。
+
+---
+
+## 三、计费规则业务知识
+
+### 3.1 多 PolicyId 规则识别
+
+**定义**：`rule` 字段为 JSON 数组，其中每个对象可能含 `policyId` 字段。若该 JSON 数组中存在 **2个或以上不同的 `policyId` 值**，则该企业为"多PolicyId计费"。
+
+**判断逻辑：**
+- ✅ 单 PolicyId：所有对象的 `policyId` 均为 `599` → **只有1个policyId**
+- ✅ 多 PolicyId：对象中出现 `599`、`600`、`601` → **有3个不同policyId**
+- ✅ 无 `policyId` 字段的对象（如 `{"balanceType":100,"busType":1,"costUnit":500}`）：**忽略，不计入统计**
+
+**ClickHouse SQL 识别方法**（字符串正则提取，兼容旧版本）：
+```sql
+-- 从 rule JSON 中提取所有 policyId 值，统计不同值的数量
+WITH latest_rule AS (
+    SELECT
+        enterprise_id,
+        enterprise_name,
+        rule,
+        ROW_NUMBER() OVER (PARTITION BY enterprise_id ORDER BY update_time DESC) AS rn
+    FROM crm.realtime_ods_cost_data_payment_rule_ent
+    WHERE rule LIKE '%policyId%'
+),
+extracted AS (
+    SELECT
+        enterprise_id,
+        enterprise_name,
+        arrayDistinct(
+            extractAll(rule, '"policyId"\\s*:\\s*(\\d+)')
+        ) AS policy_ids,
+        length(arrayDistinct(
+            extractAll(rule, '"policyId"\\s*:\\s*(\\d+)')
+        )) AS policy_count
+    FROM latest_rule
+    WHERE rn = 1
+)
+SELECT *
+FROM extracted
+WHERE policy_count >= 2
+ORDER BY policy_count DESC
+```
+
+---
+
+### 3.2 阶梯计费规则识别
+
+**定义**：`rule` 字段的 JSON 中含有 `tierRule` 关键字，则该企业配置了**阶梯计费**。
+
+**识别方法：**
+```sql
+-- 阶梯计费企业识别（取最新规则）
+WITH latest_rule AS (
+    SELECT
+        enterprise_id,
+        enterprise_name,
+        rule,
+        ROW_NUMBER() OVER (PARTITION BY enterprise_id ORDER BY update_time DESC) AS rn
+    FROM crm.realtime_ods_cost_data_payment_rule_ent
+)
+SELECT
+    enterprise_id,
+    enterprise_name,
+    rule
+FROM latest_rule
+WHERE rn = 1
+  AND rule LIKE '%tierRule%'
+```
+
+**阶梯类型说明（`tierRule.type` 字段）：**
+| type值 | 含义 |
+|--------|------|
+| `0` | 累进阶梯（每档费率只对该档内的量生效） |
+| `1` | 全量阶梯（达到某档后，所有量按该档费率计算） |
+| `2` | 固定阶梯（按区间固定费率） |
+
+---
+
+### 3.3 最新规则取法（标准写法）
+
+```sql
+-- 方法1：ROW_NUMBER 窗口函数（推荐）
+WITH latest AS (
+    SELECT *,
+        ROW_NUMBER() OVER (PARTITION BY enterprise_id ORDER BY update_time DESC) AS rn
+    FROM crm.realtime_ods_cost_data_payment_rule_ent
+)
+SELECT * FROM latest WHERE rn = 1;
+
+-- 方法2：子查询 MAX（备用）
+SELECT t.*
+FROM crm.realtime_ods_cost_data_payment_rule_ent t
+INNER JOIN (
+    SELECT enterprise_id, max(update_time) AS max_time
+    FROM crm.realtime_ods_cost_data_payment_rule_ent
+    GROUP BY enterprise_id
+) latest ON t.enterprise_id = latest.enterprise_id
+       AND t.update_time = latest.max_time;
+```
+
+---
+
+## 四、标准分析模板
+
+### 4.1 多PolicyId企业 + 外呼数据联合查询
+
+```sql
+-- Step1: 识别多PolicyId企业（最新规则）
+WITH latest_rule AS (
+    SELECT
+        enterprise_id,
+        enterprise_name,
+        rule,
+        ROW_NUMBER() OVER (PARTITION BY enterprise_id ORDER BY update_time DESC) AS rn
+    FROM crm.realtime_ods_cost_data_payment_rule_ent
+    WHERE rule LIKE '%policyId%'
+),
+multi_policy_ent AS (
+    SELECT
+        enterprise_id,
+        enterprise_name,
+        arrayDistinct(extractAll(rule, '"policyId"\\s*:\\s*(\\d+)')) AS policy_ids,
+        length(arrayDistinct(extractAll(rule, '"policyId"\\s*:\\s*(\\d+)'))) AS policy_count
+    FROM latest_rule
+    WHERE rn = 1
+      AND length(arrayDistinct(extractAll(rule, '"policyId"\\s*:\\s*(\\d+)'))) >= 2
+),
+-- Step2: 统计外呼数据
+call_stats AS (
+    SELECT
+        enterprise_id,
+        countIf(call_code_type IN (1, 16)) AS connected_calls,
+        countIf(call_code_type = 22) AS am_calls,
+        count() AS total_calls
+    FROM crm.realtime_dwd_crm_call_record
+    WHERE call_start_time >= '2025-03-01 00:00:00'
+      AND call_start_time < '2025-03-30 00:00:00'
+      AND (call_code_type IN (1, 16) OR call_code_type = 22)
+    GROUP BY enterprise_id
+)
+-- Step3: 关联输出
+SELECT
+    e.enterprise_name,
+    e.policy_count,
+    arrayStringConcat(e.policy_ids, ',') AS policy_ids,
+    c.connected_calls,
+    c.am_calls,
+    c.total_calls,
+    round(c.connected_calls / c.total_calls * 100, 2) AS connect_rate_pct,
+    round(c.am_calls / c.total_calls * 100, 2) AS am_rate_pct
+FROM multi_policy_ent e
+INNER JOIN call_stats c ON e.enterprise_id = c.enterprise_id
+ORDER BY c.total_calls DESC
+```
+
+---
+
+### 4.2 阶梯计费企业 + 外呼数据联合查询
+
+```sql
+WITH latest_rule AS (
+    SELECT
+        enterprise_id,
+        enterprise_name,
+        rule,
+        ROW_NUMBER() OVER (PARTITION BY enterprise_id ORDER BY update_time DESC) AS rn
+    FROM crm.realtime_ods_cost_data_payment_rule_ent
+),
+tier_ent AS (
+    SELECT enterprise_id, enterprise_name, rule
+    FROM latest_rule
+    WHERE rn = 1 AND rule LIKE '%tierRule%'
+),
+call_stats AS (
+    SELECT
+        enterprise_id,
+        countIf(call_code_type IN (1, 16)) AS connected_calls,
+        countIf(call_code_type = 22) AS am_calls
+    FROM crm.realtime_dwd_crm_call_record
+    WHERE call_start_time >= '2025-02-01 00:00:00'
+      AND call_start_time < '2025-03-30 00:00:00'
+      AND (call_code_type IN (1, 16) OR call_code_type = 22)
+    GROUP BY enterprise_id
+)
+SELECT
+    t.enterprise_name,
+    c.connected_calls,
+    c.am_calls,
+    t.rule
+FROM tier_ent t
+INNER JOIN call_stats c ON t.enterprise_id = c.enterprise_id
+ORDER BY (c.connected_calls + c.am_calls) DESC
+```
+
+---
+
+## 五、常见注意事项
+
+1. **call_code 类型问题**：永远使用字符串比较 `call_code = '12'`，不用整数
+2. **最新规则**：同企业多行规则时，必须取 `update_time` 最大的一行
+3. **JSON提取兼容性**：旧版ClickHouse不支持 `JSONExtractKeys`，使用 `extractAll` + 正则替代
+4. **分区过滤**：外呼记录表查询必须带时间范围条件，避免全表扫描
+5. **接通/AM判断**：优先使用 `call_code_type` 整数字段：Connected = `call_code_type IN (1, 16)`，Answering Machine = `call_code_type = 22`
+6. **THAI环境AM**：THAI环境 `call_code_type=22` 可能为0，疑似枚举定义差异，需额外确认
+7. **MY环境异常**：Seamoney MY 出现 AM 占比 99.99% 异常，排查时需关注号码质量问题
+8. **SG-AZURE**：该环境通常无计费规则配置或企业数量极少，可最后处理
+
+---
+
+## 六、输出报告规范
+
+分析报告标准结构：
+1. **统计口径说明**（时间范围、过滤条件、最新规则取法）
+2. **各环境汇总表**（环境 | 企业数 | Connected | AM | 接通率）
+3. **企业明细表**（环境 | 企业名 | PolicyId数/阶梯类型 | Connected | AM | 接通率）
+4. **Top N 企业排名**（按外呼总量）
+5. **异常企业标注**（接通率极低 / AM占比异常 / 疑似测试账号）
+6. **业务洞察 & 建议**
+
+报告文件写入路径：`superadmin/reports/`（文件系统根目录已指向 customer_data/，勿重复写 customer_data/ 前缀）

@@ -1,0 +1,83 @@
+"""
+测试配置
+
+提供测试用的pytest fixtures
+"""
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from backend.config.database import Base
+
+# 使用内存数据库进行测试
+TEST_DATABASE_URL = "sqlite:///./test.db"
+
+
+@pytest.fixture(scope="session")
+def test_engine():
+    """创建测试数据库引擎"""
+    engine = create_engine(
+        TEST_DATABASE_URL,
+        connect_args={"check_same_thread": False}
+    )
+    Base.metadata.create_all(bind=engine)
+    yield engine
+    Base.metadata.drop_all(bind=engine)
+
+
+@pytest.fixture
+def test_db(test_engine):
+    """创建测试数据库会话"""
+    Session = sessionmaker(bind=test_engine)
+    session = Session()
+    yield session
+    session.close()
+
+
+@pytest.fixture
+def sample_conversation():
+    """示例对话数据"""
+    from backend.models.conversation import Conversation
+    return Conversation(
+        title="测试对话",
+        current_model="claude-3-5-sonnet",
+        status="active",
+        message_count=0,
+        total_messages=0,
+        total_tokens=0,
+        metadata={}
+    )
+
+
+@pytest.fixture
+def sample_task():
+    """示例任务数据"""
+    from backend.models.task import Task, TaskType, TaskStatus
+    return Task(
+        name="测试任务",
+        task_type=TaskType.DATA_EXPORT,
+        status=TaskStatus.PENDING,
+        priority=0,
+        config={},
+        input_data={},
+        metadata={},
+        tags=[]
+    )
+
+
+@pytest.fixture
+def sample_report():
+    """示例报表数据"""
+    from backend.models.report import Report, ReportType
+    return Report(
+        name="测试报表",
+        report_type=ReportType.DASHBOARD,
+        description="这是一个测试报表",
+        theme="light",
+        share_scope="private",
+        auto_refresh=False,
+        view_count=0,
+        cache_enabled=True,
+        cache_ttl=300,
+        tags=[],
+        metadata={}
+    )

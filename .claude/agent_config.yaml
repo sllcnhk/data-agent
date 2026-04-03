@@ -1,0 +1,64 @@
+# ============================================================
+# Agent MCP 连接绑定配置
+# ============================================================
+#
+# 此文件控制每类 Agent 能访问哪些 ClickHouse 连接（权限级别）
+# 以及允许访问哪些 ClickHouse 环境。
+#
+# 字段说明：
+#   max_iterations: 该 Agent 单次对话最多允许的 LLM 推理轮次（工具调用 + 续写）
+#     不配置时使用内置默认值（etl_engineer=15, analyst=30, general=20）
+#     设置过小会导致复杂任务被截断；过大增加响应延迟和成本
+#
+#   clickhouse_connection:
+#     admin    — 使用高权限连接（clickhouse-{env}）
+#                对应 .env 中 CLICKHOUSE_{ENV}_* 凭据
+#                具有建表、写入、删除等完整权限
+#     readonly — 使用只读连接（clickhouse-{env}-ro）
+#                对应 .env 中 CLICKHOUSE_{ENV}_READONLY_* 凭据
+#                仅允许 SELECT 查询
+#                若只读凭据未配置，自动降级使用 admin 连接并输出 WARNING
+#
+#   clickhouse_envs: 允许该 Agent 访问的 ClickHouse 环境列表
+#     all（或不配置）— 自动包含所有已注册的 ClickHouse 环境，推荐
+#     [idn, sg, ...]  — 显式指定，限制到特定环境
+#
+#   excluded_non_ch_servers: 从该 Agent 可见工具中排除的非 ClickHouse 服务器列表
+#     不配置（或空）— 所有非 CH 服务器均可访问（filesystem、lark 等）
+#     [filesystem]   — 排除 filesystem，防止 LLM 误用本地文件探索代替数据库探索
+#
+# 注意：
+#   - 非 ClickHouse 的 MCP 服务器（filesystem、lark 等）默认对所有 Agent 可访问。
+#   - excluded_non_ch_servers 可按 Agent 精确控制非 CH 工具可见性。
+#   - 修改此文件后需重启后端服务生效。
+# ============================================================
+
+version: "1.0"
+
+agents:
+
+  # 数据加工工程师 — 负责 ETL、建表、数据写入
+  # 需要 admin 权限以执行 DDL/DML 操作
+  etl_engineer:
+    max_iterations: 15         # ETL 任务结构化，15 轮足够；停滞检测会提前终止死循环
+    clickhouse_connection: admin
+    clickhouse_envs: all       # 自动包含所有已注册环境，新增 env 无需修改此文件
+    # filesystem 可访问，由 FilesystemPermissionProxy 限制写权限到:
+    #   customer_data/ (读写) + .claude/skills/user/ (读写) + .claude/skills/ (只读)
+
+  # 数据分析师 — 负责数据查询与报表分析
+  # 使用只读连接，从数据库用户层面防止误操作
+  # filesystem 可访问: 可读技能文件、可写 customer_data/ 导出结果
+  # 写权限由 FilesystemPermissionProxy 限制（不允许写项目源代码）
+  analyst:
+    max_iterations: 30         # 表关系探索、多表 JOIN 分析可能需要 20+ 轮工具调用
+    clickhouse_connection: readonly
+    clickhouse_envs: all       # 自动包含所有已注册环境
+
+  # 通用助手 — 普通对话 / 问答 / 技能管理等
+  # filesystem 可访问: 可读技能文件、可写 customer_data/ 和用户技能目录
+  # 写权限由 FilesystemPermissionProxy 限制（不允许写项目源代码）
+  general:
+    max_iterations: 20         # 通用对话兼顾复杂度与效率
+    clickhouse_connection: readonly
+    clickhouse_envs: all       # 自动包含所有已注册环境

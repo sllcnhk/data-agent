@@ -1,0 +1,116 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Helvetica Neue', Helvetica, Arial, sans-serif, 'Apple Color Emoji',
+    'Segoe UI Emoji', 'Segoe UI Symbol';
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.code {
+  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New', monospace;
+}
+
+.page-header {
+  margin-bottom: 24px;
+  background: #fff;
+  padding: 16px 24px;
+  box-shadow: 0 1px 4px rgba(0, 21, 41, 0.08);
+}
+
+.stat-card {
+  margin-bottom: 16px;
+}
+
+.stat-card .ant-card-body {
+  padding: 20px;
+}
+
+.chart-container {
+  margin-top: 24px;
+  background: #fff;
+  padding: 24px;
+  border-radius: 8px;
+  box-shadow: 0 1px 4px rgba(0, 21, 41, 0.08);
+}
+
+.agent-card {
+  margin-bottom: 16px;
+  cursor: pointer;
+  transition: all 0.3s;
+}
+
+.agent-card:hover {
+  box-shadow: 0 4px 12px rgba(0, 21, 41, 0.15);
+  transform: translateY(-2px);
+}
+
+.task-item {
+  padding: 16px;
+  background: #fff;
+  margin-bottom: 8px;
+  border-radius: 6px;
+  border: 1px solid #f0f0f0;
+  transition: all 0.3s;
+}
+
+.task-item:hover {
+  border-color: #1890ff;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.task-status {
+  display: inline-block;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.task-status.pending {
+  background: #f0f0f0;
+  color: #666;
+}
+
+.task-status.running {
+  background: #e6f7ff;
+  color: #1890ff;
+}
+
+.task-status.completed {
+  background: #f6ffed;
+  color: #52c41a;
+}
+
+.task-status.failed {
+  background: #fff2f0;
+  color: #ff4d4f;
+}
+
+.loading-container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 400px;
+}
+
+.empty-state {
+  text-align: center;
+  padding: 60px 0;
+  color: #999;
+}
+
+.empty-state svg {
+  font-size: 64px;
+  margin-bottom: 16px;
+}

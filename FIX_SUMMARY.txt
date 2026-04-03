@@ -1,0 +1,64 @@
+================================================================================
+Max Tokens 修复总结 - 快速参考
+================================================================================
+
+问题: 重启后回复还是很短就断了
+
+根本原因（3个问题）:
+  1. 数据库字段是字符串 '8192'，不是整数 8192
+  2. 代码缺少类型转换，传给 API 的是字符串
+  3. claude.py 默认值是 1024（太小！），其他地方是 4096
+
+修复内容:
+  [OK] 添加类型转换：数据库 → Service → Agent → Adapter → API
+  [OK] 所有默认值统一改为 8192
+  [OK] claude.py 默认值从 1024 改为 8192（关键修复）
+  [OK] 多层防御：每一层都验证类型
+
+修改的文件（8个）:
+  1. backend/services/conversation_service.py - 类型转换 + 默认值
+  2. backend/agents/orchestrator.py - 类型转换 + 默认值
+  3. backend/core/model_adapters/claude.py - 类型转换 + 1024→8192
+  4. backend/core/model_adapters/base.py - 类型转换 + 默认值
+  5. backend/core/model_adapters/qianwen.py - 类型转换 + 默认值
+  6. backend/core/model_adapters/doubao.py - 类型转换 + 默认值
+  7. backend/api/llm_configs.py - 默认值（2处）
+  8. + 之前的配置文件（.env, settings.py, llm_config.py）
+
+验证结果:
+  [PASS] 数据库配置值: '8192' (str)
+  [PASS] 类型转换: 8192 (int)
+  [PASS] 快速测试通过
+
+下一步: 重启后端服务
+
+  方式1（推荐）:
+    cd C:\Users\shiguangping\data-agent
+    restart_backend.bat
+
+  方式2（完全重启）:
+    stop-all.bat
+    start-all.bat
+
+验证方法:
+  1. 查看启动日志，确认 max_tokens: 8192
+  2. 测试详细问题，验证完整输出
+  3. 不需要多次"继续"
+
+测试问题:
+  "请详细解释 Python 装饰器，包括基本概念、实现原理、多种使用方式、
+   带参数的装饰器、类装饰器、functools.wraps 的作用，以及实际应用
+   场景和最佳实践。请提供完整代码示例和详细说明。"
+
+预期效果:
+  修复前: 约 700-800 字被截断，需要多次"继续"
+  修复后: 一次性输出 6000-8000 字，完整回答
+
+详细文档:
+  - MAX_TOKENS_COMPLETE_FIX.md - 完整修复报告
+  - MAX_TOKENS_UPGRADE_REPORT.md - 初步分析报告
+
+================================================================================
+状态: ✅ 修复完成，等待重启验证
+日期: 2026-02-02
+================================================================================
