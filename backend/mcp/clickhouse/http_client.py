@@ -148,3 +148,51 @@ class ClickHouseHTTPClient:
         if with_column_types:
             return rows, col_types
         return rows
+
+    def insert_tsv(self, database: str, table: str, rows: List[Tuple]) -> None:
+        """
+        高性能批量插入：使用 FORMAT TabSeparated，比 VALUES 快 3-5 倍。
+
+        query 放在 URL 参数，TSV 数据作为 POST body，避免构建巨型 SQL 字符串。
+        ClickHouse TabSeparated 转义规则：\\t \\n \\r \\\\ → 双反斜线。
+        NULL 值用 \\N 表示。
+        """
+        def _tsv_cell(v) -> str:
+            if v is None:
+                return r'\N'
+            if isinstance(v, bool):
+                return '1' if v else '0'
+            s = str(v)
+            # 转义顺序：先转反斜线，再转制表符/换行符
+            s = s.replace('\\', '\\\\').replace('\t', '\\t').replace('\n', '\\n').replace('\r', '\\r')
+            return s
+
+        lines = ['\t'.join(_tsv_cell(cell) for cell in row) for row in rows]
+        tsv_body = '\n'.join(lines) + '\n'
+
+        params: Dict[str, Any] = {
+            'user': self.user,
+            'password': self.password,
+            'database': self.database,
+            'query': f'INSERT INTO `{database}`.`{table}` FORMAT TabSeparated',
+        }
+
+        try:
+            resp = self._session.post(
+                self._base_url,
+                data=tsv_body.encode('utf-8'),
+                params=params,
+                timeout=self.timeout,
+            )
+        except requests.ConnectionError as exc:
+            raise ConnectionError(
+                f"ClickHouse HTTP 连接失败 {self.host}:{self.port}: {exc}"
+            ) from exc
+        except requests.Timeout as exc:
+            raise TimeoutError(f"ClickHouse HTTP 超时 {self.host}:{self.port}") from exc
+
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"ClickHouse INSERT 失败 {resp.status_code} "
+                f"({self.host}:{self.port}): {resp.text[:500]}"
+            )

@@ -17,8 +17,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# 每批默认行数
-DEFAULT_BATCH_SIZE = 1000
+# 每批默认行数（TabSeparated 格式下 5000 行仍是小请求，HTTP 往返次数少 5 倍）
+DEFAULT_BATCH_SIZE = 5000
 # 文件大小上限 100 MB
 MAX_FILE_SIZE = 100 * 1024 * 1024
 # 预览行数
@@ -243,15 +243,14 @@ async def run_import_job(job_id: str, config: Dict[str, Any]) -> None:
     total_batches_all = 0
     done_batches_all = 0
 
-    # ── 预扫描：计算总行数和总批次数 ─────────────────────────────────────────
+    # ── 快速估算总批次（用 max_row，不全量遍历文件）────────────────────────
     try:
         import openpyxl as _ox
         wb_scan = _ox.load_workbook(file_path, read_only=True, data_only=True)
         for sc in sheet_configs:
             ws = wb_scan[sc["sheet_name"]]
-            row_count = sum(1 for _ in ws.iter_rows())
-            data_rows = row_count - (1 if sc.get("has_header", True) else 0)
-            data_rows = max(data_rows, 0)
+            row_count = ws.max_row or 0
+            data_rows = max(row_count - (1 if sc.get("has_header", True) else 0), 0)
             batches = (data_rows + batch_size - 1) // batch_size if data_rows else 0
             total_batches_all += batches
         wb_scan.close()
@@ -311,9 +310,7 @@ async def run_import_job(job_id: str, config: Dict[str, Any]) -> None:
                 if len(batch_rows) >= batch_size:
                     sheet_batch_num += 1
                     try:
-                        values_clause = _rows_to_values_clause(batch_rows)
-                        sql = f"INSERT INTO `{database}`.`{table}` VALUES {values_clause}"
-                        client.execute(sql)
+                        client.insert_tsv(database, table, batch_rows)
                         sheet_imported += len(batch_rows)
                         total_imported += len(batch_rows)
                         done_batches_all += 1
@@ -345,15 +342,16 @@ async def run_import_job(job_id: str, config: Dict[str, Any]) -> None:
 
                     batch_rows = []
 
-                    # 每批更新进度
-                    db = SessionLocal()
-                    try:
-                        job = _get_job(db)
-                        job.imported_rows = total_imported
-                        job.done_batches = done_batches_all
-                        _save(db, job)
-                    finally:
-                        db.close()
+                    # 每 10 批更新一次进度（减少 PostgreSQL round-trip）
+                    if done_batches_all % 10 == 0:
+                        db = SessionLocal()
+                        try:
+                            job = _get_job(db)
+                            job.imported_rows = total_imported
+                            job.done_batches = done_batches_all
+                            _save(db, job)
+                        finally:
+                            db.close()
 
                     # 让出事件循环，避免阻塞
                     await asyncio.sleep(0)
@@ -365,9 +363,7 @@ async def run_import_job(job_id: str, config: Dict[str, Any]) -> None:
             if batch_rows:
                 sheet_batch_num += 1
                 try:
-                    values_clause = _rows_to_values_clause(batch_rows)
-                    sql = f"INSERT INTO `{database}`.`{table}` VALUES {values_clause}"
-                    client.execute(sql)
+                    client.insert_tsv(database, table, batch_rows)
                     sheet_imported += len(batch_rows)
                     total_imported += len(batch_rows)
                     done_batches_all += 1

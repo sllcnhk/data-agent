@@ -62,7 +62,7 @@ class SheetConfig(BaseModel):
 class ExecuteImportRequest(BaseModel):
     upload_id: str = Field(..., description="上传接口返回的 upload_id")
     connection_env: str = Field(..., description="目标 ClickHouse 环境名")
-    batch_size: int = Field(default=DEFAULT_BATCH_SIZE, ge=100, le=10000)
+    batch_size: int = Field(default=DEFAULT_BATCH_SIZE, ge=100, le=50000)
     sheets: List[SheetConfig]
 
 
