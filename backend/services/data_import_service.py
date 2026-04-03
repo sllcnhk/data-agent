@@ -269,6 +269,28 @@ async def run_import_job(job_id: str, config: Dict[str, Any]) -> None:
     done_sheets = 0
     abort_flag = False
 
+    def _is_cancelling() -> bool:
+        """检查任务是否被请求取消（每批次调用一次）"""
+        db = SessionLocal()
+        try:
+            j = _get_job(db)
+            return j is not None and j.status == "cancelling"
+        finally:
+            db.close()
+
+    def _mark_cancelled():
+        db = SessionLocal()
+        try:
+            j = _get_job(db)
+            if j:
+                j.status = "cancelled"
+                j.finished_at = datetime.utcnow()
+                j.imported_rows = total_imported
+                j.done_batches = done_batches_all
+                _save(db, j)
+        finally:
+            db.close()
+
     for sc in sheet_configs:
         if abort_flag:
             break
@@ -277,6 +299,12 @@ async def run_import_job(job_id: str, config: Dict[str, Any]) -> None:
         database = sc["database"]
         table = sc["table"]
         has_header = sc.get("has_header", True)
+
+        # 每个 sheet 开始前检查取消
+        if _is_cancelling():
+            logger.info("[ImportJob %s] Cancelled before sheet '%s'.", job_id, sheet_name)
+            _mark_cancelled()
+            return
 
         # 更新当前 sheet
         db = SessionLocal()
@@ -355,6 +383,15 @@ async def run_import_job(job_id: str, config: Dict[str, Any]) -> None:
 
                     # 让出事件循环，避免阻塞
                     await asyncio.sleep(0)
+
+                    # 每批检查是否被取消
+                    if _is_cancelling():
+                        logger.info("[ImportJob %s] Cancelled mid-sheet '%s' after %d rows.",
+                                    job_id, sheet_name, sheet_imported)
+                        _row_iter.close()
+                        wb.close()
+                        _mark_cancelled()
+                        return
 
             if abort_flag:
                 break

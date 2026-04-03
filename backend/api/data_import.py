@@ -302,7 +302,37 @@ async def get_job_status(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. 删除任务记录
+# 6. 取消任务
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/jobs/{job_id}/cancel")
+async def cancel_job(
+    job_id: str,
+    current_user=Depends(require_permission("data", "import")),
+    db: Session = Depends(get_db),
+):
+    """
+    请求取消一个 pending/running 任务。
+    将状态置为 cancelling，后台协程下一批次检测到后干净退出。
+    """
+    from backend.models.import_job import ImportJob
+
+    job = db.query(ImportJob).filter(ImportJob.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"任务不存在: {job_id}")
+    if job.status not in ("pending", "running"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"任务当前状态 '{job.status}' 不可取消",
+        )
+    job.status = "cancelling"
+    job.updated_at = datetime.utcnow()
+    db.commit()
+    return {"success": True, "data": {"status": "cancelling"}}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. 删除任务记录
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.delete("/jobs/{job_id}")

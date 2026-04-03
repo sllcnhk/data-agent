@@ -43,7 +43,9 @@ import {
   DeleteOutlined,
   ImportOutlined,
   LoadingOutlined,
+  MinusCircleOutlined,
   ReloadOutlined,
+  StopOutlined,
   SyncOutlined,
 } from '@ant-design/icons';
 import {
@@ -77,10 +79,12 @@ interface SheetFormRow extends SheetPreview {
 
 const StatusTag: React.FC<{ status: string }> = ({ status }) => {
   const map: Record<string, { color: string; icon: React.ReactNode; label: string }> = {
-    pending:   { color: 'default',   icon: <LoadingOutlined />,     label: '等待中' },
-    running:   { color: 'processing',icon: <SyncOutlined spin />,   label: '导入中' },
-    completed: { color: 'success',   icon: <CheckCircleOutlined />, label: '已完成' },
-    failed:    { color: 'error',     icon: <CloseCircleOutlined />, label: '失败' },
+    pending:    { color: 'default',   icon: <LoadingOutlined />,        label: '等待中' },
+    running:    { color: 'processing',icon: <SyncOutlined spin />,      label: '导入中' },
+    completed:  { color: 'success',   icon: <CheckCircleOutlined />,    label: '已完成' },
+    failed:     { color: 'error',     icon: <CloseCircleOutlined />,    label: '失败' },
+    cancelling: { color: 'warning',   icon: <LoadingOutlined />,        label: '取消中' },
+    cancelled:  { color: 'default',   icon: <MinusCircleOutlined />,    label: '已取消' },
   };
   const cfg = map[status] ?? { color: 'default', icon: null, label: status };
   return (
@@ -358,32 +362,61 @@ const DataImportPage: React.FC = () => {
     },
     {
       title: '操作',
-      width: 60,
-      render: (_: any, r: ImportJobStatus) => (
-        <Popconfirm
-          title="确认删除该任务记录？"
-          description="仅删除记录，不影响已导入的数据。"
-          onConfirm={async () => {
-            try {
-              await dataImportApi.deleteJob(r.job_id);
-              message.success('已删除');
-              loadHistory(historyPage);
-            } catch (e: any) {
-              message.error(`删除失败: ${e?.response?.data?.detail ?? e.message}`);
-            }
-          }}
-          okText="删除"
-          okButtonProps={{ danger: true }}
-          cancelText="取消"
-        >
-          <Button
-            type="text"
-            danger
-            size="small"
-            icon={<DeleteOutlined />}
-          />
-        </Popconfirm>
-      ),
+      width: 70,
+      render: (_: any, r: ImportJobStatus) => {
+        const isActive = ['pending', 'running', 'cancelling'].includes(r.status);
+        if (isActive) {
+          return (
+            <Popconfirm
+              title="确认取消该导入任务？"
+              description="已导入的批次数据不会回滚，未导入部分将停止。"
+              onConfirm={async () => {
+                try {
+                  await dataImportApi.cancelJob(r.job_id);
+                  message.success('已发送取消请求，任务将在当前批次完成后停止');
+                  loadHistory(historyPage);
+                } catch (e: any) {
+                  message.error(`取消失败: ${e?.response?.data?.detail ?? e.message}`);
+                }
+              }}
+              okText="确认取消"
+              okButtonProps={{ danger: true }}
+              cancelText="不取消"
+              disabled={r.status === 'cancelling'}
+            >
+              <Button
+                type="text"
+                danger
+                size="small"
+                icon={<StopOutlined />}
+                disabled={r.status === 'cancelling'}
+              >
+                取消
+              </Button>
+            </Popconfirm>
+          );
+        }
+        return (
+          <Popconfirm
+            title="确认删除该任务记录？"
+            description="仅删除记录，不影响已导入的数据。"
+            onConfirm={async () => {
+              try {
+                await dataImportApi.deleteJob(r.job_id);
+                message.success('已删除');
+                loadHistory(historyPage);
+              } catch (e: any) {
+                message.error(`删除失败: ${e?.response?.data?.detail ?? e.message}`);
+              }
+            }}
+            okText="删除"
+            okButtonProps={{ danger: true }}
+            cancelText="取消"
+          >
+            <Button type="text" danger size="small" icon={<DeleteOutlined />} />
+          </Popconfirm>
+        );
+      },
     },
   ];
 

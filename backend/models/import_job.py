@@ -32,6 +32,7 @@ class ImportJob(Base):
 
     # 任务状态
     # pending → running → completed / failed
+    #                   ↘ cancelling → cancelled
     status = Column(String(20), nullable=False, default="pending", index=True, comment="任务状态")
 
     # Sheet 级别进度

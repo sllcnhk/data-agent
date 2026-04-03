@@ -75,7 +75,7 @@ export interface ImportJobStatus {
   upload_id: string;
   filename: string;
   connection_env: string;
-  status: 'pending' | 'running' | 'completed' | 'failed';
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelling' | 'cancelled';
   total_sheets: number;
   done_sheets: number;
   current_sheet: string | null;
@@ -155,6 +155,11 @@ export const dataImportApi = {
       params: { page, page_size: pageSize },
     });
     return res.data?.data;
+  },
+
+  /** 请求取消 pending/running 任务（将状态置为 cancelling） */
+  cancelJob: async (jobId: string): Promise<void> => {
+    await apiClient.post(`/data-import/jobs/${jobId}/cancel`);
   },
 
   /** 删除任务记录（不影响已导入数据） */
