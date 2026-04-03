@@ -41,6 +41,7 @@ PERMISSIONS = [
     ("users",           "assign_role",  "分配/撤销角色"),
     ("settings",        "read",         "查看系统设置"),
     ("settings",        "write",        "修改系统设置"),
+    ("data",            "import",       "Excel 数据导入 ClickHouse"),
 ]
 
 

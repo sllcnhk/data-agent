@@ -10,6 +10,7 @@ import {
   TeamOutlined,
   ApiOutlined,
   SafetyOutlined,
+  ImportOutlined,
 } from '@ant-design/icons';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from '@/store/useAuthStore';
@@ -37,6 +38,7 @@ const ALL_MENU_ITEMS: MenuItem[] = [
   { key: '/skills',      icon: <ToolOutlined />,          label: '技能中心', perm: 'skills.user:read' },
   { key: '/users',       icon: <TeamOutlined />,          label: '用户管理', perm: 'users:read' },
   { key: '/roles',       icon: <SafetyOutlined />,        label: '角色权限', perm: 'users:read' },
+  { key: '/data-import', icon: <ImportOutlined />,         label: '数据导入', perm: 'data:import' },
   { key: '/logs',        icon: <FileTextOutlined />,      label: '日志查看' },
 ];
 

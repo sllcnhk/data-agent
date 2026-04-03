@@ -12,6 +12,7 @@ import LogsPage from './pages/Logs';
 import Login from './pages/Login';
 import Users from './pages/Users';
 import Roles from './pages/Roles';
+import DataImport from './pages/DataImport';
 import { useAuthStore } from '@/store/useAuthStore';
 
 const { Content } = Layout;
@@ -86,6 +87,7 @@ function App() {
                   <Route path="/logs" element={<LogsPage />} />
                   <Route path="/users" element={<Users />} />
                   <Route path="/roles" element={<Roles />} />
+                  <Route path="/data-import" element={<DataImport />} />
                 </Routes>
               </Content>
             </AppLayout>

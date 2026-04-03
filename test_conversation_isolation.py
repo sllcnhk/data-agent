@@ -27,6 +27,15 @@ os.environ.setdefault("ENABLE_AUTH", "False")
 
 _PREFIX = f"_ci_{uuid.uuid4().hex[:6]}_"
 
+# ─── 模块级 auth 补丁（兼容与 test_rbac.py 混跑）────────────────────────────────
+_auth_patcher = None
+
+def setup_module(_=None):
+    global _auth_patcher
+    from backend.config.settings import settings
+    _auth_patcher = patch.object(settings, 'enable_auth', False)
+    _auth_patcher.start()
+
 # ── 全局 DB session ───────────────────────────────────────────────────────────
 
 
@@ -82,6 +91,10 @@ def _auth(user):
 
 
 def teardown_module(_=None):
+    global _auth_patcher
+    if _auth_patcher is not None:
+        _auth_patcher.stop()
+        _auth_patcher = None
     from backend.models.user import User
     from backend.models.conversation import Conversation
     from backend.models import ConversationGroup
