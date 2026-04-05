@@ -2,7 +2,7 @@
 
 > **适用对象**：LLM 模型（Claude Code / 其他 AI）、新加入开发者
 > **目的**：快速理解系统整体架构、模块职责、数据流向和交互接口
-> **最后更新**：2026-03-26（**文件写入下载**：`files_written` SSE 事件 + `GET /api/v1/files/download` 安全下载端点 + 文件下载卡片 UI + `FILE_OUTPUT_DATE_SUBFOLDER` 月份子目录配置；技能路由可视化：`skill_matched` SSE 事件、`SkillLoader._last_match_info`、ThoughtProcess 🧠 技能路由面板、`GET /skills/load-errors`；侧边栏 Tab UI + 只读模式 + is_shared 群组框架；对话用户隔离；对话附件上传；ClickHouse TCP→HTTP 自动回退；对话打断；用户技能目录隔离修复）
+> **最后更新**：2026-04-05（**Excel → ClickHouse 数据导入**：`migrate_data_import.py` DB 迁移 + 9 个 `/data-import/*` REST 端点 + `run_import_job` 后台协程（TabSeparated 格式 + 协作式取消）+ 大文件流式上传优化；**文件写入下载**：`files_written` SSE 事件 + `GET /api/v1/files/download` 安全下载端点 + 文件下载卡片 UI + `FILE_OUTPUT_DATE_SUBFOLDER` 月份子目录配置；技能路由可视化：`skill_matched` SSE 事件、`SkillLoader._last_match_info`、ThoughtProcess 🧠 技能路由面板、`GET /skills/load-errors`；侧边栏 Tab UI + 只读模式 + is_shared 群组框架；对话用户隔离；对话附件上传；ClickHouse TCP→HTTP 自动回退；对话打断；用户技能目录隔离修复）
 
 ---
 
@@ -58,6 +58,7 @@ data-agent/
 │   │   ├── mcp.py                  # /mcp 服务器管理
 │   │   ├── groups.py               # /groups 对话分组
 │   │   ├── files.py                # ★ GET /files/download — 安全文件下载端点（路径验证 + 用户隔离）
+│   │   ├── data_import.py          # ★ /data-import/* — Excel → ClickHouse 数据导入（9 端点，superadmin 专属）
 │   │   └── llm_configs.py          # /llm-configs LLM 配置
 │   ├── core/
 │   │   ├── approval_manager.py     # ApprovalManager 单例（async Event 暂停）
@@ -79,7 +80,8 @@ data-agent/
 │   │       ├── server.py           # ★ ClickHouseMCPServer（TCP 9000 探测→失败自动回退 HTTP 8123）
 │   │       └── http_client.py      # ★ ClickHouseHTTPClient（requests-based，execute() 兼容 clickhouse-driver）
 │   ├── services/
-│   │   └── conversation_service.py # ★ SSE 流处理、自动续接、上下文压缩
+│   │   ├── conversation_service.py # ★ SSE 流处理、自动续接、上下文压缩
+│   │   └── data_import_service.py  # ★ run_import_job() 后台协程（分批 insert_tsv + 协作式取消）
 │   ├── skills/
 │   │   ├── skill_loader.py         # SkillLoader 单例；3层加载；build_skill_prompt_async()；_MAX_INJECT_CHARS=16000 保护
 │   │   ├── skill_semantic_router.py  # ★ LLM 批量路由器（单次调用对候选 skill 打分，0-1.0）
@@ -93,14 +95,18 @@ data-agent/
 │   │   ├── user_role.py            # ★ UserRole 关联表（user_id + role_id + assigned_by）
 │   │   ├── role_permission.py      # ★ RolePermission 关联表
 │   │   ├── refresh_token.py        # ★ RefreshToken（jti uuid，轮换/revoke 状态）
+│   │   ├── import_job.py           # ★ ImportJob（数据导入任务，状态机 + 进度追踪 + JSONB 配置快照）
 │   │   └── ...                     # 其他模型（Conversation/Message/Task/Report 等）
 │   ├── scripts/
-│   │   └── init_rbac.py            # ★ 初始化 4 角色 + 13 权限（幂等，首次部署运行）
+│   │   ├── init_rbac.py            # ★ 初始化 4 角色 + 13 权限（幂等，首次部署运行）
+│   │   └── migrate_data_import.py  # ★ 创建 import_jobs 表 + 种子 data:import 权限（幂等）
 │   └── config/
 │       └── settings.py             # Pydantic Settings（环境变量映射，含 RBAC 配置项）
 ├── frontend/src/
 │   ├── pages/Chat.tsx              # ★ 主聊天页面（SSE 消费、Modal 渲染、附件 chips 展示）
 │   ├── pages/Roles.tsx             # ★ 角色权限管理页面（卡片视图 + 权限分配弹窗；users:read 权限）
+│   ├── pages/DataImport.tsx        # ★ Excel 数据导入页面（3步骤向导：选连接/上传→配置Sheet→进度监控；data:import 权限）
+│   ├── services/dataImportApi.ts   # ★ 数据导入 API 客户端（9 个方法，大文件 timeout=10min）
 │   ├── store/useChatStore.ts       # Zustand store（消息、审批、续接、isCancelling 状态）
 │   ├── store/useAuthStore.ts       # ★ JWT 认证状态（access_token 内存；initAuth 4路径；isAnonymousUser；authChecked）
 │   ├── App.tsx                     # ★ 路由定义；RequireAuth（authChecked 防闪烁）；initAuth() on mount
@@ -115,8 +121,10 @@ data-agent/
 ├── customer_data/                  # ★ Agent 文件写入区（按用户隔离子目录）
 │   ├── superadmin/                 # superadmin 用户数据（含历史迁移数据）
 │   │   ├── db_knowledge/           # 数据库元数据知识库
+│   │   ├── imports/                # Excel 数据导入临时文件（完成/失败后自动清理）
 │   │   └── reports/                # 分析报告输出
 │   └── {username}/                 # 其他用户各自独立子目录
+│       └── imports/                # 各用户的 Excel 导入临时文件
 └── .claude/
     ├── agent_config.yaml           # Agent→MCP 绑定配置（ClickHouse 权限 + 迭代次数）
     └── skills/                     # 三层技能目录（系统/项目/用户）
@@ -777,6 +785,82 @@ GET /api/v1/files/download（backend/api/files.py）
 
 ---
 
+### 4.17 Excel → ClickHouse 数据导入流程（2026-04-05）
+
+```
+前端 DataImport.tsx（3 步骤向导）
+  Step 1: 选择 ClickHouse 连接 + 上传 Excel 文件
+    GET /data-import/connections        → 可写连接列表（从 MCPServerManager 枚举 clickhouse-* 非 -ro）
+    POST /data-import/upload (multipart) → upload_id + Sheet 预览信息
+      │
+      ├─ 前端 dataImportApi.uploadExcel(file) — axios timeout=600000ms（10分钟）
+      └─ 后端 upload_excel()
+           ├─ MIME/扩展名检查（.xlsx/.xls）
+           ├─ 1MB 分块流式写盘（边写边计算大小，超 100MB 立即 413）
+           │    customer_data/{username}/imports/{upload_id}.xlsx
+           └─ run_in_executor(parse_excel_preview)  ← openpyxl 在线程池中运行（避免阻塞事件循环）
+                ├─ read_only=True, data_only=True
+                ├─ ws.max_row        ← O(1) 元数据，不遍历所有行
+                └─ iter_rows() 仅取前 PREVIEW_ROWS=5 行后立即 break
+
+  Step 2: 配置各 Sheet 映射
+    GET /data-import/connections/{env}/databases  → 数据库列表
+    GET /data-import/connections/{env}/databases/{db}/tables → 表列表
+    用户为每个 Sheet 选择 database / table / has_header / enabled
+
+  Step 3: 提交导入 + 进度监控
+    POST /data-import/execute
+      │  body: {upload_id, connection_env, batch_size, sheets:[...]}
+      └─ execute_import()
+           ├─ 定位 customer_data/{username}/imports/{upload_id}.xlsx
+           ├─ 创建 ImportJob(status="pending") → db.commit()
+           └─ asyncio.create_task(run_import_job(job_id, config))  ← 后台协程，立即返回 job_id
+
+  轮询进度（前端定时 GET /data-import/jobs/{job_id}）
+    ← ImportJob.to_dict(): status / done_sheets / done_batches / imported_rows / error_message
+
+  取消（可选）
+    POST /data-import/jobs/{job_id}/cancel → status="cancelling"
+    run_import_job 协程下批次检测后干净退出 → status="cancelled"
+
+  删除（终止态后）
+    DELETE /data-import/jobs/{job_id} → 删除 DB 记录（不影响已导入数据）
+
+run_import_job(job_id, config) 后台协程（data_import_service.py）：
+  ├─ status="running"; started_at=utcnow()
+  ├─ 快速估算总批次：load_workbook → ws.max_row（O(1)）→ total_batches
+  ├─ for sheet in sheet_configs:
+  │    ├─ _is_cancelling() → True → _mark_cancelled() → return（每 Sheet 开始前检查）
+  │    ├─ openpyxl.load_workbook(read_only=True)
+  │    ├─ iter_rows(values_only=True) → 跳过 has_header 首行
+  │    └─ for row in rows:
+  │         batch_rows.append(row)
+  │         if len(batch_rows) >= batch_size:
+  │           client.insert_tsv(database, table, batch_rows)  ← TabSeparated 格式（3-5x 性能提升）
+  │           done_batches += 1
+  │           每 10 批写一次 DB 进度（减少 PostgreSQL 往返）
+  │           await asyncio.sleep(0)          ← 让出事件循环
+  │           _is_cancelling() → True → return cancelled
+  │           Abort on first failure → status="failed"
+  │    尾部剩余行 → insert_tsv
+  └─ status="completed"; os.unlink(file_path)  ← 清理临时文件
+```
+
+**状态机**：
+
+```
+pending ──(协程启动)──► running ──(完成)──► completed
+                   │         └──(失败)──► failed
+                   │
+   ┌──(POST cancel)──┘
+   ▼
+cancelling ──(协程检测到)──► cancelled
+```
+
+**权限**：全部 9 个 `/data-import/*` 端点均通过 `Depends(require_permission("data", "import"))` 保护。仅 superadmin 拥有 `data:import` 权限。`ENABLE_AUTH=false` 时 AnonymousUser(is_superadmin=True) 自动通过。
+
+---
+
 ## 5. SSE 事件类型参考
 
 前端通过 `text/event-stream` 接收以下事件（均为 JSON）：
@@ -900,6 +984,22 @@ GET /api/v1/files/download（backend/api/files.py）
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/files/download?path=...` | 下载 `customer_data/{username}/` 下的文件。`path` 支持带/不带 `customer_data/` 前缀两种格式。响应头 `Content-Disposition: attachment; filename*=UTF-8''...`（支持中文文件名）。文件不存在返回 404，跨用户返回 403，路径穿越返回 403，目录路径返回 400。 |
+
+### 数据导入 `/data-import`
+
+> 全部端点需 `data:import` 权限（**仅 superadmin**）。`ENABLE_AUTH=false` 时 AnonymousUser(is_superadmin=True) 自动通过。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/data-import/connections` | 所有可写 ClickHouse 连接（从 MCPServerManager 枚举，排除 -ro 只读服务器） |
+| GET | `/data-import/connections/{env}/databases` | 查询指定环境的数据库列表（排除 system/information_schema） |
+| GET | `/data-import/connections/{env}/databases/{db}/tables` | 查询指定数据库的表列表 |
+| POST | `/data-import/upload` | 上传 Excel（multipart）。1MB 分块流式写盘；上限 100MB；线程池解析预览。返回 `upload_id` + Sheet 预览信息 |
+| POST | `/data-import/execute` | 提交导入任务。创建 `ImportJob` 记录（status=pending）并后台启动 `run_import_job` 协程。立即返回 `job_id` |
+| GET | `/data-import/jobs/{job_id}` | 查询任务状态与进度（用于前端轮询） |
+| GET | `/data-import/jobs` | 历史任务列表（分页，按 created_at 倒序），参数：`page`/`page_size` |
+| POST | `/data-import/jobs/{job_id}/cancel` | 请求取消 pending/running 任务（将状态置为 cancelling；协作式，非强制终止） |
+| DELETE | `/data-import/jobs/{job_id}` | 删除任务记录（不影响已导入数据） |
 
 ### 分组管理 `/groups`
 

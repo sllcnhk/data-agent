@@ -10,8 +10,9 @@ test_data_import_e2e.py — Excel 数据导入功能完整测试套件
   E  (8)  — execute 导入任务端点（参数校验、任务创建、后台启动）
   F  (6)  — 任务状态/历史列表端点（状态查询、分页排序）
   G  (8)  — 端到端导入流程（Mock ClickHouseHTTPClient，验证完整状态机）
+  H  (8)  — 取消功能完整流程（cancel 端点 + run_import_job 协程合作式退出）
 
-总计: 48 个测试用例
+总计: 56 个测试用例
 
 Bug 修复验证：
   - Fix1: data:import 权限已种子到 DB（A1-A4 覆盖）
@@ -770,8 +771,12 @@ class TestEndToEndImportFlow(unittest.TestCase):
     """
 
     def _run_job(self, file_path, sheet_configs, env="sg", batch_size=100,
-                 ch_execute_side_effect=None):
-        """辅助：创建 ImportJob + 运行协程 + 返回最终 job 状态"""
+                 ch_insert_side_effect=None, initial_status="pending"):
+        """辅助：创建 ImportJob + 运行协程 + 返回最终 job 状态
+
+        ch_insert_side_effect: 注入到 mock_client.insert_tsv.side_effect（模拟插入失败或取消）
+        initial_status: ImportJob 初始状态（默认 pending，可设为 cancelling 测试预取消）
+        """
         from backend.models.import_job import ImportJob
         from backend.config.database import SessionLocal
 
@@ -785,7 +790,7 @@ class TestEndToEndImportFlow(unittest.TestCase):
                 upload_id=str(uuid.uuid4()),
                 filename=Path(file_path).name,
                 connection_env=env,
-                status="pending",
+                status=initial_status,
             )
             db.add(job)
             db.commit()
@@ -800,10 +805,8 @@ class TestEndToEndImportFlow(unittest.TestCase):
         }
 
         mock_client = MagicMock()
-        if ch_execute_side_effect:
-            mock_client.execute.side_effect = ch_execute_side_effect
-        else:
-            mock_client.execute.return_value = []
+        if ch_insert_side_effect:
+            mock_client.insert_tsv.side_effect = ch_insert_side_effect
 
         with patch("backend.services.data_import_service._build_ch_client",
                    return_value=mock_client):
@@ -815,7 +818,11 @@ class TestEndToEndImportFlow(unittest.TestCase):
         db = SessionLocal()
         try:
             job = db.query(ImportJob).filter(ImportJob.id == job_id).first()
-            return job.to_dict() if job else None
+            result = job.to_dict() if job else None
+            # Attach mock for caller inspection
+            if result is not None:
+                result["_mock_client"] = mock_client
+            return result
         finally:
             db.close()
 
@@ -886,7 +893,6 @@ class TestEndToEndImportFlow(unittest.TestCase):
         rows = [["id", "val"]] + [[i, f"v{i}"] for i in range(20)]
         fp = self._write_xlsx(rows)
         mock_client = MagicMock()
-        mock_client.execute.return_value = []
         try:
             from backend.services.data_import_service import run_import_job
             from backend.models.import_job import ImportJob
@@ -917,8 +923,8 @@ class TestEndToEndImportFlow(unittest.TestCase):
             with patch("backend.services.data_import_service._build_ch_client",
                        return_value=mock_client):
                 asyncio.run(run_import_job(job_id, config))
-            # 20 data rows, batch=7 → ceil(20/7)=3 batches
-            self.assertEqual(mock_client.execute.call_count, 3)
+            # 20 data rows, batch=7 → ceil(20/7)=3 batches；服务使用 insert_tsv
+            self.assertEqual(mock_client.insert_tsv.call_count, 3)
         finally:
             self._safe_unlink(fp)
 
@@ -931,7 +937,7 @@ class TestEndToEndImportFlow(unittest.TestCase):
                 {"sheet_name": "TestSheet", "database": "db",
                  "table": "t", "has_header": True, "enabled": True}
             ], batch_size=10,
-               ch_execute_side_effect=RuntimeError("CH insert error"))
+               ch_insert_side_effect=RuntimeError("CH insert error"))
             # 核心断言：任务状态 + 错误信息
             self.assertEqual(result["status"], "failed")
             self.assertIsNotNone(result["error_message"])
@@ -969,7 +975,7 @@ class TestEndToEndImportFlow(unittest.TestCase):
         self._run_job(fp, [
             {"sheet_name": "TestSheet", "database": "db",
              "table": "t", "has_header": True, "enabled": True}
-        ], ch_execute_side_effect=RuntimeError("fail"))
+        ], ch_insert_side_effect=RuntimeError("fail"))
         self.assertFalse(os.path.exists(fp), "Temp file should be deleted even on failure")
 
     def test_G8_disabled_sheet_skipped(self):
@@ -1033,6 +1039,297 @@ class TestEndToEndImportFlow(unittest.TestCase):
                 self.assertEqual(job.imported_rows, 2)  # Only Active sheet data
             finally:
                 db.close()
+        finally:
+            self._safe_unlink(fp)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# H — 取消功能完整流程 (8 tests)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCancelFlow(unittest.TestCase):
+    """
+    端到端取消功能验证：
+    - cancel 端点状态机（pending/running 可取消，其他拒绝）
+    - run_import_job 协程对 cancelling 状态的检测与干净退出
+    - _mark_cancelled 正确设置最终字段
+    """
+
+    def _write_xlsx(self, rows):
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "CancelSheet"
+        for row in rows:
+            ws.append(row)
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+            wb.save(f.name)
+            return f.name
+
+    def _safe_unlink(self, fp):
+        try:
+            if os.path.exists(fp):
+                os.unlink(fp)
+        except OSError:
+            pass
+
+    def _create_job_db(self, status="pending"):
+        """直接在 DB 创建 ImportJob，返回 job_id"""
+        from backend.models.import_job import ImportJob
+        from backend.config.database import SessionLocal
+        job_id = str(uuid.uuid4())
+        db = SessionLocal()
+        try:
+            job = ImportJob(
+                id=uuid.UUID(job_id),
+                user_id=str(uuid.uuid4()),
+                username=f"{_PREFIX}cancel",
+                upload_id=str(uuid.uuid4()),
+                filename="cancel.xlsx",
+                connection_env="sg",
+                status=status,
+            )
+            db.add(job)
+            db.commit()
+        finally:
+            db.close()
+        return job_id
+
+    def _get_job_dict(self, job_id):
+        from backend.models.import_job import ImportJob
+        from backend.config.database import SessionLocal
+        db = SessionLocal()
+        try:
+            job = db.query(ImportJob).filter(ImportJob.id == job_id).first()
+            return job.to_dict() if job else None
+        finally:
+            db.close()
+
+    # ── cancel 端点状态机 ──────────────────────────────────────────────────────
+
+    def test_H1_cancel_endpoint_pending_returns_cancelling(self):
+        """POST /cancel on pending → 200, data.status=cancelling"""
+        job_id = _create_job(status="pending")
+        resp = _get_client().post(f"/api/v1/data-import/jobs/{job_id}/cancel")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["status"], "cancelling")
+
+    def test_H2_cancel_endpoint_running_returns_cancelling(self):
+        """POST /cancel on running → 200, data.status=cancelling"""
+        job_id = _create_job(status="running")
+        resp = _get_client().post(f"/api/v1/data-import/jobs/{job_id}/cancel")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["status"], "cancelling")
+
+    def test_H3_cancel_endpoint_completed_returns_400(self):
+        """POST /cancel on completed → 400"""
+        job_id = _create_job(status="completed")
+        resp = _get_client().post(f"/api/v1/data-import/jobs/{job_id}/cancel")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("completed", resp.json()["detail"])
+
+    def test_H4_cancel_endpoint_updates_db(self):
+        """cancel 端点成功后 DB 状态立即变为 cancelling"""
+        from backend.models.import_job import ImportJob
+        job_id = _create_job(status="running")
+        _get_client().post(f"/api/v1/data-import/jobs/{job_id}/cancel")
+        db = _db()
+        try:
+            job = db.query(ImportJob).filter(ImportJob.id == job_id).first()
+            self.assertEqual(job.status, "cancelling")
+        finally:
+            db.close()
+
+    # ── run_import_job 协程取消逻辑 ───────────────────────────────────────────
+
+    def test_H5_cancel_detected_before_second_sheet(self):
+        """多 Sheet 文件：Sheet1 完成后触发取消，Sheet2 开始前 _is_cancelling() 检测到 → cancelled"""
+        import openpyxl
+        wb = openpyxl.Workbook()
+        ws1 = wb.active
+        ws1.title = "S1"
+        for i in range(5):
+            ws1.append([i])
+        ws2 = wb.create_sheet("S2")
+        for i in range(5):
+            ws2.append([i])
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as f:
+            wb.save(f.name)
+            fp = f.name
+        try:
+            from backend.services.data_import_service import run_import_job
+            from backend.models.import_job import ImportJob
+            from backend.config.database import SessionLocal
+
+            job_id = self._create_job_db(status="pending")
+            insert_calls = [0]
+
+            def side_effect(database, table, batch_rows):
+                insert_calls[0] += 1
+                # Sheet1 批次完成后把状态设为 cancelling
+                if table == "t1":
+                    db2 = SessionLocal()
+                    try:
+                        j = db2.query(ImportJob).filter(ImportJob.id == job_id).first()
+                        j.status = "cancelling"
+                        db2.commit()
+                    finally:
+                        db2.close()
+
+            mock_client = MagicMock()
+            mock_client.insert_tsv.side_effect = side_effect
+
+            config = {
+                "file_path": fp,
+                "connection_env": "sg",
+                "batch_size": 100,
+                "sheets": [
+                    {"sheet_name": "S1", "database": "db", "table": "t1",
+                     "has_header": False, "enabled": True},
+                    {"sheet_name": "S2", "database": "db", "table": "t2",
+                     "has_header": False, "enabled": True},
+                ],
+            }
+            with patch("backend.services.data_import_service._build_ch_client",
+                       return_value=mock_client):
+                asyncio.run(run_import_job(job_id, config))
+
+            result = self._get_job_dict(job_id)
+            self.assertEqual(result["status"], "cancelled")
+            # Sheet2 不应被处理
+            self.assertEqual(insert_calls[0], 1,
+                             "取消后 Sheet2 不应产生任何 INSERT 调用")
+        finally:
+            self._safe_unlink(fp)
+
+    def test_H6_cancelled_job_has_finished_at_set(self):
+        """取消完成后 _mark_cancelled 将 finished_at 设置为非 None"""
+        rows = [["id", "val"]] + [[i, f"v{i}"] for i in range(20)]
+        fp = self._write_xlsx(rows)
+        try:
+            from backend.services.data_import_service import run_import_job
+            from backend.models.import_job import ImportJob
+            from backend.config.database import SessionLocal
+
+            job_id = self._create_job_db(status="pending")
+
+            def cancelling_insert(database, table, batch_rows):
+                db2 = SessionLocal()
+                try:
+                    j = db2.query(ImportJob).filter(ImportJob.id == job_id).first()
+                    j.status = "cancelling"
+                    db2.commit()
+                finally:
+                    db2.close()
+
+            mock_client = MagicMock()
+            mock_client.insert_tsv.side_effect = cancelling_insert
+
+            config = {
+                "file_path": fp,
+                "connection_env": "sg",
+                "batch_size": 5,
+                "sheets": [{"sheet_name": "CancelSheet", "database": "db",
+                             "table": "t", "has_header": True, "enabled": True}],
+            }
+            with patch("backend.services.data_import_service._build_ch_client",
+                       return_value=mock_client):
+                asyncio.run(run_import_job(job_id, config))
+
+            result = self._get_job_dict(job_id)
+            self.assertEqual(result["status"], "cancelled")
+            self.assertIsNotNone(result["finished_at"], "_mark_cancelled 应设置 finished_at")
+        finally:
+            self._safe_unlink(fp)
+
+    def test_H7_mid_sheet_cancellation(self):
+        """mid-sheet 取消：第一批 insert_tsv 后状态变为 cancelling，协程在下一批检测到并退出"""
+        # 40 行数据，batch=10 → 4 批，第一批后设为 cancelling
+        rows = [["id", "val"]] + [[i, f"v{i}"] for i in range(40)]
+        fp = self._write_xlsx(rows)
+        try:
+            from backend.services.data_import_service import run_import_job
+            from backend.models.import_job import ImportJob
+            from backend.config.database import SessionLocal
+
+            job_id = self._create_job_db(status="pending")
+
+            call_count = [0]
+
+            def cancelling_insert(database, table, batch_rows):
+                call_count[0] += 1
+                if call_count[0] == 1:
+                    # 第一批完成后设为 cancelling
+                    db2 = SessionLocal()
+                    try:
+                        j = db2.query(ImportJob).filter(ImportJob.id == job_id).first()
+                        j.status = "cancelling"
+                        db2.commit()
+                    finally:
+                        db2.close()
+
+            mock_client = MagicMock()
+            mock_client.insert_tsv.side_effect = cancelling_insert
+
+            config = {
+                "file_path": fp,
+                "connection_env": "sg",
+                "batch_size": 10,
+                "sheets": [{"sheet_name": "CancelSheet", "database": "db",
+                             "table": "t", "has_header": True, "enabled": True}],
+            }
+            with patch("backend.services.data_import_service._build_ch_client",
+                       return_value=mock_client):
+                asyncio.run(run_import_job(job_id, config))
+
+            result = self._get_job_dict(job_id)
+            self.assertEqual(result["status"], "cancelled")
+            # 第一批已完成（count=1），取消后不再继续
+            self.assertEqual(call_count[0], 1,
+                             "取消后不应再执行后续批次")
+        finally:
+            self._safe_unlink(fp)
+
+    def test_H8_mid_cancel_preserves_imported_rows(self):
+        """mid-sheet 取消后，imported_rows 保留已完成批次的行数"""
+        rows = [["id"]] + [[i] for i in range(30)]
+        fp = self._write_xlsx(rows)
+        try:
+            from backend.services.data_import_service import run_import_job
+            from backend.models.import_job import ImportJob
+            from backend.config.database import SessionLocal
+
+            job_id = self._create_job_db(status="pending")
+
+            def cancelling_insert(database, table, batch_rows):
+                # 第一批（10行）完成后立即设为 cancelling
+                db2 = SessionLocal()
+                try:
+                    j = db2.query(ImportJob).filter(ImportJob.id == job_id).first()
+                    j.status = "cancelling"
+                    db2.commit()
+                finally:
+                    db2.close()
+
+            mock_client = MagicMock()
+            mock_client.insert_tsv.side_effect = cancelling_insert
+
+            config = {
+                "file_path": fp,
+                "connection_env": "sg",
+                "batch_size": 10,
+                "sheets": [{"sheet_name": "CancelSheet", "database": "db",
+                             "table": "t", "has_header": False, "enabled": True}],
+            }
+            with patch("backend.services.data_import_service._build_ch_client",
+                       return_value=mock_client):
+                asyncio.run(run_import_job(job_id, config))
+
+            result = self._get_job_dict(job_id)
+            self.assertEqual(result["status"], "cancelled")
+            # 第一批（10行）已导入，cancelled 时保留该数值
+            self.assertGreaterEqual(result["imported_rows"], 10,
+                                    "已完成批次的行数应保留在 imported_rows 中")
         finally:
             self._safe_unlink(fp)
 

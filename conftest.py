@@ -59,7 +59,7 @@ def _cleanup_customer_data_dirs(label: str = "") -> int:
 
 def _cleanup_test_data(label: str = ""):
     """
-    清理数据库中的测试用户和角色，以及 customer_data/ 下的测试用户目录。
+    清理数据库中的测试用户、角色和导入任务，以及 customer_data/ 下的测试用户目录。
     返回 (deleted_users, deleted_roles)。
     label 仅用于日志标注（如 "pre" / "post"）。
     """
@@ -77,6 +77,21 @@ def _cleanup_test_data(label: str = ""):
 
     db = SessionLocal()
     try:
+        # 清理测试导入任务（ImportJob.username 匹配测试前缀）
+        try:
+            from backend.models.import_job import ImportJob
+            test_jobs = [
+                j for j in db.query(ImportJob).all()
+                if _is_test_entity(j.username)
+            ]
+            for j in test_jobs:
+                db.delete(j)
+            if test_jobs:
+                tag = f"[{label}] " if label else ""
+                print(f"\n[conftest] {tag}Cleanup: deleted {len(test_jobs)} import job(s).")
+        except Exception as exc:
+            print(f"\n[conftest] ImportJob cleanup skipped (non-fatal): {exc}")
+
         test_users = [
             u for u in db.query(User).all()
             if u.username not in _PROTECTED_USERS and _is_test_entity(u.username)

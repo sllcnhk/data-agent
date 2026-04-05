@@ -1,6 +1,6 @@
 # 数据库迁移指南
 
-> **最后更新**：2026-03-26（**文件写入下载**：**无 DB 迁移**，文件路径元数据写入已有 `messages.extra_metadata["files_written"]` JSONB 列；技能路由可视化 T1-T6：**无新增 DB 迁移**，skill_matched SSE 事件 / SkillLoader._last_match_info / ThoughtProcess 🧠 面板均为代码层变更；新增 `migrate_add_is_shared.py`：`conversations.is_shared` 字段；对话用户隔离：`migrate_conversation_user_isolation.py`；其余历次变更均无数据库结构变更）
+> **最后更新**：2026-04-05（**Excel 数据导入**：`migrate_data_import.py` 新建 `import_jobs` 表 + 种子 `data:import` 权限；**文件写入下载**：**无 DB 迁移**，文件路径元数据写入已有 `messages.extra_metadata["files_written"]` JSONB 列；技能路由可视化 T1-T6：**无新增 DB 迁移**，skill_matched SSE 事件 / SkillLoader._last_match_info / ThoughtProcess 🧠 面板均为代码层变更；新增 `migrate_add_is_shared.py`：`conversations.is_shared` 字段；对话用户隔离：`migrate_conversation_user_isolation.py`；其余历次变更均无数据库结构变更）
 
 本文档说明数据库迁移的两种方式：
 1. **项目自有手动迁移脚本**（`backend/migrations/`）— 当前主要方式，支持 up/down
@@ -24,6 +24,7 @@
 | is_shared 字段（群组框架） | 2026-03-25 | **DB 迁移脚本**：`backend/scripts/migrate_add_is_shared.py`。`conversations` 表加 `is_shared BOOLEAN NOT NULL DEFAULT FALSE`（群组聊天预留扩展点）；脚本幂等（检查列存在后跳过）。所有存量对话默认 `is_shared=false`，不影响现有功能。 | ✅ 已执行 |
 | 技能路由可视化（T1-T6） | 2026-03-26 | **无 DB 迁移**。变更均为代码层：`SkillLoader._last_match_info`、`skill_matched` SSE 事件、ThoughtProcess 🧠 面板、`GET /skills/load-errors` API。推理事件经由已有 `messages.extra_metadata['thinking_events']` JSONB 路径持久化，无需结构变更。 | ✅ 无需执行 |
 | 文件写入下载（T1-T7） | 2026-03-26 | **无 DB 迁移**。Agent 写文件时生成的文件路径元数据（`[{path,name,size,mime_type}]`）写入已有 `messages.extra_metadata["files_written"]` JSONB 列，无需结构变更。文件实体存储于 `customer_data/{username}/` 目录（文件系统层面）。新增 `backend/api/files.py` 下载端点与 `FILE_OUTPUT_DATE_SUBFOLDER` 配置项均为代码/配置层变更。 | ✅ 无需执行 |
+| Excel 数据导入 | 2026-04-05 | **DB 迁移脚本**：`backend/scripts/migrate_data_import.py`。① 新建 `import_jobs` 表（UUID PK、状态机字段、进度追踪字段、错误信息、JSONB 配置快照）；② 插入 `data:import` 权限记录；③ 将 `data:import` 权限分配给 superadmin 角色。幂等（`CREATE TABLE IF NOT EXISTS` + `INSERT ... ON CONFLICT DO NOTHING`）。 | ✅ 已执行 |
 
 ---
 
@@ -138,6 +139,74 @@ ALTER TABLE conversations
 - `backend/models/conversation.py` — `is_shared = Column(Boolean, default=False)`；`to_dict()` 暴露 `"is_shared": self.is_shared or False`
 - `backend/api/conversations.py` — `_check_conversation_write_permission()`（send_message / regenerate / clear 调用）
 - `frontend/src/store/useChatStore.ts` — `Conversation` interface 加 `is_shared?: boolean`
+
+---
+
+### migrate_data_import.py（2026-04-05）
+
+**目的**：为 Excel → ClickHouse 数据导入功能创建 `import_jobs` 表，并种子 `data:import` 权限。
+
+```bash
+# 执行迁移
+d:\ProgramData\Anaconda3\envs\dataagent\python.exe \
+  backend/scripts/migrate_data_import.py
+```
+
+```sql
+-- Step 1: 创建 import_jobs 表
+CREATE TABLE IF NOT EXISTS import_jobs (
+  id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id      VARCHAR(64) NOT NULL,
+  username     VARCHAR(128) NOT NULL,
+  upload_id    VARCHAR(64)  NOT NULL,
+  filename     VARCHAR(256) NOT NULL,
+  connection_env VARCHAR(64) NOT NULL,
+  status       VARCHAR(32)  NOT NULL DEFAULT 'pending',
+  -- 进度字段
+  total_sheets  INT NOT NULL DEFAULT 0,
+  done_sheets   INT NOT NULL DEFAULT 0,
+  current_sheet VARCHAR(256),
+  total_rows    BIGINT NOT NULL DEFAULT 0,
+  imported_rows BIGINT NOT NULL DEFAULT 0,
+  total_batches INT NOT NULL DEFAULT 0,
+  done_batches  INT NOT NULL DEFAULT 0,
+  -- 错误信息
+  error_message TEXT,
+  errors        JSONB,
+  -- 配置快照（connection_env/batch_size/sheets）
+  config_snapshot JSONB,
+  -- 时间戳
+  created_at   TIMESTAMP WITHOUT TIME ZONE DEFAULT now(),
+  started_at   TIMESTAMP WITHOUT TIME ZONE,
+  finished_at  TIMESTAMP WITHOUT TIME ZONE,
+  updated_at   TIMESTAMP WITHOUT TIME ZONE DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_import_jobs_user_id   ON import_jobs(user_id);
+CREATE INDEX IF NOT EXISTS idx_import_jobs_status    ON import_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_import_jobs_created_at ON import_jobs(created_at DESC);
+
+-- Step 2: 插入 data:import 权限（幂等）
+INSERT INTO permissions (id, resource, action, description)
+VALUES (gen_random_uuid(), 'data', 'import', 'Excel 数据导入到 ClickHouse')
+ON CONFLICT (resource, action) DO NOTHING;
+
+-- Step 3: 将 data:import 权限分配给 superadmin 角色（幂等）
+INSERT INTO role_permissions (role_id, permission_id)
+SELECT r.id, p.id
+FROM roles r, permissions p
+WHERE r.name = 'superadmin' AND p.resource = 'data' AND p.action = 'import'
+ON CONFLICT DO NOTHING;
+```
+
+**状态机**：`pending` → `running` → `completed` / `failed`；取消路径：`pending`/`running` → `cancelling` → `cancelled`。
+
+**权限范围**：`data:import` 仅 superadmin 角色持有。前端菜单入口：侧边栏「数据导入」，需 `is_superadmin=true`。
+
+相关代码：
+- `backend/models/import_job.py` — `ImportJob` ORM 模型 + `to_dict()`
+- `backend/api/data_import.py` — 9 个端点：连接列表 / 数据库 / 表 / 上传 / 执行 / 状态 / 列表 / 取消 / 删除
+- `backend/services/data_import_service.py` — `run_import_job()` 后台协程（分批插入 + 协作式取消）
 
 ---
 

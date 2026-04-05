@@ -132,7 +132,7 @@ export const dataImportApi = {
         'Content-Type': 'multipart/form-data',
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
-      timeout: 120000, // 大文件上传最多 2 分钟
+      timeout: 600000, // 大文件上传最多 10 分钟
     });
     return res.data?.data;
   },

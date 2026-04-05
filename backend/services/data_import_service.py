@@ -127,6 +127,10 @@ def parse_excel_preview(file_path: str) -> List[Dict[str, Any]]:
     """
     用 openpyxl 流式模式读取 Excel，返回每个 Sheet 的预览信息。
 
+    性能优化：
+    - 行数使用 ws.max_row 元数据（O(1)），不再遍历全部行
+    - 迭代器只读取前 PREVIEW_ROWS 行后立即停止
+
     Returns:
         [{
             "sheet_name": str,
@@ -142,19 +146,18 @@ def parse_excel_preview(file_path: str) -> List[Dict[str, Any]]:
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
             preview_rows: List[List] = []
-            row_count = 0
 
             for row in ws.iter_rows(values_only=True):
-                row_count += 1
-                if row_count <= PREVIEW_ROWS:
-                    preview_rows.append([
-                        str(cell) if cell is not None else ""
-                        for cell in row
-                    ])
+                if len(preview_rows) >= PREVIEW_ROWS:
+                    break  # 预览行足够，立即停止，不扫描剩余行
+                preview_rows.append([
+                    str(cell) if cell is not None else ""
+                    for cell in row
+                ])
 
             sheets.append({
                 "sheet_name": sheet_name,
-                "row_count_estimate": row_count,
+                "row_count_estimate": ws.max_row or 0,  # O(1) 元数据，无需全量遍历
                 "preview_rows": preview_rows,
             })
     finally:
@@ -229,6 +232,13 @@ async def run_import_job(job_id: str, config: Dict[str, Any]) -> None:
         job = _get_job(db)
         if not job:
             logger.error("[ImportJob %s] Job not found, aborting.", job_id)
+            return
+        # 取消请求可能在任务启动前就到达（pending → cancelling）
+        if job.status == "cancelling":
+            job.status = "cancelled"
+            job.finished_at = datetime.utcnow()
+            _save(db, job)
+            logger.info("[ImportJob %s] Cancelled before start.", job_id)
             return
         job.status = "running"
         job.started_at = datetime.utcnow()

@@ -1,7 +1,7 @@
 # 数据智能体系统 — 核心使用手册
 
-**文档版本**: v2.4
-**适用系统版本**: P0 + P1 + P2 + P3 + 3-Tier Skill System + Semantic Skill Routing + RBAC + 角色管理页面 + 推理过程持久化 + ContinuationCard + ClickHouse 动态多区域配置 + Session 过期管理 + 对话打断（停止生成）+ 对话附件上传 + 用户技能目录隔离修复 + 对话用户隔离 + 侧边栏 Tab UI + 只读模式 + is_shared 群组框架 + 技能路由可视化 + **文件写入下载**（2026-03-26）
+**文档版本**: v2.5
+**适用系统版本**: P0 + P1 + P2 + P3 + 3-Tier Skill System + Semantic Skill Routing + RBAC + 角色管理页面 + 推理过程持久化 + ContinuationCard + ClickHouse 动态多区域配置 + Session 过期管理 + 对话打断（停止生成）+ 对话附件上传 + 用户技能目录隔离修复 + 对话用户隔离 + 侧边栏 Tab UI + 只读模式 + is_shared 群组框架 + 技能路由可视化 + 文件写入下载 + **Excel → ClickHouse 数据导入**（2026-04-05）
 **读者对象**: 数据工程师、数据分析师、系统管理员
 
 ---
@@ -19,6 +19,7 @@
 9. [多模型支持与对话内切换](#9-多模型支持与对话内切换)
 10. [用户认证与多用户管理（RBAC）](#10-用户认证与多用户管理rbac)（含 10.9 Session 过期行为说明）
 11. [快速参考卡](#11-快速参考卡)
+12. [Excel → ClickHouse 数据导入（superadmin 专属）](#12-excel--clickhouse-数据导入superadmin-专属)
 
 ---
 
@@ -1764,6 +1765,7 @@ python backend/scripts/migrate_conversation_user_isolation.py
 | 中断正在进行的 AI 生成 | 发送消息后 → 输入框上方**「停止生成」**红色按钮（见 5.6 节）|
 | 发送附件（图片/PDF/文件） | 输入框右侧**「📎 回形针」**按钮或粘贴图片（见 5.7 节）|
 | 下载 Agent 生成的文件（CSV/Excel/JSON 等）| 助手消息末尾 → **「📎 生成的文件」卡片** → 点击「下载」按钮（见 5.9 节）|
+| 将 Excel 文件批量导入 ClickHouse | 侧边栏 → **「数据导入」**（仅 superadmin；见第 12 节）|
 | 查看本次回答调了哪些工具 | 助手消息上方 → 点击**「推理过程」** 折叠面板 |
 | 刷新页面后查看历史推理过程 | 推理过程已持久化，刷新后仍可展开（见 5.4 节）|
 | 了解 Agent 自动续接了几次 | 消息列表中查看 🔄 续接提示横幅（`[N/3]`）|
@@ -1854,8 +1856,132 @@ DELETE /api/v1/roles/{id}/permissions/{perm_id}  # 移除角色权限（需 user
 # 权限管理（需 users:read 权限）
 GET    /api/v1/permissions                       # 全量权限定义列表（共 13 条）
 
+# Excel 数据导入（需 data:import 权限，仅 superadmin）
+GET    /api/v1/data-import/connections              # 可写 ClickHouse 连接列表
+GET    /api/v1/data-import/connections/{env}/databases  # 数据库列表
+GET    /api/v1/data-import/connections/{env}/databases/{db}/tables  # 表列表
+POST   /api/v1/data-import/upload               # 上传 Excel（multipart，上限 100MB）
+POST   /api/v1/data-import/execute              # 提交导入任务（后台执行）
+GET    /api/v1/data-import/jobs/{job_id}        # 查询任务进度
+GET    /api/v1/data-import/jobs                 # 历史任务列表（分页）
+POST   /api/v1/data-import/jobs/{job_id}/cancel # 取消 pending/running 任务
+DELETE /api/v1/data-import/jobs/{job_id}        # 删除任务记录
+
 # 系统
 GET    /health                                   # 系统健康检查
+```
+
+---
+
+## 12. Excel → ClickHouse 数据导入（superadmin 专属）
+
+> **权限要求**：仅 `superadmin` 用户可使用此功能（`data:import` 权限）。
+>
+> **入口**：侧边栏导航 → **「数据导入」**（`ExportOutlined` 图标）。`ENABLE_AUTH=false` 时（单用户模式），匿名用户默认为 superadmin，可直接使用。
+
+### 12.1 功能概述
+
+将本地 Excel（`.xlsx` / `.xls`）文件中的数据批量导入到 ClickHouse 指定表，无需编写 ETL SQL。支持：
+
+- **多 Sheet** 一次性配置，各 Sheet 独立指定目标 database/table
+- **大文件**：单次最大 100MB，采用流式上传（1MB 分块写盘）
+- **实时进度**：行级 + 批次级双进度条，可随时取消
+- **历史记录**：任务列表保存所有历史导入记录，可按需删除
+
+### 12.2 操作步骤
+
+#### 步骤一：选择连接 + 上传文件
+
+1. 进入数据导入页面，页面顶部显示**步骤向导**。
+2. 在「选择目标环境」下拉框选择目标 ClickHouse 连接（仅显示可写连接，只读连接不在列表中）。
+3. 点击「上传 Excel 文件」区域（或将文件拖入），选择本地 `.xlsx`/`.xls` 文件。
+4. 后端接收到文件后自动解析每个 Sheet 的名称、估算行数和前 5 行预览。
+5. 上传成功后页面自动进入**步骤二**。
+
+> **大文件提示**：60MB 文件上传约需 30–60 秒（取决于网络），页面会显示进度条，请耐心等待。
+
+#### 步骤二：配置 Sheet 映射
+
+上传完成后，页面显示所有 Sheet 的配置表格：
+
+| 字段 | 说明 |
+|------|------|
+| Sheet 名称 | Excel 工作表名（只读） |
+| 估算行数 | 来自 Excel 元数据（O(1) 读取，非全量扫描，大文件也即时显示） |
+| 目标数据库 | 下拉选择；选中连接环境下的所有数据库 |
+| 目标表 | 下拉选择；选中数据库下的所有表 |
+| 含表头 | 勾选后第一行作为标题跳过，不导入 |
+| 启用 | 取消勾选可跳过该 Sheet（不导入） |
+
+配置完成后点击「**开始导入**」进入步骤三。
+
+#### 步骤三：监控进度 + 取消/删除
+
+页面显示当前导入任务的实时状态：
+
+| 指标 | 说明 |
+|------|------|
+| 状态徽标 | `等待中` / `进行中` / `取消中` / `已取消` / `已完成` / `失败` |
+| Sheet 进度 | 已完成 Sheet / 总 Sheet 数 |
+| 批次进度 | 已完成批次 / 总批次数（每批 5000 行） |
+| 导入行数 | 累计已写入 ClickHouse 的行数 |
+| 当前 Sheet | 正在处理的工作表名 |
+| 错误信息 | 仅失败时显示，包含批次号和错误原因 |
+
+**操作按钮**：
+
+- **取消**（仅进行中/等待中）：点击后状态变为`取消中`，后台协程完成当前批次后停止（最长延迟约 2 秒）。
+- **删除**（仅终止状态：已完成/失败/已取消）：删除 DB 记录，不影响已写入 ClickHouse 的数据。
+
+> **进度刷新**：页面自动每 2 秒轮询一次最新进度，无需手动刷新。
+
+### 12.3 历史任务列表
+
+历史任务按创建时间倒序显示，分页浏览。每条记录包含：文件名、目标环境、创建时间、最终状态和导入行数。
+
+已完成/失败/已取消任务可点击**「删除」**清理记录。
+
+### 12.4 注意事项与限制
+
+| 项目 | 说明 |
+|------|------|
+| 文件大小上限 | **100 MB**（超出返回 413）|
+| 文件格式 | 仅 `.xlsx` 和 `.xls`（其他格式前端拒绝上传）|
+| 目标表须存在 | 系统不自动建表，目标表需提前在 ClickHouse 中创建 |
+| 列数/类型匹配 | Excel 列顺序与 ClickHouse 表列顺序须一致；数据类型由 ClickHouse 负责转换 |
+| 批大小 | 默认每批 5000 行（`batch_size`），最小 100，最大 50000；可在 `ExecuteImportRequest` 中调整 |
+| 行数估算 | 预览阶段的「估算行数」取自 Excel 元数据（`ws.max_row`），部分 Excel 文件元数据不准确；实际导入行数以「导入行数」指标为准 |
+| 取消时机 | 协作式取消：每批完成后检测，已写入的批次**不会回滚**。取消仅停止后续批次，已导入数据保留 |
+| 临时文件 | 上传文件保存在 `customer_data/{username}/imports/`，任务完成（无论成功/失败）后自动清理 |
+| 单进程限制 | 并发导入任务无限制，但大批量并发会占用 ClickHouse 写入连接，建议顺序提交 |
+
+### 12.5 API 快速参考（程序化调用）
+
+```bash
+# 获取可写连接列表
+GET /api/v1/data-import/connections
+Authorization: Bearer <superadmin_token>
+
+# 上传 Excel 文件
+POST /api/v1/data-import/upload
+Content-Type: multipart/form-data
+→ 返回: {"upload_id": "...", "filename": "...", "sheets": [...]}
+
+# 提交导入任务
+POST /api/v1/data-import/execute
+{"upload_id": "...", "connection_env": "sg", "batch_size": 5000,
+ "sheets": [{"sheet_name": "Sheet1", "database": "crm", "table": "orders",
+              "has_header": true, "enabled": true}]}
+→ 返回: {"job_id": "...", "status": "pending"}
+
+# 轮询进度
+GET /api/v1/data-import/jobs/{job_id}
+
+# 取消任务
+POST /api/v1/data-import/jobs/{job_id}/cancel
+
+# 删除记录
+DELETE /api/v1/data-import/jobs/{job_id}
 ```
 
 ---

@@ -9,8 +9,10 @@ test_data_import.py — Excel → ClickHouse 数据导入功能测试
   D  (8)  — 上传端点（文件类型/大小检查、正常上传、Sheet 预览）
   E  (8)  — execute 导入端点（参数校验、任务创建、后台启动）
   F  (8)  — jobs 查询端点（状态轮询、历史列表分页）
+  H  (8)  — cancel 端点（状态机校验：pending/running 可取消，其他拒绝，DB 更新验证）
+  I  (4)  — delete 端点（删除任务记录，404 处理）
 
-总计: 44 个测试用例
+总计: 56 个测试用例
 """
 import asyncio
 import io
@@ -674,6 +676,158 @@ class TestJobsEndpoints(unittest.TestCase):
         ]
         for f in required_fields:
             self.assertIn(f, d, f"Missing field: {f}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# H — cancel 端点 (8 tests)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCancelEndpoint(unittest.TestCase):
+    """验证 POST /jobs/{job_id}/cancel 状态机约束与 DB 持久化"""
+
+    def _client(self):
+        from fastapi.testclient import TestClient
+        from backend.main import app
+        return TestClient(app, raise_server_exceptions=False)
+
+    def _make_job(self, status="pending"):
+        from backend.models.import_job import ImportJob
+        db = _db()
+        try:
+            job = ImportJob(
+                user_id=str(uuid.uuid4()),
+                username=f"{_PREFIX}h",
+                upload_id=str(uuid.uuid4()),
+                filename="cancel_test.xlsx",
+                connection_env="sg",
+                status=status,
+            )
+            db.add(job)
+            db.commit()
+            db.refresh(job)
+            return str(job.id)
+        finally:
+            db.close()
+
+    def test_H1_cancel_pending_job_returns_200(self):
+        """pending 状态任务可以取消 → 200, data.status=cancelling"""
+        job_id = self._make_job("pending")
+        resp = self._client().post(f"/api/v1/data-import/jobs/{job_id}/cancel")
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["success"])
+        self.assertEqual(resp.json()["data"]["status"], "cancelling")
+
+    def test_H2_cancel_running_job_returns_200(self):
+        """running 状态任务可以取消 → 200"""
+        job_id = self._make_job("running")
+        resp = self._client().post(f"/api/v1/data-import/jobs/{job_id}/cancel")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["data"]["status"], "cancelling")
+
+    def test_H3_cancel_completed_job_returns_400(self):
+        """completed 任务不可取消 → 400"""
+        job_id = self._make_job("completed")
+        resp = self._client().post(f"/api/v1/data-import/jobs/{job_id}/cancel")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("completed", resp.json()["detail"])
+
+    def test_H4_cancel_failed_job_returns_400(self):
+        """failed 任务不可取消 → 400"""
+        job_id = self._make_job("failed")
+        resp = self._client().post(f"/api/v1/data-import/jobs/{job_id}/cancel")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_H5_cancel_nonexistent_job_returns_404(self):
+        """不存在的 job_id → 404"""
+        resp = self._client().post(f"/api/v1/data-import/jobs/{uuid.uuid4()}/cancel")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_H6_cancel_sets_db_status_to_cancelling(self):
+        """cancel 请求后 DB 中 status 字段更新为 cancelling"""
+        from backend.models.import_job import ImportJob
+        job_id = self._make_job("pending")
+        self._client().post(f"/api/v1/data-import/jobs/{job_id}/cancel")
+        db = _db()
+        try:
+            job = db.query(ImportJob).filter(ImportJob.id == job_id).first()
+            self.assertIsNotNone(job)
+            self.assertEqual(job.status, "cancelling")
+        finally:
+            db.close()
+
+    def test_H7_cancel_already_cancelling_returns_400(self):
+        """cancelling 状态任务再次取消 → 400（幂等保护）"""
+        job_id = self._make_job("cancelling")
+        resp = self._client().post(f"/api/v1/data-import/jobs/{job_id}/cancel")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_H8_cancel_already_cancelled_returns_400(self):
+        """cancelled 状态任务不可取消 → 400"""
+        job_id = self._make_job("cancelled")
+        resp = self._client().post(f"/api/v1/data-import/jobs/{job_id}/cancel")
+        self.assertEqual(resp.status_code, 400)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# I — delete 端点 (4 tests)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestDeleteEndpoint(unittest.TestCase):
+    """验证 DELETE /jobs/{job_id} 任务记录删除行为"""
+
+    def _client(self):
+        from fastapi.testclient import TestClient
+        from backend.main import app
+        return TestClient(app, raise_server_exceptions=False)
+
+    def _make_job(self, status="completed"):
+        from backend.models.import_job import ImportJob
+        db = _db()
+        try:
+            job = ImportJob(
+                user_id=str(uuid.uuid4()),
+                username=f"{_PREFIX}i",
+                upload_id=str(uuid.uuid4()),
+                filename="delete_test.xlsx",
+                connection_env="sg",
+                status=status,
+            )
+            db.add(job)
+            db.commit()
+            db.refresh(job)
+            return str(job.id)
+        finally:
+            db.close()
+
+    def test_I1_delete_existing_job_returns_200(self):
+        """删除存在的任务 → 200, success=true"""
+        job_id = self._make_job("completed")
+        resp = self._client().delete(f"/api/v1/data-import/jobs/{job_id}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["success"])
+
+    def test_I2_delete_nonexistent_job_returns_404(self):
+        """删除不存在的任务 → 404"""
+        resp = self._client().delete(f"/api/v1/data-import/jobs/{uuid.uuid4()}")
+        self.assertEqual(resp.status_code, 404)
+
+    def test_I3_delete_removes_record_from_db(self):
+        """删除后 DB 中记录消失"""
+        from backend.models.import_job import ImportJob
+        job_id = self._make_job("failed")
+        self._client().delete(f"/api/v1/data-import/jobs/{job_id}")
+        db = _db()
+        try:
+            job = db.query(ImportJob).filter(ImportJob.id == job_id).first()
+            self.assertIsNone(job)
+        finally:
+            db.close()
+
+    def test_I4_delete_active_job_also_succeeds(self):
+        """删除 running/pending 任务也返回 200（不阻止删除记录，不停止后台任务）"""
+        job_id = self._make_job("running")
+        resp = self._client().delete(f"/api/v1/data-import/jobs/{job_id}")
+        self.assertEqual(resp.status_code, 200)
 
 
 if __name__ == "__main__":

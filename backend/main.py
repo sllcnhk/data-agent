@@ -83,6 +83,43 @@ async def lifespan(app: FastAPI):
         await manager.register_agent(agent)
         logger.info(f"Created agent: {agent.agent_id}")
 
+    # 恢复孤儿导入任务（服务重启后，非终态任务已无活跃协程）
+    try:
+        from backend.config.database import SessionLocal
+        from backend.models.import_job import ImportJob
+        from datetime import datetime as _dt
+        _db = SessionLocal()
+        try:
+            _now = _dt.utcnow()
+            _interrupted = _db.query(ImportJob).filter(
+                ImportJob.status.in_(["pending", "running"])
+            ).all()
+            for _j in _interrupted:
+                _j.status = "failed"
+                _j.error_message = "服务重启，任务已中断"
+                _j.finished_at = _now
+                _j.updated_at = _now
+            _cancelling = _db.query(ImportJob).filter(
+                ImportJob.status == "cancelling"
+            ).all()
+            for _j in _cancelling:
+                _j.status = "cancelled"
+                _j.finished_at = _now
+                _j.updated_at = _now
+            if _interrupted or _cancelling:
+                _db.commit()
+                logger.info(
+                    "Startup recovery: %d interrupted job(s) → failed, %d cancelling → cancelled",
+                    len(_interrupted), len(_cancelling),
+                )
+        except Exception as _e:
+            _db.rollback()
+            logger.warning("Import job startup recovery failed (non-critical): %s", _e)
+        finally:
+            _db.close()
+    except Exception as _e:
+        logger.warning("Could not run import job startup recovery: %s", _e)
+
     # 启动 SKILL.md 热加载文件监视器
     try:
         from backend.skills.skill_loader import reload_skills

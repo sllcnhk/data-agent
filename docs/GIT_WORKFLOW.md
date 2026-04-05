@@ -196,9 +196,11 @@ git config --global user.email "你的邮箱"
 6. 点击 `Create repository`
 7. 复制仓库地址（HTTPS 格式：`https://github.com/用户名/data-agent.git`）
 
-**认证方式**（二选一）：
-- **HTTPS + Personal Access Token**：在 GitHub Settings → Developer Settings → Personal access tokens 生成 token，首次 push 时输入
-- **SSH Key**：生成 SSH 密钥对，更方便（一次配置，永久免密）
+**认证方式**：使用 SSH Key（已配置）
+
+- 本机 SSH 密钥：`~/.ssh/id_ed25519`（ed25519，2026-04-03 生成）
+- 远程地址：`git@github.com:sllcnhk/data-agent.git`（SSH 方式，国内 443 端口受阻时仍可用）
+- 日常 push/pull 无需输入密码，一次配置永久生效
 
 ---
 

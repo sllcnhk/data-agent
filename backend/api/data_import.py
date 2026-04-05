@@ -120,6 +120,9 @@ async def get_tables(
 # 3. Excel 上传 + 预览
 # ─────────────────────────────────────────────────────────────────────────────
 
+_UPLOAD_CHUNK_SIZE = 1 * 1024 * 1024  # 1 MB per chunk
+
+
 @router.post("/upload")
 async def upload_excel(
     file: UploadFile = File(...),
@@ -131,20 +134,19 @@ async def upload_excel(
     - 文件大小上限 100 MB
     - 保存路径：customer_data/{username}/imports/{upload_id}.xlsx
     - 返回 upload_id（供后续 execute 使用）
+
+    性能优化：
+    - 分块流式写文件（避免 60 MB 全量加载到内存后再写盘）
+    - parse_excel_preview 放进线程池（openpyxl 是 CPU/IO 密集型，不阻塞事件循环）
     """
+    import asyncio
+    import concurrent.futures
+
     # 文件类型检查
     if not file.filename or not file.filename.lower().endswith((".xlsx", ".xls")):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="仅支持 .xlsx 或 .xls 文件",
-        )
-
-    # 读取文件内容（检查大小）
-    content = await file.read()
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"文件大小超出限制（最大 {MAX_FILE_SIZE // 1024 // 1024} MB）",
         )
 
     # 保存到临时目录
@@ -153,22 +155,44 @@ async def upload_excel(
     import_dir.mkdir(parents=True, exist_ok=True)
 
     upload_id = str(uuid.uuid4())
-    # 保留原始扩展名（统一为 .xlsx 或 .xls）
     suffix = Path(file.filename).suffix.lower()
     tmp_path = import_dir / f"{upload_id}{suffix}"
 
+    # 分块流式写文件，边写边检查大小
+    file_size = 0
     try:
-        tmp_path.write_bytes(content)
+        with tmp_path.open("wb") as fp:
+            while True:
+                chunk = await file.read(_UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                file_size += len(chunk)
+                if file_size > MAX_FILE_SIZE:
+                    fp.close()
+                    tmp_path.unlink(missing_ok=True)
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"文件大小超出限制（最大 {MAX_FILE_SIZE // 1024 // 1024} MB）",
+                    )
+                fp.write(chunk)
+    except HTTPException:
+        raise
     except Exception as e:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=f"文件保存失败: {e}")
 
-    # 解析预览
+    # 在线程池中解析预览（openpyxl 阻塞 CPU/IO，不能跑在事件循环线程上）
+    loop = asyncio.get_event_loop()
     try:
-        sheets = parse_excel_preview(str(tmp_path))
+        sheets = await loop.run_in_executor(
+            None, parse_excel_preview, str(tmp_path)
+        )
     except Exception as e:
-        # 解析失败 → 删除临时文件
         try:
-            tmp_path.unlink()
+            tmp_path.unlink(missing_ok=True)
         except Exception:
             pass
         raise HTTPException(
@@ -181,7 +205,7 @@ async def upload_excel(
         "data": {
             "upload_id": upload_id,
             "filename": file.filename,
-            "file_size": len(content),
+            "file_size": file_size,
             "sheets": sheets,
         },
     }

@@ -1,6 +1,6 @@
 # 部署指南
 
-> 版本：v2.0 · 2026-03-26（**文件写入下载**：`files_written` SSE 事件 + `GET /api/v1/files/download` 安全下载端点 + `FILE_OUTPUT_DATE_SUBFOLDER` 配置，**无 DB 迁移**；技能路由可视化：`skill_matched` SSE 事件 + `SkillLoader._last_match_info` + ThoughtProcess 🧠 面板 + `GET /skills/load-errors`，**无 DB 迁移**；侧边栏 Tab UI + is_shared：`migrate_add_is_shared.py` DB 迁移；对话用户隔离：`migrate_conversation_user_isolation.py` DB 迁移 + 所有对话/分组端点补全鉴权；customer_data 用户隔离；对话附件上传）
+> 版本：v2.1 · 2026-04-05（**Excel 数据导入**：`migrate_data_import.py` DB 迁移（`import_jobs` 表 + `data:import` 权限）；流式上传支持 100MB 大文件；**文件写入下载**：`files_written` SSE 事件 + `GET /api/v1/files/download` 安全下载端点 + `FILE_OUTPUT_DATE_SUBFOLDER` 配置，**无 DB 迁移**；技能路由可视化：`skill_matched` SSE 事件 + `SkillLoader._last_match_info` + ThoughtProcess 🧠 面板 + `GET /skills/load-errors`，**无 DB 迁移**；侧边栏 Tab UI + is_shared：`migrate_add_is_shared.py` DB 迁移；对话用户隔离：`migrate_conversation_user_isolation.py` DB 迁移 + 所有对话/分组端点补全鉴权；customer_data 用户隔离；对话附件上传）
 >
 > 本文档说明如何将数据智能分析 Agent 系统从 Windows 开发环境迁移到 Linux 服务器，供团队多人共用。
 
@@ -143,6 +143,7 @@ sudo apt install -y git curl unzip build-essential libpq-dev
 │       └── user/         ← 用户自定义技能（ENABLE_AUTH=false: flat 目录；ENABLE_AUTH=true: user/{username}/ 子目录）
 ├── customer_data/        ← Agent 数据输出根目录（需要写权限）
 │   └── {username}/       ← 每位用户独立子目录（服务启动后首次对话时自动创建）
+│       └── imports/      ← Excel 数据导入临时文件（导入任务完成/失败后自动清理）
 ├── logs/                 ← 后端日志（自动创建）
 ├── data/                 ← ChromaDB 缓存（自动创建）
 │   ├── vector_db/
@@ -787,6 +788,8 @@ RATE_LIMIT_PER_MINUTE=60
 > **对话附件元数据**：用户发送附件（图片/PDF/文本/CSV/JSON）时，系统将 base64 数据发送给 LLM 识别，但**仅将元数据**（文件名、MIME 类型、文件大小）存入 `messages.extra_metadata["attachments"]` JSONB 数组。单个附件元数据约 100–200 字节。历史消息中的附件以文本注解形式呈现给 LLM（如 `[附件: report.pdf (application/pdf, 12345 bytes)]`），**不会重复存储 base64 内容**。**无需数据库迁移**（复用现有 `extra_metadata` JSONB 列）。20MB 附件经 base64 编码后约 27MB，Nginx `client_max_body_size 100m` 已足够覆盖。
 >
 > **Agent 文件写入元数据**：Agent 通过 `write_file` 工具写出的文件（CSV/JSON/Excel 等），路径信息存入 `messages.extra_metadata["files_written"]`（`[{path, name, size, mime_type}]`）。文件实体存储在 `customer_data/{username}/` 目录（非数据库），用户通过 `GET /api/v1/files/download?path=...` 下载。**无需数据库迁移**（复用现有 `extra_metadata` JSONB 列）。
+>
+> **Excel 数据导入任务记录**：每次导入任务以记录形式写入 `import_jobs` 表（UUID PK），包含状态、进度（已导入行数/批次）、错误信息和配置快照。上传的 Excel 临时文件存于 `customer_data/{username}/imports/`，任务完成或失败后自动删除（`os.unlink`）。**需执行 `migrate_data_import.py`**（新建 `import_jobs` 表 + 种子 `data:import` 权限）。文件大小上限 100MB，采用 1MB 分块流式写盘（不全量加载内存），支持大文件上传。
 
 ---
 
@@ -812,6 +815,9 @@ python backend/scripts/migrate_conversation_user_isolation.py
 
 # is_shared 字段迁移（群组框架预留，始终执行；幂等，已存在列时自动跳过）
 python backend/scripts/migrate_add_is_shared.py
+
+# Excel 数据导入迁移（创建 import_jobs 表 + data:import 权限；幂等）
+python backend/scripts/migrate_data_import.py
 
 # 验证表结构
 python -c "
@@ -846,6 +852,9 @@ python backend/scripts/migrate_conversation_user_isolation.py
 python backend/scripts/migrate_add_is_shared.py
 
 # v1.9+ 技能路由可视化：无 DB 迁移，仅代码更新即可
+
+# v2.1+ Excel 数据导入：执行 DB 迁移（幂等，已执行过会跳过）
+python backend/scripts/migrate_data_import.py
 
 # 重启服务
 sudo systemctl restart data-agent-backend
@@ -1311,6 +1320,31 @@ CLICKHOUSE_THAI_READONLY_PASSWORD=<密码>
 # nginx.conf server 块内
 client_max_body_size 100m;
 ```
+
+---
+
+### Q: Excel 数据导入时上传大文件（50MB+）超时
+
+**A:** 上传超时通常由以下原因引起：
+
+1. **Nginx 请求体大小限制**：确认 Nginx 配置了足够大的 `client_max_body_size`（需 ≥ 100m）：
+   ```nginx
+   client_max_body_size 100m;
+   ```
+
+2. **Nginx 代理超时**：确认 nginx.conf 中 `/api/` location 块的超时足够长：
+   ```nginx
+   proxy_read_timeout 600s;
+   proxy_send_timeout 600s;
+   ```
+
+3. **前端 axios 超时**：数据导入上传接口的客户端超时已设置为 10 分钟（600000ms），无需调整。
+
+4. **后端 Vite 代理超时（仅开发环境）**：`vite.config.ts` 中 `/api` 代理的 `timeout` 已设置为 600000ms，无需调整。
+
+5. **文件大小超限**：系统上限 100MB；超过时服务器返回 413。确认 Excel 文件是否真的超过了 100MB。
+
+> 后端采用 1MB 分块流式写盘，上传 60MB 文件约需 30–60 秒（取决于网络带宽）；openpyxl 解析预览在线程池中运行，不阻塞事件循环。
 
 ---
 
