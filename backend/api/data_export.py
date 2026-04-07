@@ -274,6 +274,14 @@ async def delete_job(
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"任务不存在: {job_id}")
 
+    # 只允许删除终态任务（完成/取消/失败），活跃任务须先取消
+    _TERMINAL = {"completed", "cancelled", "failed"}
+    if job.status not in _TERMINAL:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"无法删除状态为 '{job.status}' 的任务，请先取消后再删除",
+        )
+
     # 删除本地文件
     if job.file_path:
         try:

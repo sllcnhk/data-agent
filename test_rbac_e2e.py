@@ -366,14 +366,15 @@ class TestPermissionsAPI(unittest.TestCase):
             )
         self.assertEqual(resp.status_code, 403, resp.text)
 
-    def test_K4_all_13_permissions_present(self):
-        """权限列表包含设计文档中定义的全部 13 个权限"""
+    def test_K4_all_permissions_present(self):
+        """权限列表包含设计文档中定义的全部权限（含 data:export）"""
         expected = {
             "chat:use", "skills.user:read", "skills.user:write",
             "skills.project:read", "skills.project:write", "skills.system:read",
             "models:read", "models:write",
             "users:read", "users:write", "users:assign_role",
             "settings:read", "settings:write",
+            "data:export",
         }
         with patch("backend.config.settings.settings.enable_auth", True):
             resp = self.client.get(
@@ -873,13 +874,14 @@ class TestPermissionMatrixCompleteness(unittest.TestCase):
                          f"viewer 应仅有 chat:use，实际: {perms}")
 
     def test_O2_analyst_role_permissions(self):
-        """analyst 角色权限符合设计：chat + skills.user + skills.project:read + skills.system:read"""
+        """analyst 角色权限符合设计：chat + skills + settings:read（MCPStatus 所需）"""
         perms = self._perms(self.analyst_user)
         expected = {
             "chat:use",
             "skills.user:read", "skills.user:write",
             "skills.project:read",
             "skills.system:read",
+            "settings:read",   # MCPStatus 组件可见
         }
         self.assertEqual(perms, expected,
                          f"analyst 权限不符合设计\n期望: {expected}\n实际: {perms}")
@@ -899,9 +901,9 @@ class TestPermissionMatrixCompleteness(unittest.TestCase):
                          f"admin 权限不符合设计\n期望: {expected}\n实际: {perms}")
 
     def test_O4_superadmin_role_has_all_permissions(self):
-        """superadmin 角色拥有全部 13 个权限"""
+        """superadmin 角色拥有全部权限（含 data:export）"""
         perms = self._perms(self.super_user)
-        all_13 = {
+        all_expected = {
             "chat:use",
             "skills.user:read", "skills.user:write",
             "skills.project:read", "skills.project:write",
@@ -909,8 +911,9 @@ class TestPermissionMatrixCompleteness(unittest.TestCase):
             "models:read", "models:write",
             "users:read", "users:write", "users:assign_role",
             "settings:read", "settings:write",
+            "data:export",
         }
-        missing = all_13 - perms
+        missing = all_expected - perms
         self.assertEqual(missing, set(),
                          f"superadmin 缺少权限: {missing}")
 
