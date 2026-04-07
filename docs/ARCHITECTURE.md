@@ -96,17 +96,21 @@ data-agent/
 │   │   ├── role_permission.py      # ★ RolePermission 关联表
 │   │   ├── refresh_token.py        # ★ RefreshToken（jti uuid，轮换/revoke 状态）
 │   │   ├── import_job.py           # ★ ImportJob（数据导入任务，状态机 + 进度追踪 + JSONB 配置快照）
+│   │   ├── export_job.py           # ★ ExportJob（SQL→Excel 导出任务，状态机 + 批次/Sheet 进度追踪）
 │   │   └── ...                     # 其他模型（Conversation/Message/Task/Report 等）
 │   ├── scripts/
-│   │   ├── init_rbac.py            # ★ 初始化 4 角色 + 13 权限（幂等，首次部署运行）
-│   │   └── migrate_data_import.py  # ★ 创建 import_jobs 表 + 种子 data:import 权限（幂等）
+│   │   ├── init_rbac.py            # ★ 初始化 4 角色 + 15 权限（幂等，首次部署运行）
+│   │   ├── migrate_data_import.py  # ★ 创建 import_jobs 表 + 种子 data:import 权限（幂等）
+│   │   └── migrate_data_export.py  # ★ 创建 export_jobs 表 + 种子 data:export 权限（幂等）
 │   └── config/
 │       └── settings.py             # Pydantic Settings（环境变量映射，含 RBAC 配置项）
 ├── frontend/src/
 │   ├── pages/Chat.tsx              # ★ 主聊天页面（SSE 消费、Modal 渲染、附件 chips 展示）
 │   ├── pages/Roles.tsx             # ★ 角色权限管理页面（卡片视图 + 权限分配弹窗；users:read 权限）
 │   ├── pages/DataImport.tsx        # ★ Excel 数据导入页面（3步骤向导：选连接/上传→配置Sheet→进度监控；data:import 权限）
+│   ├── pages/DataExport.tsx        # ★ SQL→Excel 数据导出页面（SQL编辑→预览→提交→进度轮询→下载；data:export 权限）
 │   ├── services/dataImportApi.ts   # ★ 数据导入 API 客户端（9 个方法，大文件 timeout=10min）
+│   ├── services/dataExportApi.ts   # ★ 数据导出 API 客户端（8 个方法，execute/poll/download/cancel）
 │   ├── store/useChatStore.ts       # Zustand store（消息、审批、续接、isCancelling 状态）
 │   ├── store/useAuthStore.ts       # ★ JWT 认证状态（access_token 内存；initAuth 4路径；isAnonymousUser；authChecked）
 │   ├── App.tsx                     # ★ 路由定义；RequireAuth（authChecked 防闪烁）；initAuth() on mount
@@ -122,9 +126,11 @@ data-agent/
 │   ├── superadmin/                 # superadmin 用户数据（含历史迁移数据）
 │   │   ├── db_knowledge/           # 数据库元数据知识库
 │   │   ├── imports/                # Excel 数据导入临时文件（完成/失败后自动清理）
+│   │   ├── exports/                # SQL→Excel 导出文件（下载后可手动删除）
 │   │   └── reports/                # 分析报告输出
 │   └── {username}/                 # 其他用户各自独立子目录
-│       └── imports/                # 各用户的 Excel 导入临时文件
+│       ├── imports/                # 各用户的 Excel 导入临时文件
+│       └── exports/                # 各用户的 SQL→Excel 导出文件
 └── .claude/
     ├── agent_config.yaml           # Agent→MCP 绑定配置（ClickHouse 权限 + 迭代次数）
     └── skills/                     # 三层技能目录（系统/项目/用户）
@@ -861,6 +867,48 @@ cancelling ──(协程检测到)──► cancelled
 
 ---
 
+### 4.18 SQL → Excel 数据导出流程
+
+```
+前端 DataExport.tsx
+  └─ POST /api/v1/data-export/preview        ← SQL 预览（前 100 行）
+  └─ POST /api/v1/data-export/execute        ← 提交导出任务，返回 job_id
+       └─ data_export.py → 创建 ExportJob(status=pending)
+       └─ asyncio.create_task(run_export_job(job_id, config))
+            ├─ job.status = "running"; job.started_at = now
+            ├─ 线程池执行 get_columns() → 获取列信息（决定表头）
+            ├─ openpyxl.Workbook(write_only=True)   ← 流式写 xlsx，低内存峰值
+            ├─ for batch in iter_batches(sql, batch_size=50000):
+            │    ├─ 检查 job.status == "cancelling" → break → status="cancelled"
+            │    ├─ 写入当前批次行（Int64/UInt64/Int128+ → str，防科学计数法）
+            │    ├─ 当前 Sheet 行数 ≥ 1,000,000 → 自动新建下一个 Sheet（含表头）
+            │    ├─ exported_rows += len(batch); done_batches += 1
+            │    └─ 每 10 批持久化进度到 DB（减少 PostgreSQL 往返）
+            ├─ workbook.save(output_path)
+            └─ status="completed"; file_size=os.path.getsize(output_path)
+  └─ GET  /api/v1/data-export/jobs/{job_id}  ← 前端轮询进度（200ms 间隔）
+  └─ GET  /api/v1/data-export/jobs/{job_id}/download  ← 下载 xlsx
+```
+
+**状态机**：
+
+```
+pending ──(协程启动)──► running ──(完成)──► completed
+                   │         └──(失败)──► failed
+                   │
+   ┌──(POST cancel)──┘
+   ▼
+cancelling ──(协程检测到)──► cancelled
+```
+
+**大整数处理**：ClickHouse `Int64`/`UInt64`/`Int128`/`UInt128`/`Int256`/`UInt256` 超出 JS/Excel 安全整数范围（2^53），自动转换为字符串写入单元格，防止精度丢失（显示为科学计数法）。
+
+**多 Sheet 自动分割**：Excel 单 Sheet 行数上限 `MAX_ROWS_PER_SHEET = 1,000,000`。超限时自动创建新 Sheet（`Sheet1` → `Sheet2` → …），每个 Sheet 均含表头行。
+
+**权限**：全部 8 个 `/data-export/*` 端点均通过 `Depends(require_permission("data", "export"))` 保护。默认仅 superadmin 拥有 `data:export` 权限（可通过角色管理 API 动态授予其他角色）。`ENABLE_AUTH=false` 时 AnonymousUser(is_superadmin=True) 自动通过。
+
+---
+
 ## 5. SSE 事件类型参考
 
 前端通过 `text/event-stream` 接收以下事件（均为 JSON）：
@@ -975,7 +1023,7 @@ cancelling ──(协程检测到)──► cancelled
 ### 权限 `/permissions`
 | 方法 | 路径 | 权限要求 | 说明 |
 |------|------|---------|------|
-| GET | `/permissions` | `users:read` | 全量权限定义列表（共 13 条，含 resource/action/description）|
+| GET | `/permissions` | `users:read` | 全量权限定义列表（共 15 条，含 resource/action/description）|
 
 ### 文件下载 `/files`
 
@@ -1000,6 +1048,21 @@ cancelling ──(协程检测到)──► cancelled
 | GET | `/data-import/jobs` | 历史任务列表（分页，按 created_at 倒序），参数：`page`/`page_size` |
 | POST | `/data-import/jobs/{job_id}/cancel` | 请求取消 pending/running 任务（将状态置为 cancelling；协作式，非强制终止） |
 | DELETE | `/data-import/jobs/{job_id}` | 删除任务记录（不影响已导入数据） |
+
+### 数据导出 `/data-export`
+
+> 全部端点需 `data:export` 权限（**默认仅 superadmin**，可通过角色管理 API 动态授予其他角色）。`ENABLE_AUTH=false` 时 AnonymousUser(is_superadmin=True) 自动通过。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/data-export/connections` | 所有可写 ClickHouse 连接（复用 data-import 的枚举逻辑，排除 -ro 只读服务器） |
+| POST | `/data-export/preview` | SQL 预览：加 LIMIT 执行，返回列信息 + 前 N 行（默认 100，最多 500）。线程池执行，不阻塞事件循环 |
+| POST | `/data-export/execute` | 提交导出任务。创建 `ExportJob` 记录（status=pending）并后台启动 `run_export_job` 协程。立即返回 `job_id` |
+| GET | `/data-export/jobs/{job_id}` | 查询任务状态与进度（used for 前端轮询）：exported_rows / done_batches / current_sheet / total_sheets |
+| POST | `/data-export/jobs/{job_id}/cancel` | 请求取消 pending/running 任务（pending→直接 cancelled；running→cancelling，协作式） |
+| DELETE | `/data-export/jobs/{job_id}` | 删除任务记录及本地 xlsx 文件（**仅允许终态**：completed/cancelled/failed，活跃任务须先取消） |
+| GET | `/data-export/jobs` | 历史导出任务列表（分页，按 created_at 倒序），参数：`page`/`page_size` |
+| GET | `/data-export/jobs/{job_id}/download` | 下载已完成的 xlsx 文件（`FileResponse`，触发浏览器另存为对话框） |
 
 ### 分组管理 `/groups`
 
@@ -1233,12 +1296,14 @@ ENABLE_AUTH=false                       ENABLE_AUTH=true
 | `skills.project:write` | — | — | ✓ | ✓ |
 | `skills.system:read` | — | ✓ | ✓ | ✓ |
 | `models:read` | — | — | ✓ | ✓ |
-| `settings:read` | — | — | ✓ | ✓ |
+| `models:write` | — | — | ✓ | ✓ |
+| `settings:read` | — | ✓ | ✓ | ✓ |
 | `settings:write` | — | — | ✓ | ✓ |
 | `users:read` | — | — | — | ✓ |
 | `users:write` | — | — | — | ✓ |
 | `users:assign_role` | — | — | — | ✓ |
-| ... | — | — | — | ✓ |
+| `data:import` | — | — | — | ✓ |
+| `data:export` | — | — | — | ✓ |
 
 > `is_superadmin=True` 的用户跳过角色表，直接被授予系统中所有权限（`get_user_permissions` 返回全量权限列表）。
 

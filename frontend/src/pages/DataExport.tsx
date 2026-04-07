@@ -108,6 +108,7 @@ const DataExport: React.FC = () => {
   const [listPage, setListPage] = useState(1);
   const [listPageSize] = useState(10);
   const [listLoading, setListLoading] = useState(false);
+  const [downloadingIds, setDownloadingIds] = useState<Set<string>>(new Set());
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // ── 加载连接列表 ─────────────────────────────────────────────────────────────
@@ -234,15 +235,41 @@ const DataExport: React.FC = () => {
   };
 
   // ── 下载文件 ─────────────────────────────────────────────────────────────────
-  const handleDownload = (job: ExportJob) => {
-    const url = dataExportApi.getDownloadUrl(job.job_id);
-    // 通过动态 <a> 触发浏览器另存为
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = job.output_filename ?? 'export.xlsx';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+  // 使用 axios blob 下载，确保 Authorization Bearer token 随请求发送。
+  // 原生 <a href> 导航不经过 axios 拦截器，会触发 401 → 浏览器报"无法从网站上提取文件"。
+  const handleDownload = async (job: ExportJob) => {
+    setDownloadingIds(prev => new Set(prev).add(job.job_id));
+    try {
+      const blob = await dataExportApi.downloadFile(job.job_id);
+      const objectUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = objectUrl;
+      a.download = job.output_filename ?? `export_${job.job_id}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(objectUrl);
+    } catch (e: any) {
+      let detail = e?.message ?? '未知错误';
+      // responseType='blob' 时，错误响应 data 是 Blob，需要解析才能拿到 detail
+      if (e?.response?.data instanceof Blob) {
+        try {
+          const text = await (e.response.data as Blob).text();
+          detail = JSON.parse(text)?.detail ?? text;
+        } catch {
+          // ignore
+        }
+      } else if (e?.response?.data?.detail) {
+        detail = e.response.data.detail;
+      }
+      message.error(`下载失败: ${detail}`);
+    } finally {
+      setDownloadingIds(prev => {
+        const next = new Set(prev);
+        next.delete(job.job_id);
+        return next;
+      });
+    }
   };
 
   // ── 预览表格列 ───────────────────────────────────────────────────────────────
@@ -353,11 +380,12 @@ const DataExport: React.FC = () => {
       render: (_: any, r: ExportJob) => (
         <Space size="small">
           {r.status === 'completed' && (
-            <Tooltip title="下载">
+            <Tooltip title={downloadingIds.has(r.job_id) ? '下载中…' : '下载'}>
               <Button
                 type="link"
                 size="small"
                 icon={<DownloadOutlined />}
+                loading={downloadingIds.has(r.job_id)}
                 onClick={() => handleDownload(r)}
               />
             </Tooltip>

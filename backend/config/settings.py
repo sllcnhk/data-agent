@@ -237,6 +237,21 @@ class Settings(BaseSettings):
     max_upload_size: str = Field(default="100MB", env="MAX_UPLOAD_SIZE")
     upload_dir: str = Field(default="uploads", env="UPLOAD_DIR")
     export_dir: str = Field(default="exports", env="EXPORT_DIR")
+
+    # 导出任务 ClickHouse 查询设置（应用层 per-query 覆盖，不修改服务器配置）
+    export_query_max_execution_time: int = Field(
+        default=300,
+        env="EXPORT_QUERY_MAX_EXECUTION_TIME",
+    )
+    export_chunk_size: int = Field(
+        default=200_000,
+        env="EXPORT_CHUNK_SIZE",
+    )
+    export_auto_chunk_threshold: int = Field(
+        default=500_000,
+        env="EXPORT_AUTO_CHUNK_THRESHOLD",
+    )
+
     allowed_file_extensions: List[str] = Field(
         default_factory=lambda: [".csv", ".xlsx", ".xls", ".json", ".parquet", ".txt"],
         env="ALLOWED_FILE_EXTENSIONS"

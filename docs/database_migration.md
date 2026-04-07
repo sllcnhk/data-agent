@@ -1,6 +1,6 @@
 # 数据库迁移指南
 
-> **最后更新**：2026-04-05（**Excel 数据导入**：`migrate_data_import.py` 新建 `import_jobs` 表 + 种子 `data:import` 权限；**文件写入下载**：**无 DB 迁移**，文件路径元数据写入已有 `messages.extra_metadata["files_written"]` JSONB 列；技能路由可视化 T1-T6：**无新增 DB 迁移**，skill_matched SSE 事件 / SkillLoader._last_match_info / ThoughtProcess 🧠 面板均为代码层变更；新增 `migrate_add_is_shared.py`：`conversations.is_shared` 字段；对话用户隔离：`migrate_conversation_user_isolation.py`；其余历次变更均无数据库结构变更）
+> **最后更新**：2026-04-07（**SQL→Excel 数据导出**：`migrate_data_export.py` 新建 `export_jobs` 表 + 种子 `data:export` 权限；**Excel 数据导入**：`migrate_data_import.py` 新建 `import_jobs` 表 + 种子 `data:import` 权限；**文件写入下载**：**无 DB 迁移**，文件路径元数据写入已有 `messages.extra_metadata["files_written"]` JSONB 列；技能路由可视化 T1-T6：**无新增 DB 迁移**，skill_matched SSE 事件 / SkillLoader._last_match_info / ThoughtProcess 🧠 面板均为代码层变更；新增 `migrate_add_is_shared.py`：`conversations.is_shared` 字段；对话用户隔离：`migrate_conversation_user_isolation.py`；其余历次变更均无数据库结构变更）
 
 本文档说明数据库迁移的两种方式：
 1. **项目自有手动迁移脚本**（`backend/migrations/`）— 当前主要方式，支持 up/down
@@ -25,6 +25,7 @@
 | 技能路由可视化（T1-T6） | 2026-03-26 | **无 DB 迁移**。变更均为代码层：`SkillLoader._last_match_info`、`skill_matched` SSE 事件、ThoughtProcess 🧠 面板、`GET /skills/load-errors` API。推理事件经由已有 `messages.extra_metadata['thinking_events']` JSONB 路径持久化，无需结构变更。 | ✅ 无需执行 |
 | 文件写入下载（T1-T7） | 2026-03-26 | **无 DB 迁移**。Agent 写文件时生成的文件路径元数据（`[{path,name,size,mime_type}]`）写入已有 `messages.extra_metadata["files_written"]` JSONB 列，无需结构变更。文件实体存储于 `customer_data/{username}/` 目录（文件系统层面）。新增 `backend/api/files.py` 下载端点与 `FILE_OUTPUT_DATE_SUBFOLDER` 配置项均为代码/配置层变更。 | ✅ 无需执行 |
 | Excel 数据导入 | 2026-04-05 | **DB 迁移脚本**：`backend/scripts/migrate_data_import.py`。① 新建 `import_jobs` 表（UUID PK、状态机字段、进度追踪字段、错误信息、JSONB 配置快照）；② 插入 `data:import` 权限记录；③ 将 `data:import` 权限分配给 superadmin 角色。幂等（`CREATE TABLE IF NOT EXISTS` + `INSERT ... ON CONFLICT DO NOTHING`）。 | ✅ 已执行 |
+| SQL→Excel 数据导出 | 2026-04-07 | **DB 迁移脚本**：`backend/scripts/migrate_data_export.py`。① 新建 `export_jobs` 表（UUID PK、状态机字段、行级/批次/Sheet 三层进度字段、输出文件路径/大小、JSONB 配置快照）；② 插入 `data:export` 权限记录；③ 将 `data:export` 权限分配给 superadmin 角色。幂等（`CREATE TABLE IF NOT EXISTS` + `INSERT ... ON CONFLICT DO NOTHING`）。 | ✅ 已执行 |
 
 ---
 
@@ -207,6 +208,97 @@ ON CONFLICT DO NOTHING;
 - `backend/models/import_job.py` — `ImportJob` ORM 模型 + `to_dict()`
 - `backend/api/data_import.py` — 9 个端点：连接列表 / 数据库 / 表 / 上传 / 执行 / 状态 / 列表 / 取消 / 删除
 - `backend/services/data_import_service.py` — `run_import_job()` 后台协程（分批插入 + 协作式取消）
+
+---
+
+### migrate_data_export.py（2026-04-07）— SQL→Excel 数据导出
+
+**运行方式**：
+
+```bash
+# Windows + Anaconda（推荐方式）
+D:\ProgramData\Anaconda3\envs\dataagent\python.exe backend/scripts/migrate_data_export.py
+
+# Linux/Mac
+python backend/scripts/migrate_data_export.py
+```
+
+脚本幂等，多次运行无副作用（`CREATE TABLE IF NOT EXISTS` + `INSERT ... ON CONFLICT DO NOTHING`）。
+
+**创建的表结构**：
+
+```sql
+CREATE TABLE IF NOT EXISTS export_jobs (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    -- 所属用户
+    user_id     VARCHAR(64) NOT NULL,
+    username    VARCHAR(100) NOT NULL,
+
+    -- 导出配置
+    job_name        VARCHAR(200),
+    query_sql       TEXT NOT NULL,
+    connection_env  VARCHAR(50) NOT NULL,
+    connection_type VARCHAR(20) NOT NULL DEFAULT 'clickhouse',
+    db_name         VARCHAR(200),
+
+    -- 任务状态：pending → running → completed/failed；取消路径 → cancelling → cancelled
+    status          VARCHAR(20) NOT NULL DEFAULT 'pending',
+
+    -- 进度追踪（行级 / 批次 / Sheet 三层）
+    total_rows      INTEGER,
+    exported_rows   INTEGER DEFAULT 0,
+    total_batches   INTEGER,
+    done_batches    INTEGER DEFAULT 0,
+    current_sheet   VARCHAR(200),
+    total_sheets    INTEGER DEFAULT 0,
+
+    -- 输出文件
+    output_filename VARCHAR(500),
+    file_path       VARCHAR(1000),
+    file_size       BIGINT,
+
+    -- 配置快照（JSONB）
+    config_snapshot JSONB,
+
+    -- 错误信息
+    error_message   TEXT,
+
+    -- 时间戳
+    created_at  TIMESTAMP NOT NULL DEFAULT NOW(),
+    started_at  TIMESTAMP,
+    finished_at TIMESTAMP,
+    updated_at  TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+-- 索引
+CREATE INDEX IF NOT EXISTS idx_export_jobs_user_id    ON export_jobs(user_id);
+CREATE INDEX IF NOT EXISTS idx_export_jobs_status     ON export_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_export_jobs_created_at ON export_jobs(created_at);
+
+-- Step 2: 插入 data:export 权限（幂等）
+INSERT INTO permissions (id, resource, action, description)
+VALUES (gen_random_uuid(), 'data', 'export', 'SQL 查询结果导出为 Excel')
+ON CONFLICT (resource, action) DO NOTHING;
+
+-- Step 3: 将 data:export 权限分配给 superadmin 角色（幂等）
+INSERT INTO role_permissions (role_id, permission_id)
+SELECT r.id, p.id
+FROM roles r, permissions p
+WHERE r.name = 'superadmin' AND p.resource = 'data' AND p.action = 'export'
+ON CONFLICT DO NOTHING;
+```
+
+**状态机**：`pending` → `running` → `completed` / `failed`；取消路径：`pending` → `cancelled`（直接终态）；`running` → `cancelling` → `cancelled`（协作式，后台协程批次边界检测退出）。
+
+**权限范围**：`data:export` 默认仅 superadmin 角色持有；可通过角色管理 API（`POST /roles/{id}/permissions`）动态授予其他角色。前端菜单入口：侧边栏「数据导出」，需 `data:export` 权限。
+
+**删除保护**：`DELETE /data-export/jobs/{id}` 仅允许终态任务（`completed/cancelled/failed`）删除，防止后台协程写入孤儿文件（协程仍运行但 DB 记录已消失）。
+
+相关代码：
+- `backend/models/export_job.py` — `ExportJob` ORM 模型 + `to_dict()`
+- `backend/api/data_export.py` — 8 个端点：连接列表 / SQL预览 / 执行 / 状态 / 取消 / 删除 / 历史列表 / 下载
+- `backend/services/data_export_service.py` — `run_export_job()` 后台协程（流式写 xlsx + 多 Sheet 分割 + 大整数转换 + 协作式取消）
 
 ---
 

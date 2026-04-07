@@ -153,7 +153,17 @@ export const dataExportApi = {
     await apiClient.delete(`/data-export/jobs/${jobId}`);
   },
 
-  /** 获取文件下载 URL（供 <a href> 使用） */
-  getDownloadUrl: (jobId: string): string =>
-    `${API_BASE_URL}/data-export/jobs/${jobId}/download`,
+  /**
+   * 以 blob 方式下载导出文件。
+   * 通过 axios 发起请求，自动携带 Authorization Bearer token，
+   * 避免原生 <a href> 导航绕过认证拦截器导致 401。
+   * 大文件给 2 分钟超时（默认 30s 不够）。
+   */
+  downloadFile: async (jobId: string): Promise<Blob> => {
+    const res = await apiClient.get(`/data-export/jobs/${jobId}/download`, {
+      responseType: 'blob',
+      timeout: 120000,
+    });
+    return res.data as Blob;
+  },
 };

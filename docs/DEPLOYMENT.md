@@ -1,6 +1,6 @@
 # 部署指南
 
-> 版本：v2.1 · 2026-04-05（**Excel 数据导入**：`migrate_data_import.py` DB 迁移（`import_jobs` 表 + `data:import` 权限）；流式上传支持 100MB 大文件；**文件写入下载**：`files_written` SSE 事件 + `GET /api/v1/files/download` 安全下载端点 + `FILE_OUTPUT_DATE_SUBFOLDER` 配置，**无 DB 迁移**；技能路由可视化：`skill_matched` SSE 事件 + `SkillLoader._last_match_info` + ThoughtProcess 🧠 面板 + `GET /skills/load-errors`，**无 DB 迁移**；侧边栏 Tab UI + is_shared：`migrate_add_is_shared.py` DB 迁移；对话用户隔离：`migrate_conversation_user_isolation.py` DB 迁移 + 所有对话/分组端点补全鉴权；customer_data 用户隔离；对话附件上传）
+> 版本：v2.2 · 2026-04-07（**SQL→Excel 数据导出**：`migrate_data_export.py` DB 迁移（`export_jobs` 表 + `data:export` 权限）；流式写 xlsx + 多 Sheet 自动分割 + 大整数安全转换；v2.1 · 2026-04-05：**Excel 数据导入**：`migrate_data_import.py` DB 迁移（`import_jobs` 表 + `data:import` 权限）；流式上传支持 100MB 大文件；**文件写入下载**：`files_written` SSE 事件 + `GET /api/v1/files/download` 安全下载端点 + `FILE_OUTPUT_DATE_SUBFOLDER` 配置，**无 DB 迁移**；技能路由可视化：`skill_matched` SSE 事件 + `SkillLoader._last_match_info` + ThoughtProcess 🧠 面板 + `GET /skills/load-errors`，**无 DB 迁移**；侧边栏 Tab UI + is_shared：`migrate_add_is_shared.py` DB 迁移；对话用户隔离：`migrate_conversation_user_isolation.py` DB 迁移 + 所有对话/分组端点补全鉴权；customer_data 用户隔离；对话附件上传）
 >
 > 本文档说明如何将数据智能分析 Agent 系统从 Windows 开发环境迁移到 Linux 服务器，供团队多人共用。
 
@@ -143,7 +143,8 @@ sudo apt install -y git curl unzip build-essential libpq-dev
 │       └── user/         ← 用户自定义技能（ENABLE_AUTH=false: flat 目录；ENABLE_AUTH=true: user/{username}/ 子目录）
 ├── customer_data/        ← Agent 数据输出根目录（需要写权限）
 │   └── {username}/       ← 每位用户独立子目录（服务启动后首次对话时自动创建）
-│       └── imports/      ← Excel 数据导入临时文件（导入任务完成/失败后自动清理）
+│       ├── imports/      ← Excel 数据导入临时文件（导入任务完成/失败后自动清理）
+│       └── exports/      ← SQL→Excel 导出文件（下载后可通过 DELETE /jobs/{id} 手动清理）
 ├── logs/                 ← 后端日志（自动创建）
 ├── data/                 ← ChromaDB 缓存（自动创建）
 │   ├── vector_db/
@@ -252,7 +253,7 @@ EOF
 python -m alembic upgrade head
 
 # 初始化 RBAC 角色和权限数据（幂等，重复运行无副作用）
-# 写入 4 个预置角色（viewer/analyst/admin/superadmin）和 13 条权限定义
+# 写入 4 个预置角色（viewer/analyst/admin/superadmin）和 15 条权限定义
 # ENABLE_AUTH=true 时必须执行；ENABLE_AUTH=false 时可跳过
 python backend/scripts/init_rbac.py
 ```
@@ -790,6 +791,8 @@ RATE_LIMIT_PER_MINUTE=60
 > **Agent 文件写入元数据**：Agent 通过 `write_file` 工具写出的文件（CSV/JSON/Excel 等），路径信息存入 `messages.extra_metadata["files_written"]`（`[{path, name, size, mime_type}]`）。文件实体存储在 `customer_data/{username}/` 目录（非数据库），用户通过 `GET /api/v1/files/download?path=...` 下载。**无需数据库迁移**（复用现有 `extra_metadata` JSONB 列）。
 >
 > **Excel 数据导入任务记录**：每次导入任务以记录形式写入 `import_jobs` 表（UUID PK），包含状态、进度（已导入行数/批次）、错误信息和配置快照。上传的 Excel 临时文件存于 `customer_data/{username}/imports/`，任务完成或失败后自动删除（`os.unlink`）。**需执行 `migrate_data_import.py`**（新建 `import_jobs` 表 + 种子 `data:import` 权限）。文件大小上限 100MB，采用 1MB 分块流式写盘（不全量加载内存），支持大文件上传。
+>
+> **SQL→Excel 数据导出任务记录**：每次导出任务写入 `export_jobs` 表（UUID PK），包含状态（pending/running/completed/failed/cancelling/cancelled）、行级/批次/Sheet 三层进度字段、输出文件路径和 JSONB 配置快照。导出 xlsx 文件存于 `customer_data/{username}/exports/`，通过 `DELETE /data-export/jobs/{id}` 手动触发文件删除（`os.unlink`）。**需执行 `migrate_data_export.py`**（新建 `export_jobs` 表 + 种子 `data:export` 权限）。采用 `openpyxl.Workbook(write_only=True)` 流式写 xlsx（低内存峰值），超过 100 万行自动分 Sheet。
 
 ---
 
@@ -818,6 +821,9 @@ python backend/scripts/migrate_add_is_shared.py
 
 # Excel 数据导入迁移（创建 import_jobs 表 + data:import 权限；幂等）
 python backend/scripts/migrate_data_import.py
+
+# SQL→Excel 数据导出迁移（创建 export_jobs 表 + data:export 权限；幂等）
+python backend/scripts/migrate_data_export.py
 
 # 验证表结构
 python -c "
@@ -855,6 +861,9 @@ python backend/scripts/migrate_add_is_shared.py
 
 # v2.1+ Excel 数据导入：执行 DB 迁移（幂等，已执行过会跳过）
 python backend/scripts/migrate_data_import.py
+
+# v2.2+ SQL→Excel 数据导出：执行 DB 迁移（幂等，已执行过会跳过）
+python backend/scripts/migrate_data_export.py
 
 # 重启服务
 sudo systemctl restart data-agent-backend
@@ -934,7 +943,7 @@ SESSION_IDLE_TIMEOUT_MINUTES=120       # Session 空闲超时；超时后 /auth/
 | `viewer` | 只读用户 | `chat:use` |
 | `analyst` | 数据分析师 | `chat:use` + `skills.user:读写` + `skills.project/system:读` |
 | `admin` | 管理员 | analyst 全部 + `skills.project:写` + `models:读` + `settings:读` + `settings:写`（**无** `users:*`）|
-| `superadmin` | 超级管理员 | 全部 13 项权限（含 `users:读写/角色分配`），`is_superadmin=true` |
+| `superadmin` | 超级管理员 | 全部 15 项权限（含 `users:读写/角色分配`、`data:import/export`），`is_superadmin=true` |
 
 > **注意**：`admin` 角色无用户管理权限（无 `users:read/write/assign_role`）。用户管理功能仅 `is_superadmin=true` 的账号可用。
 
@@ -1397,6 +1406,8 @@ client_max_body_size 100m;
 [ ] RBAC 数据初始化（python backend/scripts/init_rbac.py，ENABLE_AUTH=true 时必须）
 [ ] 对话用户隔离迁移（python backend/scripts/migrate_conversation_user_isolation.py，首次部署执行）
 [ ] is_shared 字段迁移（python backend/scripts/migrate_add_is_shared.py，幂等，始终执行）
+[ ] Excel 数据导入迁移（python backend/scripts/migrate_data_import.py，幂等，始终执行）
+[ ] SQL→Excel 数据导出迁移（python backend/scripts/migrate_data_export.py，幂等，始终执行）
 [ ] 前端 npm run build，dist/ 复制到 /var/www/data-agent/
 [ ] Nginx 配置含 SSE 相关头，nginx -t 通过，reload
 [ ] systemd 服务配置，enable + start，status 为 active

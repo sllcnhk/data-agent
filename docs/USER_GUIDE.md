@@ -1600,7 +1600,7 @@ Authorization: Bearer <superadmin-token>
 GET /api/v1/permissions
 Authorization: Bearer <superadmin-token>
 
-# 响应：13 条权限定义列表，每条含 id / resource / action / description
+# 响应：15 条权限定义列表，每条含 id / resource / action / description
 ```
 
 完整权限键列表：
@@ -1614,13 +1614,14 @@ Authorization: Bearer <superadmin-token>
 | `skills.project:write` | 管理项目技能（需 Admin Token）|
 | `skills.system:read` | 查看系统技能 |
 | `models:read` | 查看模型配置 |
+| `models:write` | 新增/修改/删除 LLM Config |
 | `settings:read` | 查看 MCP 服务器列表/详情/统计（`GET /mcp/*`）|
 | `settings:write` | 调用 MCP 工具、测试连接（`POST /mcp/*`）|
 | `users:read` | 查看用户列表及角色权限页面 |
 | `users:write` | 创建/修改/删除用户和角色 |
 | `users:assign_role` | 为用户和角色分配/撤销权限 |
-| `tasks:read` | 查看任务列表 |
-| `agents:read` | 查看 Agent 状态 |
+| `data:import` | Excel 数据导入到 ClickHouse（superadmin 专属）|
+| `data:export` | SQL 查询结果导出为 Excel（superadmin 专属）|
 
 ---
 
@@ -1766,6 +1767,7 @@ python backend/scripts/migrate_conversation_user_isolation.py
 | 发送附件（图片/PDF/文件） | 输入框右侧**「📎 回形针」**按钮或粘贴图片（见 5.7 节）|
 | 下载 Agent 生成的文件（CSV/Excel/JSON 等）| 助手消息末尾 → **「📎 生成的文件」卡片** → 点击「下载」按钮（见 5.9 节）|
 | 将 Excel 文件批量导入 ClickHouse | 侧边栏 → **「数据导入」**（仅 superadmin；见第 12 节）|
+| 将 SQL 查询结果导出为 Excel | 侧边栏 → **「数据导出」**（仅 superadmin；见第 13 节）|
 | 查看本次回答调了哪些工具 | 助手消息上方 → 点击**「推理过程」** 折叠面板 |
 | 刷新页面后查看历史推理过程 | 推理过程已持久化，刷新后仍可展开（见 5.4 节）|
 | 了解 Agent 自动续接了几次 | 消息列表中查看 🔄 续接提示横幅（`[N/3]`）|
@@ -1982,6 +1984,133 @@ POST /api/v1/data-import/jobs/{job_id}/cancel
 
 # 删除记录
 DELETE /api/v1/data-import/jobs/{job_id}
+```
+
+---
+
+## 13. SQL → Excel 数据导出（superadmin 专属）
+
+> **权限要求**：仅 `superadmin` 用户可使用此功能（`data:export` 权限）。
+>
+> **入口**：侧边栏导航 → **「数据导出」**（`ExportOutlined` 图标，位于「数据导入」旁边）。`ENABLE_AUTH=false` 时（单用户模式），匿名用户默认为 superadmin，可直接使用。
+
+### 13.1 功能概述
+
+在页面输入任意 SELECT SQL，选择 ClickHouse 连接，预览前 N 行结果后一键导出为本地 Excel（`.xlsx`）文件。支持：
+
+- **流式导出**：服务端 HTTP 流式响应 + `openpyxl` write-only 模式，峰值内存仅为 `batch_size` × 行宽；不受大数据量影响
+- **多 Sheet 自动分割**：每满 100 万数据行自动创建新 Sheet（Sheet1、Sheet2…），每个 Sheet 均带标题行
+- **大整数安全**：`Int64`/`UInt64`/`Int128`/`UInt128`/`Int256`/`UInt256` 类型自动转为字符串，避免 Excel 打开时显示科学计数法
+- **中文无乱码**：`.xlsx` 格式（zip+XML），openpyxl 原生 UTF-8，无需编码转换
+- **任务取消**：导出中途可取消；取消后已写入部分保存为残余文件（可手动删除）
+- **历史记录**：任务列表保存所有导出记录，终止状态下可删除
+
+### 13.2 操作步骤
+
+#### 步骤一：输入 SQL + 选择连接 + 预览
+
+1. 进入数据导出页面，上方区域输入 SELECT SQL 语句（支持复杂查询，无需手动加 `LIMIT`）。
+2. 在「选择连接」下拉框选择目标 ClickHouse 连接（仅显示可写连接，只读连接不在列表中）。
+3. 点击「**查询**」按钮（或 `Ctrl+Enter`），后端执行 `SELECT * FROM (...) LIMIT N` 返回前 N 行预览数据。
+4. 预览表格显示列名、数据类型和前 N 行内容（`NULL` 值高亮显示）。
+
+> **预览限制**：默认返回前 100 行，可通过 `limit` 参数调整（最大 500）；预览不会触发导出任务。
+
+#### 步骤二：导出配置 + 提交
+
+1. 确认预览数据无误后，点击预览区域**右上角**的「**导出**」按钮。
+2. 弹出配置对话框：
+
+   | 字段 | 说明 |
+   |------|------|
+   | 任务名称 | 选填；用于文件名前缀（会自动净化特殊字符）；留空则使用 `export` |
+   | 批大小 | 每批从 ClickHouse 拉取的行数（默认 50000，范围 1000–200000） |
+
+3. 点击「**开始导出**」后：
+   - 后端创建导出任务（`status=pending`），返回 `job_id`
+   - 后台协程立即开始流式读取 + 写入 Excel
+
+#### 步骤三：监控进度 + 下载 / 取消 / 删除
+
+历史任务列表（页面下方）显示所有导出记录，每 2 秒自动轮询活跃任务状态：
+
+| 指标 | 说明 |
+|------|------|
+| 状态徽标 | `等待中` / `进行中` / `取消中` / `已取消` / `已完成` / `失败` |
+| 已导出行数 | 累计写入 Excel 的数据行数（不含标题行）|
+| Sheet 数 | 总 Sheet 数（每 100 万行新增一张）|
+| 文件大小 | 完成后显示 `.xlsx` 文件大小 |
+
+**操作按钮**：
+
+- **下载**（仅 `已完成`）：点击触发浏览器「另存为」对话框，下载本地 `.xlsx` 文件。
+- **取消**（仅 `等待中`/`进行中`）：协作式取消；后台协程在下一批次检测到信号后停止；`等待中` 任务直接置为 `已取消`。
+- **删除**（仅终止状态：`已完成`/`已取消`/`失败`）：删除 DB 记录和本地文件。
+
+> **取消注意**：取消后已写入部分会保存为残余文件；点击「删除」可一并清除。
+
+### 13.3 多 Sheet 自动分割说明
+
+当导出行数超过 100 万（Excel 单 Sheet 硬上限约 104 万行）时，系统自动创建新工作表：
+
+```
+Sheet1: 标题行 + 第 1–1,000,000 行数据
+Sheet2: 标题行 + 第 1,000,001–2,000,000 行数据
+Sheet3: 标题行 + 第 2,000,001–... 行数据
+```
+
+每个 Sheet 均保留相同的标题行，可直接跨 Sheet 使用 Excel 筛选/排序。
+
+### 13.4 大整数处理说明
+
+ClickHouse 的 `Int64`/`UInt64` 及更大整数类型（`Int128`/`UInt128`/`Int256`/`UInt256`）在 Excel 中会被当作浮点数显示，导致末尾精度丢失或科学计数法。系统自动将上述类型转换为**字符串**写入 Excel 单元格，保留完整精度。
+
+示例：`12345678901234567` → Excel 单元格文本值 `"12345678901234567"`（而非 `1.23457E+16`）。
+
+### 13.5 注意事项与限制
+
+| 项目 | 说明 |
+|------|------|
+| SQL 类型 | 仅支持 `SELECT` 查询；不执行 INSERT/UPDATE/DROP 等写操作 |
+| 连接类型 | 当前支持 ClickHouse；架构预留 MySQL 等扩展点（`BaseExportClient` 抽象层）|
+| 单 Sheet 行上限 | 系统限制 100 万数据行/Sheet，超出自动新建；Excel 实际单 Sheet 上限约 104 万行 |
+| 并发导出 | 无系统级并发限制，但大量并发会占用 ClickHouse 连接，建议顺序提交 |
+| 取消后文件 | 取消后已写入部分不会自动删除；需手动点「删除」清理 |
+| 文件存储路径 | 服务端存储于 `customer_data/{username}/exports/`；下载完成后可通过「删除」清理 |
+| 批大小 | 默认 50000 行/批；内存峰值约为 `batch_size × 行宽`；网络较慢时可适当降低 |
+
+### 13.6 API 快速参考（程序化调用）
+
+```bash
+# 获取可写连接列表
+GET /api/v1/data-export/connections
+Authorization: Bearer <superadmin_token>
+
+# SQL 预览（不触发导出任务）
+POST /api/v1/data-export/preview
+{"query_sql": "SELECT id, name FROM users", "connection_env": "sg", "limit": 100}
+→ 返回: {"columns": [{"name":"id","type":"Int64"},...], "rows": [...], "row_count": N}
+
+# 提交导出任务
+POST /api/v1/data-export/execute
+{"query_sql": "SELECT * FROM orders", "connection_env": "sg",
+ "job_name": "orders_2026", "batch_size": 50000}
+→ 返回: {"job_id": "...", "status": "pending", "output_filename": "orders_2026_20260407_120000.xlsx"}
+
+# 轮询进度
+GET /api/v1/data-export/jobs/{job_id}
+
+# 历史任务列表
+GET /api/v1/data-export/jobs?page=1&page_size=10
+
+# 取消任务
+POST /api/v1/data-export/jobs/{job_id}/cancel
+
+# 下载文件
+GET /api/v1/data-export/jobs/{job_id}/download
+
+# 删除记录（仅终止状态）
+DELETE /api/v1/data-export/jobs/{job_id}
 ```
 
 ---

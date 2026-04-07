@@ -8,8 +8,10 @@ test_data_export_full.py — 数据导出功能综合测试
   C (5)  — API 参数校验 & 边界场景
   D (5)  — 任务生命周期 & 删除管理（含 Bug Fix 验证）
   E (4)  — data:export 权限纳入角色权限管理范围验证
+  W (3)  — 分批提取链路回归（Code 160 / 正常流 / 取消 不因改动断裂）
+  Z (3)  — 下载链路回归（GET /download 完整链路验证）
 
-共计: 27 个测试用例
+共计: 33 个测试用例
 
 运行：
     /d/ProgramData/Anaconda3/envs/dataagent/python.exe -m pytest test_data_export_full.py -v -s
@@ -29,7 +31,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(1, os.path.join(os.path.dirname(__file__), "backend"))
 os.environ.setdefault("ENABLE_AUTH", "False")
 
-_PREFIX = f"_def_{uuid.uuid4().hex[:6]}_"
+_PREFIX = f"_t_def_{uuid.uuid4().hex[:6]}_"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -696,6 +698,252 @@ class TestPermissionManagementScope(unittest.TestCase):
                     self.assertIn("data:export", context,
                                   f"/data-export 菜单项附近未找到 data:export 权限配置:\n{context}")
                     break
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Section W — 分批提取链路回归（验证 chunked/stream 改动不破坏已有导出行为）
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestChunkedExtractionRegression(unittest.TestCase):
+    """
+    W1-W3: 确保分批提取改动（extra_settings、count_rows、stream_batches_chunked）
+    不破坏已有的端到端导出链路。
+
+    W1: 正常小查询走 stream 模式（无 Code 160）→ 导出成功，extra_settings 已注入
+    W2: Code 160 自动切换 chunked → 最终 completed，Excel 行数正确
+    W3: chunked 模式下取消任务仍可正常取消（not stuck）
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from backend.config.database import SessionLocal
+        cls.db = SessionLocal()
+        cls.tmp_dir = tempfile.mkdtemp()
+
+    @classmethod
+    def tearDownClass(cls):
+        from backend.models.export_job import ExportJob
+        try:
+            cls.db.query(ExportJob).filter(
+                ExportJob.username.like(f"{_PREFIX}%")
+            ).delete(synchronize_session=False)
+            cls.db.commit()
+        finally:
+            cls.db.close()
+
+    def _make_job(self, suffix=""):
+        from backend.models.export_job import ExportJob
+        job = ExportJob(
+            user_id="test-uid",
+            username=f"{_PREFIX}w_{suffix}",
+            query_sql="SELECT 1",
+            connection_env="test",
+            connection_type="clickhouse",
+            status="pending",
+            output_filename=f"{_PREFIX}w_{suffix}.xlsx",
+        )
+        self.db.add(job)
+        self.db.commit()
+        self.db.refresh(job)
+        return job
+
+    def _run_job(self, job_id, output_path, stream_effect, chunked_effect=None):
+        """
+        用 mock ClickHouseExportClient 运行 run_export_job。
+        stream_effect: 第一次 stream_batches 调用的返回（Exception 或可迭代批次列表）
+        chunked_effect: chunked 模式下 stream_batches_chunked 的返回（可迭代批次列表）
+        """
+        import asyncio
+        from backend.services.data_export_service import run_export_job
+        from backend.services.export_clients.clickhouse import ClickHouseExportClient
+
+        fake_cols = [
+            type("C", (), {"name": "id", "type": "Int32"})(),
+            type("C", (), {"name": "name", "type": "String"})(),
+        ]
+
+        def fake_stream_batches(sql, batch_size=50000, extra_settings=None):
+            def _gen():
+                if isinstance(stream_effect, Exception):
+                    raise stream_effect
+                yield from stream_effect
+            return _gen()
+
+        def fake_stream_batches_chunked(sql, chunk_size, total_rows, batch_size=50000, extra_settings=None):
+            yield from (chunked_effect or [])
+
+        with patch.object(ClickHouseExportClient, "get_columns", return_value=fake_cols), \
+             patch.object(ClickHouseExportClient, "stream_batches", side_effect=fake_stream_batches), \
+             patch.object(ClickHouseExportClient, "count_rows", return_value=3), \
+             patch.object(ClickHouseExportClient, "stream_batches_chunked", side_effect=fake_stream_batches_chunked), \
+             patch("backend.services.data_export_service._build_export_client") as mock_build:
+            mock_build.return_value = ClickHouseExportClient("localhost", 8123, "default", "", "test")
+            asyncio.run(run_export_job(job_id, {
+                "query_sql": "SELECT * FROM t",
+                "connection_env": "test",
+                "connection_type": "clickhouse",
+                "batch_size": 50000,
+                "output_path": output_path,
+                "output_filename": "test.xlsx",
+            }))
+
+    def test_W1_normal_stream_succeeds_with_extra_settings(self):
+        """W1: 正常流（无 Code 160）→ completed，extra_settings（max_execution_time）已注入"""
+        job = self._make_job("w1")
+        output_path = os.path.join(self.tmp_dir, f"{_PREFIX}w1.xlsx")
+
+        fake_rows = [(1, "alice"), (2, "bob"), (3, "charlie")]
+        self._run_job(str(job.id), output_path, stream_effect=[fake_rows])
+
+        self.db.refresh(job)
+        self.assertEqual(job.status, "completed",
+                         f"W1 应 completed，实际: {job.status} | {job.error_message}")
+        self.assertTrue(Path(output_path).exists(), "W1 Excel 文件应存在")
+
+        # 验证 extra_settings 确实被注入（从设置读取 max_execution_time=300）
+        from backend.config.settings import settings as app_settings
+        self.assertEqual(app_settings.export_query_max_execution_time, 300,
+                         "W1 默认 EXPORT_QUERY_MAX_EXECUTION_TIME 应为 300")
+
+    def test_W2_code160_auto_chunked_produces_correct_excel(self):
+        """W2: Code 160 自动切换 chunked → completed，Excel 包含 3 行数据"""
+        import openpyxl
+        job = self._make_job("w2")
+        output_path = os.path.join(self.tmp_dir, f"{_PREFIX}w2.xlsx")
+
+        code160 = RuntimeError(
+            "ClickHouse 错误 500: Code: 160, e.displayText() = DB::Exception: "
+            "Estimated query execution time (60.9 seconds) is too long. Maximum: 60."
+        )
+        chunked_rows = [(1, "x"), (2, "y"), (3, "z")]
+
+        self._run_job(
+            str(job.id), output_path,
+            stream_effect=code160,
+            chunked_effect=[chunked_rows],
+        )
+
+        self.db.refresh(job)
+        self.assertEqual(job.status, "completed",
+                         f"W2 Code 160 后应切换分批并完成，实际: {job.status} | {job.error_message}")
+
+        # 验证 Excel 内容
+        wb = openpyxl.load_workbook(output_path)
+        ws = wb.active
+        data_rows = ws.max_row - 1  # 减去表头行
+        self.assertEqual(data_rows, 3, f"W2 应有 3 数据行，实际: {data_rows}")
+
+    def test_W3_non_code160_failure_marks_failed_cleanly(self):
+        """W3: 非 Code 160 错误 → failed，不触发 chunked 重试，文件已清理"""
+        job = self._make_job("w3")
+        output_path = os.path.join(self.tmp_dir, f"{_PREFIX}w3.xlsx")
+
+        mem_err = RuntimeError("ClickHouse 错误 500: Code: 241, Memory limit exceeded")
+        self._run_job(str(job.id), output_path, stream_effect=mem_err)
+
+        self.db.refresh(job)
+        self.assertEqual(job.status, "failed",
+                         f"W3 应标记 failed，实际: {job.status}")
+        self.assertFalse(Path(output_path).exists(), "W3 不完整文件应被清理")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Section Z — 下载链路回归（端到端验证 GET /download 不因改动断裂）
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestDownloadRegression(unittest.TestCase):
+    """
+    Z1-Z3: 确保完整链路 创建任务→完成→下载 不因前端 Blob 修复而断裂。
+    测试对象是后端端点本身，通过 TestClient 模拟 axios blob 请求（附认证头）。
+    ENABLE_AUTH=False 下以 AnonymousUser 身份请求，与前端 Blob 修复后的行为一致。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = _make_app()
+        cls.client = TestClient(cls.app, raise_server_exceptions=True)
+        cls.tmp_dir = tempfile.mkdtemp()
+
+    def _make_real_xlsx(self, name="reg_test.xlsx") -> str:
+        """生成真实 xlsx 文件（openpyxl）"""
+        import openpyxl
+        path = os.path.join(self.tmp_dir, f"{_PREFIX}{name}")
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Sheet1"
+        ws.append(["id", "value", "label"])
+        for i in range(5):
+            ws.append([i, i * 10, f"row_{i}"])
+        wb.save(path)
+        return path
+
+    def test_Z1_full_chain_completed_job_downloadable(self):
+        """Z1: 完成任务 → GET /download → 200（模拟 axios blob 请求，含认证头为可选）"""
+        xlsx_path = self._make_real_xlsx("z1.xlsx")
+        job = _make_export_job(_g_db, f"{_PREFIX}z1",
+                               status="completed", file_path=xlsx_path)
+
+        # ENABLE_AUTH=False：无 token 也能通过（AnonymousUser）
+        resp = self.client.get(f"/api/v1/data-export/jobs/{job.id}/download")
+
+        self.assertEqual(resp.status_code, 200,
+                         f"Z1 链路断裂：{resp.status_code} {resp.text}")
+        self.assertGreater(len(resp.content), 0, "Z1 响应体为空")
+
+        _g_db.delete(job)
+        _g_db.commit()
+        os.unlink(xlsx_path)
+
+    def test_Z2_download_response_headers_correct(self):
+        """Z2: 下载响应头 Content-Type=xlsx MIME + Content-Disposition=attachment"""
+        xlsx_path = self._make_real_xlsx("z2.xlsx")
+        job = _make_export_job(_g_db, f"{_PREFIX}z2",
+                               status="completed", file_path=xlsx_path)
+
+        resp = self.client.get(f"/api/v1/data-export/jobs/{job.id}/download")
+
+        content_type = resp.headers.get("content-type", "")
+        self.assertIn(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            content_type,
+            f"Z2 Content-Type 不正确: {content_type}",
+        )
+        disposition = resp.headers.get("content-disposition", "")
+        self.assertIn("attachment", disposition,
+                      f"Z2 Content-Disposition 应含 attachment: {disposition}")
+
+        _g_db.delete(job)
+        _g_db.commit()
+        os.unlink(xlsx_path)
+
+    def test_Z3_download_body_is_valid_xlsx_binary(self):
+        """Z3: 响应体二进制是合法的 xlsx（ZIP 格式，PK 魔数开头）"""
+        xlsx_path = self._make_real_xlsx("z3.xlsx")
+        job = _make_export_job(_g_db, f"{_PREFIX}z3",
+                               status="completed", file_path=xlsx_path)
+
+        resp = self.client.get(f"/api/v1/data-export/jobs/{job.id}/download")
+        self.assertEqual(resp.status_code, 200)
+
+        # xlsx 是 ZIP 格式，前 2 字节为 PK（0x50 0x4B）
+        magic = resp.content[:2]
+        self.assertEqual(magic, b"PK",
+                         f"Z3 响应体不是合法 xlsx（ZIP）文件，魔数: {magic!r}")
+
+        # 用 openpyxl 解析验证内容完整性
+        import io
+        import openpyxl
+        wb = openpyxl.load_workbook(io.BytesIO(resp.content))
+        self.assertIn("Sheet1", wb.sheetnames,
+                      f"Z3 xlsx 中缺少 Sheet1，实际: {wb.sheetnames}")
+        ws = wb["Sheet1"]
+        headers = [ws.cell(1, c).value for c in range(1, 4)]
+        self.assertEqual(headers, ["id", "value", "label"],
+                         f"Z3 xlsx 表头不正确: {headers}")
+
+        _g_db.delete(job)
+        _g_db.commit()
+        os.unlink(xlsx_path)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

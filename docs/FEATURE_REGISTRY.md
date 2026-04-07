@@ -325,6 +325,37 @@ superadmin 专属功能：将 Excel 文件（`.xlsx`/`.xls`）直接导入到 Cl
 
 ---
 
+### SQL → Excel 数据导出（已完成，2026-04-07）
+
+superadmin 专属功能（可动态授予其他角色）：执行任意 SQL 查询并将结果异步导出为 Excel 文件，支持多 Sheet 自动分割、大整数安全转换、实时进度轮询和任务取消/下载/删除。
+
+| 功能 | 文件 | 说明 |
+|------|------|------|
+| ExportJob ORM 模型 | `backend/models/export_job.py` | UUID PK；状态机字段（pending/running/completed/failed/cancelling/cancelled）；行级+批次+Sheet 三层进度字段；output_filename/file_path/file_size；JSONB 配置快照；`to_dict()` 序列化 |
+| DB 迁移脚本 | `backend/scripts/migrate_data_export.py` | 幂等：新建 `export_jobs` 表 + 索引（user_id/status/created_at）；插入 `data:export` 权限；分配给 superadmin 角色 |
+| 连接列表端点 | `backend/api/data_export.py:GET /data-export/connections` | 复用 `list_writable_connections()`，返回所有可写（非 -ro）ClickHouse 连接 |
+| SQL 预览端点 | `data_export.py:POST /data-export/preview` | 加 LIMIT 执行 SQL，返回列信息 + 前 N 行数据（默认 100，上限 500）；线程池执行，不阻塞事件循环 |
+| 执行导出端点 | `data_export.py:POST /data-export/execute` | 创建 `ExportJob` DB 记录（status=pending）；`asyncio.create_task(run_export_job(...))` 后台启动；立即返回 `job_id` + `output_filename` |
+| `run_export_job` 后台协程 | `backend/services/data_export_service.py` | `openpyxl.Workbook(write_only=True)` 流式写 xlsx（低内存峰值）；分批迭代 `iter_batches()`；Int64/UInt64/Int128+ 自动转 str；每 1,000,000 行自动新建 Sheet（含表头）；每 10 批写一次 DB 进度；批次边界检查 `cancelling` 实现协作式取消 |
+| 任务状态端点 | `data_export.py:GET /data-export/jobs/{job_id}` | 前端轮询进度（exported_rows / done_batches / current_sheet / total_sheets） |
+| 取消任务端点 | `data_export.py:POST /data-export/jobs/{job_id}/cancel` | pending → 直接 cancelled；running → cancelling（协作式，非强制终止）；已终止任务返回 400 |
+| 删除任务端点 | `data_export.py:DELETE /data-export/jobs/{job_id}` | **仅允许终态**（completed/cancelled/failed）；同时删除本地 xlsx 文件；活跃任务须先取消再删除（防止孤儿协程写入无 DB 记录的文件） |
+| 历史任务列表端点 | `data_export.py:GET /data-export/jobs` | 分页（page/page_size），按 created_at 倒序 |
+| 文件下载端点 | `data_export.py:GET /data-export/jobs/{job_id}/download` | `FileResponse`，`Content-Disposition: attachment`，触发浏览器另存为对话框 |
+| 权限控制 | `Depends(require_permission("data", "export"))` | 全部 8 个端点均需 `data:export` 权限；默认 superadmin 专属，可通过角色管理 API 动态授予 |
+| 前端数据导出页面 | `frontend/src/pages/DataExport.tsx` | SQL 编辑器 → 预览 → 提交 → 进度条轮询 → 下载；历史任务列表（状态徽标 + 取消/下载/删除操作列）|
+| 前端 API 客户端 | `frontend/src/services/dataExportApi.ts` | `dataExportApi.{getConnections, previewSql, executeExport, getJobStatus, listJobs, cancelJob, deleteJob, downloadFile}` |
+| RBAC 范围 | — | 新菜单「数据导出」（`DownloadOutlined` 图标，`data:export` 权限）；默认仅 superadmin 可见；可通过角色权限管理页面动态授予其他角色 |
+| 测试套件 | `test_data_export_full.py` (27) + `test_data_export_e2e.py` (26) | 综合：RBAC 权限矩阵(A)/协程 E2E(B)/验证边界(C)/生命周期与删除(D)/权限管理范围(E)；E2E：连接列表/预览/执行/状态轮询/取消/删除/下载/历史列表 |
+
+**大整数安全**：Excel 最大安全整数为 2^53（JS 同）。ClickHouse `Int64`/`UInt64` 及更大类型自动检测并转为字符串，防止 Excel 显示科学计数法导致精度丢失。
+
+**多 Sheet 分割**：`MAX_ROWS_PER_SHEET = 1,000,000`（保留 Excel 硬限制余量）。超限时自动续建 Sheet，每个 Sheet 均含完整表头行，保证数据完整性。
+
+**删除保护设计**：DELETE 端点要求任务处于终态（completed/cancelled/failed）。若对运行中任务执行删除，后台协程仍在写文件但 DB 记录已消失，导致进度无法更新且生成孤儿文件。正确流程：cancel → 等待 cancelled → delete。
+
+---
+
 ### 文件写入下载（已完成，2026-03-26）
 
 Agent 在对话中写文件后，消息末尾自动附上下载卡片；用户点击触发浏览器下载；文件路径强制限制在当前用户目录内。

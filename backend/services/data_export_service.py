@@ -7,13 +7,24 @@
 - 多 Sheet 自动分割（每 100 万行新建一个 Sheet）
 - 大整数安全转字符串（避免 Excel 科学计数法）
 - 批次级取消检查（协作式取消）
+- 分批提取模式（规避 ClickHouse max_execution_time 估算拒绝 Code 160）
+
+线程安全说明：
+  run_export_job 是 async 包装器，将同步阻塞工作交给线程池（run_in_executor）。
+  这样 ClickHouse HTTP 流式读取（requests 同步库）和 openpyxl 写入不会阻塞 asyncio
+  事件循环，使其他 API 请求（如任务列表轮询 GET /data-export/jobs）能正常响应。
 """
 import asyncio
 import logging
+import math
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+# 导出专用线程池（最多 4 个并发导出，超出则排队）
+_EXPORT_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="export-worker")
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +152,31 @@ def preview_query(
 
 async def run_export_job(job_id: str, config: Dict[str, Any]) -> None:
     """
-    后台协程：流式读取 SQL 结果，写入 Excel，支持取消和多 Sheet 分割。
+    后台协程包装器：将同步阻塞的导出工作提交到线程池执行。
+
+    ClickHouse HTTP 流式读取（requests 同步库）和 openpyxl 写入均为阻塞 I/O。
+    若直接在协程中执行，会长时间占用 asyncio 事件循环，导致同期的 API 请求
+    （如 GET /data-export/jobs 任务列表轮询）无法得到响应，触发 30s 超时。
+
+    通过 run_in_executor 将阻塞工作移入独立线程，事件循环得以继续处理其他请求。
+    """
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(_EXPORT_EXECUTOR, _run_export_job_sync, job_id, config)
+
+
+def _run_export_job_sync(job_id: str, config: Dict[str, Any]) -> None:
+    """
+    同步实现（在线程池中运行，不阻塞 asyncio 事件循环）。
+
+    执行策略（双层防护）：
+      Layer 1 — Per-query max_execution_time 覆盖（应用层，不修改服务器配置）：
+        所有导出查询均附带 max_execution_time=EXPORT_QUERY_MAX_EXECUTION_TIME（默认 300s）。
+        该设置通过 HTTP URL 参数传递给 ClickHouse，仅对本次请求生效。
+
+      Layer 2 — LIMIT/OFFSET 分批提取（自动触发）：
+        触发条件 A：ClickHouse 返回 Code 160（ESTIMATED_EXECUTION_TIMEOUT_EXCEEDED）
+        触发后：先 count_rows() 获取总行数，再按 EXPORT_CHUNK_SIZE（默认 200K）分窗提取。
+        每个窗口查询同样携带 per-query max_execution_time 设置。
 
     config 结构：
     {
@@ -155,13 +190,18 @@ async def run_export_job(job_id: str, config: Dict[str, Any]) -> None:
     """
     import openpyxl
     from backend.config.database import SessionLocal
+    from backend.config.settings import settings as app_settings
     from backend.models.export_job import ExportJob
+    from backend.services.export_clients.clickhouse import is_ch_timeout_estimate_error
 
     sql = config["query_sql"]
     env = config["connection_env"]
     conn_type = config.get("connection_type", "clickhouse")
     batch_size = config.get("batch_size", DEFAULT_BATCH_SIZE)
     output_path = config["output_path"]
+
+    # Per-query ClickHouse 设置（应用层覆盖，不修改服务器配置）
+    export_settings = {"max_execution_time": app_settings.export_query_max_execution_time}
 
     def _get_job(db) -> Optional[ExportJob]:
         return db.query(ExportJob).filter(ExportJob.id == job_id).first()
@@ -239,108 +279,196 @@ async def run_export_job(job_id: str, config: Dict[str, Any]) -> None:
         _mark_failed(msg, 0, 0)
         return
 
-    # ── 创建 openpyxl Write-Only Workbook ────────────────────────────────────
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    wb = openpyxl.Workbook(write_only=True)
+    # ── 流式读取 + 写 Excel（含 Code 160 自动重试分批模式）────────────────────
+    # 最多两轮：第一轮正常流式，第二轮（若触发）分批提取
+    use_chunked = False
+    total_sql_chunks = 1   # 分批模式下的 SQL 分批总数（进度分母）
 
-    sheet_num = 1
-    ws = wb.create_sheet(f"Sheet{sheet_num}")
-    ws.append(col_names)  # 表头行
+    for attempt in range(2):
+        if attempt == 1 and not use_chunked:
+            break  # 第一轮成功，无需重试
 
-    exported_rows = 0
-    done_batches = 0
-    sheet_row_count = 0  # 当前 Sheet 已写数据行数（不含表头）
+        # ── 初始化 / 重置工作簿 ───────────────────────────────────────────────
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        wb = openpyxl.Workbook(write_only=True)
+        sheet_num = 1
+        ws = wb.create_sheet(f"Sheet{sheet_num}")
+        ws.append(col_names)  # 表头行
+        exported_rows = 0
+        done_batches = 0       # Python 级别批次计数（每 batch_size 行 +1）
+        done_sql_chunks = 0    # SQL 级别分批计数（仅分批模式有意义）
+        sheet_row_count = 0
 
-    # 更新列信息到 DB
-    db = SessionLocal()
-    try:
-        job = _get_job(db)
-        job.current_sheet = f"Sheet{sheet_num}"
-        _save(db, job)
-    finally:
-        db.close()
+        # 更新列信息到 DB
+        db = SessionLocal()
+        try:
+            job = _get_job(db)
+            if job:
+                job.current_sheet = f"Sheet{sheet_num}"
+                _save(db, job)
+        finally:
+            db.close()
 
-    # ── 流式读取 + 写 Excel ───────────────────────────────────────────────────
-    try:
-        for batch in export_client.stream_batches(sql, batch_size=batch_size):
-            # 批次前检查取消
-            if _is_cancelling():
-                logger.info("[ExportJob %s] Cancelled mid-export after %d rows.", job_id, exported_rows)
-                try:
-                    wb.save(output_path)
-                except Exception:
-                    pass
-                _mark_cancelled(exported_rows, done_batches, sheet_num)
+        # ── 分批模式：预扫描行数 → 决定分批数 ───────────────────────────────
+        if use_chunked:
+            try:
+                total_rows = export_client.count_rows(
+                    sql,
+                    timeout=app_settings.export_query_max_execution_time,
+                )
+            except Exception as cnt_err:
+                msg = f"分批模式预扫描行数失败: {cnt_err}"
+                logger.error("[ExportJob %s] %s", job_id, msg)
+                _mark_failed(msg, 0, 0)
                 return
 
-            for row in batch:
-                # 检查是否需要新建 Sheet
-                if sheet_row_count >= MAX_ROWS_PER_SHEET:
-                    sheet_num += 1
-                    ws = wb.create_sheet(f"Sheet{sheet_num}")
-                    ws.append(col_names)  # 每个 Sheet 都有表头
-                    sheet_row_count = 0
+            total_sql_chunks = max(1, math.ceil(total_rows / app_settings.export_chunk_size))
+            logger.info(
+                "[ExportJob %s] Chunked mode: total_rows=%d → %d SQL chunks (chunk_size=%d)",
+                job_id, total_rows, total_sql_chunks, app_settings.export_chunk_size,
+            )
+            db = SessionLocal()
+            try:
+                j = _get_job(db)
+                if j:
+                    j.total_rows = total_rows
+                    j.total_batches = total_sql_chunks
+                    j.updated_at = datetime.utcnow()
+                    db.commit()
+            finally:
+                db.close()
+
+            batch_source = export_client.stream_batches_chunked(
+                sql,
+                chunk_size=app_settings.export_chunk_size,
+                total_rows=total_rows,
+                batch_size=batch_size,
+                extra_settings=export_settings,
+            )
+        else:
+            batch_source = export_client.stream_batches(
+                sql,
+                batch_size=batch_size,
+                extra_settings=export_settings,
+            )
+
+        # ── 消费批次 → 写入 Excel ─────────────────────────────────────────────
+        try:
+            for batch in batch_source:
+                # 批次前检查取消
+                if _is_cancelling():
+                    logger.info(
+                        "[ExportJob %s] Cancelled mid-export after %d rows.",
+                        job_id, exported_rows,
+                    )
+                    try:
+                        wb.save(output_path)
+                    except Exception:
+                        pass
+                    _mark_cancelled(exported_rows, done_batches, sheet_num)
+                    return
+
+                for row in batch:
+                    # 检查是否需要新建 Sheet
+                    if sheet_row_count >= MAX_ROWS_PER_SHEET:
+                        sheet_num += 1
+                        ws = wb.create_sheet(f"Sheet{sheet_num}")
+                        ws.append(col_names)  # 每个 Sheet 都有表头
+                        sheet_row_count = 0
+                        db = SessionLocal()
+                        try:
+                            j = _get_job(db)
+                            if j:
+                                j.current_sheet = f"Sheet{sheet_num}"
+                                j.updated_at = datetime.utcnow()
+                                db.commit()
+                        finally:
+                            db.close()
+
+                    formatted = [_format_cell(v, col_types[i]) for i, v in enumerate(row)]
+                    ws.append(formatted)
+                    sheet_row_count += 1
+                    exported_rows += 1
+
+                done_batches += 1
+
+                # 每 N 批更新进度
+                if done_batches % PROGRESS_UPDATE_EVERY == 0:
                     db = SessionLocal()
                     try:
                         j = _get_job(db)
                         if j:
-                            j.current_sheet = f"Sheet{sheet_num}"
+                            j.exported_rows = exported_rows
                             j.updated_at = datetime.utcnow()
+                            if use_chunked:
+                                # 分批模式：done_batches 对应已完成的 SQL 分批数
+                                j.done_batches = exported_rows // app_settings.export_chunk_size
+                                j.total_batches = total_sql_chunks
+                            else:
+                                j.done_batches = done_batches
                             db.commit()
                     finally:
                         db.close()
 
-                formatted = [_format_cell(v, col_types[i]) for i, v in enumerate(row)]
-                ws.append(formatted)
-                sheet_row_count += 1
-                exported_rows += 1
+            # ── 保存文件 ──────────────────────────────────────────────────────
+            wb.save(output_path)
+            file_size = Path(output_path).stat().st_size
+            logger.info(
+                "[ExportJob %s] Completed: %d rows, %d sheet(s), %.1f MB, "
+                "mode=%s chunks=%d",
+                job_id, exported_rows, sheet_num, file_size / 1024 / 1024,
+                "chunked" if use_chunked else "stream", total_sql_chunks,
+            )
 
-            done_batches += 1
+            db = SessionLocal()
+            try:
+                job = _get_job(db)
+                if job:
+                    job.status = "completed"
+                    job.finished_at = datetime.utcnow()
+                    job.exported_rows = exported_rows
+                    job.done_batches = total_sql_chunks if use_chunked else done_batches
+                    job.total_batches = total_sql_chunks
+                    job.total_sheets = sheet_num
+                    job.file_size = file_size
+                    job.updated_at = datetime.utcnow()
+                    db.commit()
+            finally:
+                db.close()
 
-            # 让出事件循环
-            await asyncio.sleep(0)
+            break  # 成功，退出重试循环
 
-            # 每 N 批更新进度
-            if done_batches % PROGRESS_UPDATE_EVERY == 0:
-                db = SessionLocal()
+        except RuntimeError as exc:
+            # ── Code 160：ClickHouse 预估超时，切换分批模式重试 ──────────────
+            if attempt == 0 and is_ch_timeout_estimate_error(exc):
+                logger.warning(
+                    "[ExportJob %s] Code 160 (estimated timeout), switching to chunked mode: %s",
+                    job_id, exc,
+                )
+                use_chunked = True
+                # 关闭已开始但未完成的工作簿（不保存）
                 try:
-                    j = _get_job(db)
-                    if j:
-                        j.exported_rows = exported_rows
-                        j.done_batches = done_batches
-                        j.updated_at = datetime.utcnow()
-                        db.commit()
-                finally:
-                    db.close()
+                    wb.close()
+                except Exception:
+                    pass
+                continue  # 进入第二轮（分批模式）
 
-        # ── 保存文件 ──────────────────────────────────────────────────────────
-        wb.save(output_path)
-        file_size = Path(output_path).stat().st_size
-        logger.info(
-            "[ExportJob %s] Completed: %d rows, %d sheet(s), %.1f MB",
-            job_id, exported_rows, sheet_num, file_size / 1024 / 1024,
-        )
+            # 其他错误 → 标记失败
+            msg = f"导出执行失败: {exc}"
+            logger.error("[ExportJob %s] %s", job_id, msg, exc_info=True)
+            _mark_failed(msg, exported_rows, done_batches)
+            try:
+                os.unlink(output_path)
+            except Exception:
+                pass
+            return
 
-        db = SessionLocal()
-        try:
-            job = _get_job(db)
-            job.status = "completed"
-            job.finished_at = datetime.utcnow()
-            job.exported_rows = exported_rows
-            job.done_batches = done_batches
-            job.total_sheets = sheet_num
-            job.file_size = file_size
-            job.updated_at = datetime.utcnow()
-            db.commit()
-        finally:
-            db.close()
-
-    except Exception as e:
-        msg = f"导出执行失败: {e}"
-        logger.error("[ExportJob %s] %s", job_id, msg, exc_info=True)
-        _mark_failed(msg, exported_rows, done_batches)
-        # 清理不完整的文件
-        try:
-            os.unlink(output_path)
-        except Exception:
-            pass
+        except Exception as exc:
+            msg = f"导出执行失败: {exc}"
+            logger.error("[ExportJob %s] %s", job_id, msg, exc_info=True)
+            _mark_failed(msg, exported_rows, done_batches)
+            try:
+                os.unlink(output_path)
+            except Exception:
+                pass
+            return
