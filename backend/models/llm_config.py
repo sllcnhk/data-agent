@@ -168,6 +168,25 @@ DEFAULT_LLM_CONFIGS = [
         }
     },
     {
+        "model_key": "openai",
+        "model_name": "OpenAI GPT",
+        "model_type": "openai",
+        "api_base_url": "http://10.0.3.112/v1",
+        "api_key": "",
+        "default_model": "openai-gpt-5.4",
+        "temperature": "0.7",
+        "max_tokens": "4096",
+        "is_enabled": False,
+        "is_default": False,
+        "description": "OpenAI GPT - 通过内网代理访问，默认模型 gpt-5.4",
+        "icon": "🧠",
+        "extra_config": {
+            "supports_streaming": True,
+            "supports_tools": True,
+            "supports_vision": True,
+        }
+    },
+    {
         "model_key": "doubao",
         "model_name": "豆包",
         "model_type": "doubao",

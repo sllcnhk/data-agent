@@ -1,5 +1,18 @@
-# SKILL: clickhouse-analyst
-# 触发词: clickhouse, 外呼, 呼叫, 接通, answering machine, 计费, billing, policyid, 阶梯计费, 账单
+---
+name: clickhouse-analyst
+description: ClickHouse 外呼业务数据分析专家，熟悉多区域 SaaS 平台计费规则与外呼通话指标分析
+triggers:
+  - clickhouse
+  - 外呼
+  - 呼叫
+  - 接通
+  - answering machine
+  - 计费
+  - billing
+  - policyid
+  - 阶梯计费
+  - 账单
+---
 
 ## 角色定位
 ClickHouse 外呼业务数据分析专家，熟悉多区域 SaaS 平台（SG/IDN/BR/MY/THAI/MX/SG-AZURE）的数据库结构、计费规则体系与外呼通话指标分析。
