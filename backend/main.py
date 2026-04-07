@@ -83,42 +83,48 @@ async def lifespan(app: FastAPI):
         await manager.register_agent(agent)
         logger.info(f"Created agent: {agent.agent_id}")
 
-    # 恢复孤儿导入任务（服务重启后，非终态任务已无活跃协程）
+    # 恢复孤儿任务（服务重启后，非终态的 import/export 任务已无活跃协程）
     try:
         from backend.config.database import SessionLocal
         from backend.models.import_job import ImportJob
+        from backend.models.export_job import ExportJob
         from datetime import datetime as _dt
         _db = SessionLocal()
         try:
             _now = _dt.utcnow()
-            _interrupted = _db.query(ImportJob).filter(
-                ImportJob.status.in_(["pending", "running"])
-            ).all()
-            for _j in _interrupted:
-                _j.status = "failed"
-                _j.error_message = "服务重启，任务已中断"
-                _j.finished_at = _now
-                _j.updated_at = _now
-            _cancelling = _db.query(ImportJob).filter(
-                ImportJob.status == "cancelling"
-            ).all()
-            for _j in _cancelling:
-                _j.status = "cancelled"
-                _j.finished_at = _now
-                _j.updated_at = _now
-            if _interrupted or _cancelling:
+            _total_interrupted = 0
+            _total_cancelling = 0
+            for _Model, _label in [(ImportJob, "import"), (ExportJob, "export")]:
+                _interrupted = _db.query(_Model).filter(
+                    _Model.status.in_(["pending", "running"])
+                ).all()
+                for _j in _interrupted:
+                    _j.status = "failed"
+                    _j.error_message = "服务重启，任务已中断"
+                    _j.finished_at = _now
+                    _j.updated_at = _now
+                _cancelling = _db.query(_Model).filter(
+                    _Model.status == "cancelling"
+                ).all()
+                for _j in _cancelling:
+                    _j.status = "cancelled"
+                    _j.finished_at = _now
+                    _j.updated_at = _now
+                _total_interrupted += len(_interrupted)
+                _total_cancelling += len(_cancelling)
+            if _total_interrupted or _total_cancelling:
                 _db.commit()
                 logger.info(
-                    "Startup recovery: %d interrupted job(s) → failed, %d cancelling → cancelled",
-                    len(_interrupted), len(_cancelling),
+                    "Startup recovery: %d interrupted → failed, %d cancelling → cancelled",
+                    _total_interrupted, _total_cancelling,
                 )
         except Exception as _e:
             _db.rollback()
-            logger.warning("Import job startup recovery failed (non-critical): %s", _e)
+            logger.warning("Job startup recovery failed (non-critical): %s", _e)
         finally:
             _db.close()
     except Exception as _e:
-        logger.warning("Could not run import job startup recovery: %s", _e)
+        logger.warning("Could not run job startup recovery: %s", _e)
 
     # 启动 SKILL.md 热加载文件监视器
     try:
@@ -175,7 +181,7 @@ app.add_middleware(
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # 导入路由
-from api import agents, skills, conversations, llm_configs, mcp, groups, approvals, auth, users, files, data_import
+from api import agents, skills, conversations, llm_configs, mcp, groups, approvals, auth, users, files, data_import, data_export
 from api.users import roles_router, permissions_router
 
 
@@ -206,6 +212,7 @@ app.include_router(roles_router, prefix="/api/v1")
 app.include_router(permissions_router, prefix="/api/v1")
 app.include_router(files.router, prefix="/api/v1")
 app.include_router(data_import.router, prefix="/api/v1")
+app.include_router(data_export.router, prefix="/api/v1")
 
 
 # 全局异常处理器

@@ -42,6 +42,7 @@ PERMISSIONS = [
     ("settings",        "read",         "查看系统设置"),
     ("settings",        "write",        "修改系统设置"),
     ("data",            "import",       "Excel 数据导入 ClickHouse"),
+    ("data",            "export",       "SQL 结果导出为 Excel"),
 ]
 
 

@@ -28,8 +28,9 @@ from backend.models.task import (
     TaskStatus
 )
 
-# 数据导入模块
+# 数据导入/导出模块
 from backend.models.import_job import ImportJob
+from backend.models.export_job import ExportJob
 
 # Report模块
 from backend.models.report import (
@@ -53,8 +54,9 @@ __all__ = [
     "TaskType",
     "TaskStatus",
 
-    # 数据导入
+    # 数据导入/导出
     "ImportJob",
+    "ExportJob",
 
     # Report
     "Report",

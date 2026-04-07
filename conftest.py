@@ -77,20 +77,41 @@ def _cleanup_test_data(label: str = ""):
 
     db = SessionLocal()
     try:
-        # 清理测试导入任务（ImportJob.username 匹配测试前缀）
+        # 清理测试导入/导出任务（username 匹配测试前缀）
         try:
             from backend.models.import_job import ImportJob
-            test_jobs = [
+            test_import_jobs = [
                 j for j in db.query(ImportJob).all()
                 if _is_test_entity(j.username)
             ]
-            for j in test_jobs:
+            for j in test_import_jobs:
                 db.delete(j)
-            if test_jobs:
+            if test_import_jobs:
                 tag = f"[{label}] " if label else ""
-                print(f"\n[conftest] {tag}Cleanup: deleted {len(test_jobs)} import job(s).")
+                print(f"\n[conftest] {tag}Cleanup: deleted {len(test_import_jobs)} import job(s).")
         except Exception as exc:
             print(f"\n[conftest] ImportJob cleanup skipped (non-fatal): {exc}")
+
+        try:
+            import os as _os
+            from backend.models.export_job import ExportJob
+            test_export_jobs = [
+                j for j in db.query(ExportJob).all()
+                if _is_test_entity(j.username)
+            ]
+            for j in test_export_jobs:
+                # 同时删除磁盘上的导出文件
+                if j.file_path:
+                    try:
+                        _os.unlink(j.file_path)
+                    except OSError:
+                        pass
+                db.delete(j)
+            if test_export_jobs:
+                tag = f"[{label}] " if label else ""
+                print(f"\n[conftest] {tag}Cleanup: deleted {len(test_export_jobs)} export job(s).")
+        except Exception as exc:
+            print(f"\n[conftest] ExportJob cleanup skipped (non-fatal): {exc}")
 
         test_users = [
             u for u in db.query(User).all()
