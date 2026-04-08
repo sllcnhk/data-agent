@@ -88,6 +88,10 @@ class SkillMD:
         filepath:      Source file path
         tier:          system | project | user
         always_inject: If True, injected regardless of triggers (e.g. _base-*.md)
+        owner:         Username that owns this skill (user-tier only).
+                       Extracted from filepath: user/{username}/x.md → username.
+                       Empty string means shared / no owner (system, project, or
+                       legacy user skills placed directly under user/).
     """
     name: str
     version: str
@@ -104,6 +108,7 @@ class SkillMD:
     layer: str = ""          # workflow / scenario / knowledge / maintenance
     sub_skills: List[str] = field(default_factory=list)   # child skill names to load when parent matched
     env_tags: List[str] = field(default_factory=list)     # env filter: [sg, idn, br, my, thai, mx]
+    owner: str = ""          # username for user-tier skills; "" = shared/public
 
     def matches(self, message: str) -> bool:
         """Return True if any trigger keyword appears in the message."""
@@ -137,6 +142,25 @@ class SkillMD:
 # ──────────────────────────────────────────────────────────
 
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n?", re.DOTALL)
+
+
+def _extract_skill_owner(filepath: Path, skills_dir: Path) -> str:
+    """Extract the owning username from a user-tier skill filepath.
+
+    Examples (skills_dir = .claude/skills):
+      .claude/skills/user/superadmin/x.md  → "superadmin"
+      .claude/skills/user/alice/x.md       → "alice"
+      .claude/skills/user/x.md             → ""   (legacy root-level, shared)
+    """
+    try:
+        user_dir = skills_dir / "user"
+        rel = filepath.relative_to(user_dir)
+        parts = rel.parts  # e.g. ("superadmin", "x.md") or ("x.md",)
+        if len(parts) >= 2:
+            return parts[0]
+    except ValueError:
+        pass
+    return ""
 
 
 class SkillLoader:
@@ -300,6 +324,13 @@ class SkillLoader:
         always_inject_by_name = filepath.stem.startswith("_base")
         always_inject = always_inject_meta or always_inject_by_name
 
+        # owner: 仅 user-tier 有意义。
+        # 从路径中提取：user/{username}/x.md → owner = username
+        # user/x.md（根目录直放）→ owner = ""（遗留共享技能，对全体可见）
+        owner = ""
+        if tier == TIER_USER:
+            owner = _extract_skill_owner(filepath, self.skills_dir)
+
         return SkillMD(
             name=str(meta.get("name") or filepath.stem),
             version=str(meta.get("version") or "1.0"),
@@ -315,6 +346,7 @@ class SkillLoader:
             layer=str(meta.get("layer") or ""),
             sub_skills=_as_list(meta.get("sub_skills")),
             env_tags=_as_list(meta.get("env_tags")),
+            owner=owner,
         )
 
     # ── Querying ─────────────────────────────────────────
@@ -374,6 +406,22 @@ class SkillLoader:
             "load_errors": list(self._load_errors),
         }
 
+    def _get_visible_user_skills(self, username: str) -> Dict[str, "SkillMD"]:
+        """Return the subset of _user_skills visible to *username*.
+
+        Visibility rules:
+          - username == "" or "default"  → return all (ENABLE_AUTH=false / anonymous)
+          - otherwise                    → skill.owner == username (own skills)
+                                           OR skill.owner == "" (legacy shared skills)
+        """
+        if not username or username == "default":
+            return self._user_skills
+        return {
+            name: skill
+            for name, skill in self._user_skills.items()
+            if skill.owner == username or skill.owner == ""
+        }
+
     def _ensure_loaded(self) -> None:
         if not self._loaded:
             self.load_all()
@@ -427,7 +475,8 @@ class SkillLoader:
         self._ensure_loaded()
 
         # ── 1. 关键词匹配（各层独立，按 priority 取前 N）────────────────
-        user_triggered = [s for s in self._user_skills.values() if s.matches(message)]
+        visible_user = self._get_visible_user_skills(user_id)
+        user_triggered = [s for s in visible_user.values() if s.matches(message)]
         user_triggered.sort(key=lambda s: _PRIORITY_ORDER.get(s.priority, 1))
         user_triggered = user_triggered[:_MAX_TRIGGERED_PER_TIER]
 
@@ -444,7 +493,7 @@ class SkillLoader:
 
         # ── 2. Sub-skill 展开（父 skill 声明的子 skill）──────────────────
         user_triggered, proj_triggered, sys_triggered = self._expand_sub_skills(
-            user_triggered, proj_triggered, sys_triggered, message
+            user_triggered, proj_triggered, sys_triggered, message, username=user_id
         )
 
         # ── 3. 组装 prompt 文本（含 base skills）────────────────────────
@@ -642,12 +691,16 @@ class SkillLoader:
 
         # keyword 模式：内联关键词匹配，同步路径，零额外延迟
         if mode == "keyword":
-            kw_user_k = [s for s in self._user_skills.values() if s.matches(message)]
+            visible_user_k = self._get_visible_user_skills(user_id)
+            kw_user_k = [s for s in visible_user_k.values() if s.matches(message)]
             kw_proj_k = [s for s in self._project_skills.values() if s.matches(message)]
             kw_sys_k = [
                 s for s in self._system_skills.values()
                 if not s.always_inject and s.matches(message)
             ]
+            kw_user_k, kw_proj_k, kw_sys_k = self._expand_sub_skills(
+                kw_user_k, kw_proj_k, kw_sys_k, message, username=user_id
+            )
             result_k = self._build_from_matched_skills(kw_user_k, kw_proj_k, kw_sys_k)
             all_matched_k = kw_user_k + kw_proj_k + kw_sys_k
             self._last_match_info = self._make_match_info(
@@ -662,8 +715,10 @@ class SkillLoader:
         # hybrid / llm 模式：初始化路由组件
         self._ensure_routing_components()
 
+        visible_user = self._get_visible_user_skills(user_id)
+
         # ── Phase 1: 关键词匹配 ──────────────────────────────────
-        kw_user = [s for s in self._user_skills.values() if s.matches(message)]
+        kw_user = [s for s in visible_user.values() if s.matches(message)]
         kw_proj = [s for s in self._project_skills.values() if s.matches(message)]
         kw_sys = [
             s for s in self._system_skills.values()
@@ -678,9 +733,9 @@ class SkillLoader:
             kw_names = {s.name for s in self._base_skills}
 
         # ── Phase 2: 语义路由 ────────────────────────────────────
-        # 候选：排除已命中和 always_inject 的 skill
+        # 候选：排除已命中和 always_inject 的 skill（仅当前用户可见的 user skill）
         all_skills = (
-            list(self._user_skills.values())
+            list(visible_user.values())
             + list(self._project_skills.values())
             + [s for s in self._system_skills.values() if not s.always_inject]
         )
@@ -736,7 +791,7 @@ class SkillLoader:
 
         # ── Sub-skill expansion ───────────────────────────────
         final_user, final_proj, final_sys = self._expand_sub_skills(
-            final_user, final_proj, final_sys, message
+            final_user, final_proj, final_sys, message, username=user_id
         )
 
         result = self._build_from_matched_skills(final_user, final_proj, final_sys)
@@ -755,34 +810,45 @@ class SkillLoader:
         message: str,
         semantic_scores: Optional[Dict[str, float]] = None,
         threshold: float = 0.45,
+        username: str = "default",
     ) -> Dict[str, dict]:
         """
         返回每个触发 skill 的命中方式（keyword/semantic/always_inject）和分数。
         供 /skills/preview API 使用。
+
+        Args:
+            message:         用户消息
+            semantic_scores: 可选的语义路由得分字典
+            threshold:       语义命中阈值
+            username:        当前用户名，用于过滤 user-tier skill（隔离）。
+                             "" 或 "default" → 返回全部（ENABLE_AUTH=false 兼容）
         """
         self._ensure_loaded()
         details: Dict[str, dict] = {}
 
-        # always_inject
+        # always_inject（system base skill 对所有人可见）
         for s in self._base_skills:
             details[s.name] = {"method": "always_inject", "score": 1.0, "tier": s.tier}
 
-        # keyword
-        for tier_dict in (self._user_skills, self._project_skills, self._system_skills):
+        # 获取当前用户可见的 user-tier skills（按用户隔离）
+        visible_user = self._get_visible_user_skills(username)
+
+        # keyword 匹配：user-tier 按可见范围过滤，project/system 全部包含
+        for tier_dict in (visible_user, self._project_skills, self._system_skills):
             for s in tier_dict.values():
                 if s.always_inject:
                     continue
                 if s.matches(message):
                     details[s.name] = {"method": "keyword", "score": 1.0, "tier": s.tier}
 
-        # semantic
+        # semantic 匹配：同样只对可见 user skill 进行语义路由
         if semantic_scores:
-            all_skills = (
-                list(self._user_skills.values())
+            visible_for_semantic = (
+                list(visible_user.values())
                 + list(self._project_skills.values())
                 + [s for s in self._system_skills.values() if not s.always_inject]
             )
-            for s in all_skills:
+            for s in visible_for_semantic:
                 if s.name in details:
                     continue
                 score = semantic_scores.get(s.name, 0.0)
@@ -799,6 +865,7 @@ class SkillLoader:
         proj_skills: List["SkillMD"],
         sys_skills: List["SkillMD"],
         message: str,
+        username: str = "",
     ) -> tuple:
         """Expand parent skills' sub_skills declarations into additional matched skills.
 
@@ -809,13 +876,20 @@ class SkillLoader:
 
         Sub-skills bypass the per-tier 3-item cap but are still subject to
         _MAX_INJECT_CHARS in _build_from_matched_skills.
+
+        username is used to restrict the user-tier lookup to the current user's
+        visible skills, preventing sub_skill expansion from leaking other users'
+        private skills.
         """
         matched_names = {s.name for s in user_skills + proj_skills + sys_skills}
         matched_names |= {s.name for s in self._base_skills}
 
-        # Build a flat name→skill lookup across all tiers
+        # Build a flat name→skill lookup:
+        # user-tier: restricted to current user's visible skills
+        # project/system: always included (shared)
         all_skill_map: Dict[str, "SkillMD"] = {}
-        for d in (self._user_skills, self._project_skills, self._system_skills):
+        all_skill_map.update(self._get_visible_user_skills(username))
+        for d in (self._project_skills, self._system_skills):
             all_skill_map.update(d)
 
         detected_env = _detect_env(message)

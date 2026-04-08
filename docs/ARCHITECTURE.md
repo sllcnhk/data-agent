@@ -2,7 +2,7 @@
 
 > **适用对象**：LLM 模型（Claude Code / 其他 AI）、新加入开发者
 > **目的**：快速理解系统整体架构、模块职责、数据流向和交互接口
-> **最后更新**：2026-04-05（**Excel → ClickHouse 数据导入**：`migrate_data_import.py` DB 迁移 + 9 个 `/data-import/*` REST 端点 + `run_import_job` 后台协程（TabSeparated 格式 + 协作式取消）+ 大文件流式上传优化；**文件写入下载**：`files_written` SSE 事件 + `GET /api/v1/files/download` 安全下载端点 + 文件下载卡片 UI + `FILE_OUTPUT_DATE_SUBFOLDER` 月份子目录配置；技能路由可视化：`skill_matched` SSE 事件、`SkillLoader._last_match_info`、ThoughtProcess 🧠 技能路由面板、`GET /skills/load-errors`；侧边栏 Tab UI + 只读模式 + is_shared 群组框架；对话用户隔离；对话附件上传；ClickHouse TCP→HTTP 自动回退；对话打断；用户技能目录隔离修复）
+> **最后更新**：2026-04-08（**Skill 用户使用权限隔离 T1–T6**：`SkillMD.owner` 字段从 filepath 解析；`_get_visible_user_skills(username)` 可见性过滤；`build_skill_prompt_async(user_id=)` 用户隔离；`_expand_sub_skills` 防跨用户 sub_skill 展开；Preview API `effective_user_id` 绑定 + superadmin `view_as` override；`get_match_details(username=)` 修复泄露 bug；测试套件 29+43+15=87 个测试全通过；v2.4 2026-04-05：**Excel → ClickHouse 数据导入**：`migrate_data_import.py` DB 迁移 + 9 个 `/data-import/*` REST 端点 + `run_import_job` 后台协程（TabSeparated 格式 + 协作式取消）+ 大文件流式上传优化；**文件写入下载**：`files_written` SSE 事件 + `GET /api/v1/files/download` 安全下载端点 + 文件下载卡片 UI + `FILE_OUTPUT_DATE_SUBFOLDER` 月份子目录配置；技能路由可视化：`skill_matched` SSE 事件、`SkillLoader._last_match_info`、ThoughtProcess 🧠 技能路由面板、`GET /skills/load-errors`；侧边栏 Tab UI + 只读模式 + is_shared 群组框架；对话用户隔离；对话附件上传；ClickHouse TCP→HTTP 自动回退；对话打断；用户技能目录隔离修复）
 
 ---
 
@@ -83,7 +83,7 @@ data-agent/
 │   │   ├── conversation_service.py # ★ SSE 流处理、自动续接、上下文压缩
 │   │   └── data_import_service.py  # ★ run_import_job() 后台协程（分批 insert_tsv + 协作式取消）
 │   ├── skills/
-│   │   ├── skill_loader.py         # SkillLoader 单例；3层加载；build_skill_prompt_async()；_MAX_INJECT_CHARS=16000 保护
+│   │   ├── skill_loader.py         # SkillLoader 单例；3层加载；SkillMD.owner（filepath 解析）；_get_visible_user_skills(username)；build_skill_prompt_async(user_id=)；_MAX_INJECT_CHARS=16000 保护
 │   │   ├── skill_semantic_router.py  # ★ LLM 批量路由器（单次调用对候选 skill 打分，0-1.0）
 │   │   ├── skill_routing_cache.py  # ★ ChromaDB 持久化路由缓存（TTL 24h，精确哈希匹配）
 │   │   └── skill_watcher.py        # watchdog 热重载监视器（recursive=True，监听3层子目录）
@@ -145,9 +145,10 @@ data-agent/
         ├── project/                # Tier 2：项目技能（管理员 REST API 维护）
         │   └── *.md
         └── user/                   # ★ Tier 3：用户技能（API 和前端均可增删改）
-            ├── *.md                # ENABLE_AUTH=false：所有用户共用 flat 目录（向后兼容）
-            └── {username}/         # ENABLE_AUTH=true：每个用户独立子目录（隔离写入）
-                └── *.md
+            ├── *.md                # ENABLE_AUTH=false / owner=""：所有用户共用（向后兼容遗留技能）
+            └── {username}/         # ENABLE_AUTH=true：每个用户独立子目录
+                └── *.md            #   写入隔离（FilesystemPermissionProxy Fix-4）
+                                    #   读取隔离（T1–T6：_get_visible_user_skills 只返回 owner==username 或 "" 的技能）
 ```
 
 ---
@@ -675,8 +676,10 @@ Bug 修复（随本版本一起修复）：
            │
     _MAX_INJECT_CHARS=16000 限制保护（超限 → 摘要模式）
            │
-    build_skill_prompt_async() 返回 skill_injection 字符串
-           │
+    build_skill_prompt_async(user_id=context["username"]) 返回 skill_injection 字符串
+           │                          ↑ T5：由 agentic_loop 传入当前用户名
+           │    Phase 1/2 均只在 _get_visible_user_skills(user_id) 范围内匹配（T2/T3）
+           │    _expand_sub_skills 展开时同样受 user_id 限制（T4）
     注入 AgenticLoop._build_system_prompt()（async）
            → 同时注入 context["username"] 为 "CURRENT_USER: {username}"
              供 skill-creator 等技能确定写入路径 (.claude/skills/user/{username}/)
@@ -906,6 +909,68 @@ cancelling ──(协程检测到)──► cancelled
 **多 Sheet 自动分割**：Excel 单 Sheet 行数上限 `MAX_ROWS_PER_SHEET = 1,000,000`。超限时自动创建新 Sheet（`Sheet1` → `Sheet2` → …），每个 Sheet 均含表头行。
 
 **权限**：全部 8 个 `/data-export/*` 端点均通过 `Depends(require_permission("data", "export"))` 保护。默认仅 superadmin 拥有 `data:export` 权限（可通过角色管理 API 动态授予其他角色）。`ENABLE_AUTH=false` 时 AnonymousUser(is_superadmin=True) 自动通过。
+
+---
+
+### 4.19 Skill 用户使用权限隔离（T1–T6）（2026-04-08）
+
+**设计动机**：超级管理员在 `user/superadmin/` 创建的用户技能，原本对所有其他用户在对话时同样可见（`build_skill_prompt` 未按用户过滤 user-tier skill）。T1–T6 通过 `owner` 字段 + 可见性过滤，将 Tier 3 用户技能的**读访问**也完整隔离到各用户自己名下，与写入隔离对称。
+
+```
+SkillMD（T1：owner 字段）
+  ├─ owner: str  — 从 filepath 解析（_extract_skill_owner）
+  │               user/{username}/x.md  → owner="username"
+  │               user/x.md（根目录）   → owner=""（对所有人可见，遗留兼容）
+  └─ _parse_file() 调用 _extract_skill_owner(filepath, skills_dir)
+
+SkillLoader._get_visible_user_skills(username)（T2）
+  ├─ username=="" 或 "default"
+  │     → 返回全部 _user_skills（ENABLE_AUTH=false 向后兼容）
+  └─ 否则：{name: s for name, s in _user_skills.items()
+               if s.owner == "" or s.owner == username}
+
+build_skill_prompt(message, user_id=...)（T3，同步路径）
+build_skill_prompt_async(message, llm_adapter, user_id=...)（T3，异步路径）
+  ├─ Phase 1 关键词匹配：仅在 _get_visible_user_skills(user_id) 中匹配
+  ├─ Phase 2 语义候选列表：同样使用 visible_user skills（不向其他用户泄露 skill 名）
+  └─ _build_from_matched_skills()：只展开可见 skill 的内容
+
+_expand_sub_skills(skill, user_id=...)（T4）
+  └─ 在 _get_visible_user_skills(user_id) 范围内查找子技能
+     → 防止 project skill 通过 sub_skills 声明跨用户展开私有技能到他人 prompt
+
+AgenticLoop._build_system_prompt(context, message)（T5）
+  └─ await build_skill_prompt_async(
+         message, llm_adapter, user_id=context["username"]
+     )  ← context["username"] 由 send_message_stream() 注入
+
+GET /skills/preview?message=xxx（T6）
+  ├─ effective_user_id = current_user.username     （登录用户）
+  │                    = "default"                 （AnonymousUser）
+  │                    = view_as（仅 superadmin 可传 view_as 参数，代入目标用户视角）
+  ├─ build_skill_prompt_async(message, ..., user_id=effective_user_id)
+  └─ get_match_details(message, username=effective_user_id)  ← Bug 修复（见下）
+```
+
+**Bug 修复（随 T6 一起修复）**：
+
+`get_match_details()` 原实现直接迭代 `self._user_skills`（全体用户技能），导致 `/skills/preview` 响应的 `match_details` 字段中泄露其他用户的私有技能名称。修复：方法新增 `username` 参数，改为迭代 `_get_visible_user_skills(username)`；关键词路径和语义路径均已修复。
+
+**ENABLE_AUTH=false 向后兼容**：
+
+`AnonymousUser.username = "default"`；`_get_visible_user_skills("default")` 返回全部 user skills，行为与升级前一致。
+
+**RBAC 范围**：
+
+无新增菜单/路由/权限键。Skills 菜单仍受 `skills.user:read` 保护（analyst+）。`view_as` 参数通过 `is_superadmin` 字段在 API 层控制，不依赖新权限键。
+
+**测试套件**：
+
+| 测试文件 | 测试数 | 覆盖范围 |
+|---------|-------|---------|
+| `tests/test_skill_user_isolation.py` | 29 | U1–U6：owner 解析 / 用户可见性 / ENABLE_AUTH=false 兼容 / sub_skill 展开隔离 / preview API 身份逻辑 |
+| `test_skill_isolation_e2e.py` | 43 | A–H：用户技能目录写入路径 / CRUD 跨用户隔离 / 权限矩阵 / username 全链路 / RBAC 范围 / init_rbac |
+| `test_skill_prompt_isolation_e2e.py` | 15 | I–K：Preview API HTTP 级隔离 / match_details 不泄露 / build_skill_prompt_async 隔离 / list_md_skills 过滤 |
 
 ---
 

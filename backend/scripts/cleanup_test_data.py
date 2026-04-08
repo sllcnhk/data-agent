@@ -40,6 +40,53 @@ def is_test_name(name: str) -> bool:
     return any(name.startswith(p) for p in TEST_PREFIXES)
 
 
+def _cleanup_skill_files(dry_run: bool = False) -> int:
+    """
+    清理 .claude/skills/user/ 下测试产生的 skill 文件和子目录。
+
+    测试前缀（两类）：
+    1. DB 测试前缀：^_[a-z][a-z0-9]*_（如 _t_、_si_、_rbact_）
+    2. Slugified 测试前缀：^t-compat-、^t-rbac- 等（经 _slugify 后 _ 变 - ）
+    """
+    import re
+    import shutil as _shutil
+    _TEST_PATTERN = re.compile(r'^_[a-z][a-z0-9]*_')
+    _SLUGIFIED_TEST_PREFIXES = ("t-compat-", "t-rbac-", "t-skill-", "t-test-")
+
+    def _is_test_skill(name: str) -> bool:
+        return bool(_TEST_PATTERN.match(name)) or any(name.startswith(p) for p in _SLUGIFIED_TEST_PREFIXES)
+
+    user_skills_dir = _ROOT / ".claude" / "skills" / "user"
+    if not user_skills_dir.is_dir():
+        return 0
+
+    mode = "[DRY-RUN] " if dry_run else ""
+    deleted = 0
+    for entry in user_skills_dir.iterdir():
+        if entry.is_file() and entry.suffix == ".md" and _is_test_skill(entry.stem):
+            logger.info("%sWould delete skill file: %s", mode, entry.name)
+            if not dry_run:
+                try:
+                    entry.unlink()
+                    deleted += 1
+                except OSError as exc:
+                    logger.warning("  Failed to delete %s: %s", entry, exc)
+        elif entry.is_dir() and _is_test_skill(entry.name):
+            logger.info("%sWould delete skill dir: %s/", mode, entry.name)
+            if not dry_run:
+                try:
+                    _shutil.rmtree(entry)
+                    deleted += 1
+                except OSError as exc:
+                    logger.warning("  Failed to delete %s: %s", entry, exc)
+
+    if deleted:
+        logger.info("Deleted %d test skill file/dir(s) from .claude/skills/user/.", deleted)
+    elif not dry_run:
+        logger.info("No test skill files/dirs found.")
+    return deleted
+
+
 def run(dry_run: bool = False):
     from backend.config.database import SessionLocal
     from backend.models.user import User
@@ -155,24 +202,29 @@ def run(dry_run: bool = False):
         else:
             logger.info("%sNo test roles found.", mode)
 
-        # ── 5. 汇总 ─────────────────────────────────────────────────────────
+        # ── 5. 清理 skill 文件（不依赖 DB，单独处理）────────────────────────────
+        deleted_skills = _cleanup_skill_files(dry_run=dry_run)
+
+        # ── 6. 汇总 ─────────────────────────────────────────────────────────
         if dry_run:
             logger.info(
                 "DRY-RUN complete. Would delete %d import job(s), %d export job(s), "
-                "%d user(s), %d role(s). Run without --dry-run to apply.",
+                "%d user(s), %d role(s), %d skill file/dir(s). Run without --dry-run to apply.",
                 len(test_import_jobs) if "test_import_jobs" in dir() else 0,
                 len(test_export_jobs) if "test_export_jobs" in dir() else 0,
                 len(test_users),
                 len(test_roles),
+                deleted_skills,
             )
         else:
             logger.info(
                 "Cleanup complete. Deleted %d import job(s), %d export job(s), "
-                "%d user(s), %d role(s).",
+                "%d user(s), %d role(s), %d skill file/dir(s).",
                 deleted_import_jobs,
                 deleted_export_jobs,
                 deleted_users,
                 deleted_roles,
+                deleted_skills,
             )
 
     except Exception:

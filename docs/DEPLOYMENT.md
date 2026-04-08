@@ -1,6 +1,6 @@
 # 部署指南
 
-> 版本：v2.2 · 2026-04-07（**SQL→Excel 数据导出**：`migrate_data_export.py` DB 迁移（`export_jobs` 表 + `data:export` 权限）；流式写 xlsx + 多 Sheet 自动分割 + 大整数安全转换；v2.1 · 2026-04-05：**Excel 数据导入**：`migrate_data_import.py` DB 迁移（`import_jobs` 表 + `data:import` 权限）；流式上传支持 100MB 大文件；**文件写入下载**：`files_written` SSE 事件 + `GET /api/v1/files/download` 安全下载端点 + `FILE_OUTPUT_DATE_SUBFOLDER` 配置，**无 DB 迁移**；技能路由可视化：`skill_matched` SSE 事件 + `SkillLoader._last_match_info` + ThoughtProcess 🧠 面板 + `GET /skills/load-errors`，**无 DB 迁移**；侧边栏 Tab UI + is_shared：`migrate_add_is_shared.py` DB 迁移；对话用户隔离：`migrate_conversation_user_isolation.py` DB 迁移 + 所有对话/分组端点补全鉴权；customer_data 用户隔离；对话附件上传）
+> 版本：v2.3 · 2026-04-08（**Skill 用户使用权限隔离 T1–T6**：SkillMD.owner + `_get_visible_user_skills` + `build_skill_prompt_async(user_id=)` + sub_skill 展开隔离 + Preview API effective_user_id；**无 DB 迁移**，纯代码层变更；v2.2 · 2026-04-07：**SQL→Excel 数据导出**：`migrate_data_export.py` DB 迁移（`export_jobs` 表 + `data:export` 权限）；流式写 xlsx + 多 Sheet 自动分割 + 大整数安全转换；v2.1 · 2026-04-05：**Excel 数据导入**：`migrate_data_import.py` DB 迁移（`import_jobs` 表 + `data:import` 权限）；流式上传支持 100MB 大文件；**文件写入下载**：`files_written` SSE 事件 + `GET /api/v1/files/download` 安全下载端点 + `FILE_OUTPUT_DATE_SUBFOLDER` 配置，**无 DB 迁移**；技能路由可视化：`skill_matched` SSE 事件 + `SkillLoader._last_match_info` + ThoughtProcess 🧠 面板 + `GET /skills/load-errors`，**无 DB 迁移**；侧边栏 Tab UI + is_shared：`migrate_add_is_shared.py` DB 迁移；对话用户隔离：`migrate_conversation_user_isolation.py` DB 迁移 + 所有对话/分组端点补全鉴权；customer_data 用户隔离；对话附件上传）
 >
 > 本文档说明如何将数据智能分析 Agent 系统从 Windows 开发环境迁移到 Linux 服务器，供团队多人共用。
 
@@ -297,6 +297,9 @@ chmod 775 /opt/data-agent/.claude/skills/user
 > **技能写入路径规则（FilesystemPermissionProxy Fix-4）**：
 > AI 写技能文件时必须包含 `user/{username}/` 层，直接写到 `user/skill.md` 会被拒绝。
 > `create_directory user/{username}/` 是合法操作（深度 ≥ 1），`write_file user/skill.md` 会报错并提示正确格式。
+>
+> **技能读取可见性规则（T1–T6，2026-04-08）**：
+> `ENABLE_AUTH=true` 时，每个用户只能在对话 System Prompt 中看到自己创建的技能（`owner == username`）以及无主遗留技能（`owner == ""`）。其他用户的私有技能既不会注入到 System Prompt，也不会出现在 `/skills/preview` 的 `match_details` 中。系统技能（system/）和项目技能（project/）对所有用户可见，不受此限制。
 
 ### 5.7 测试启动
 
@@ -864,6 +867,10 @@ python backend/scripts/migrate_data_import.py
 
 # v2.2+ SQL→Excel 数据导出：执行 DB 迁移（幂等，已执行过会跳过）
 python backend/scripts/migrate_data_export.py
+
+# v2.3+ Skill 用户使用权限隔离（T1–T6）：无 DB 迁移，纯代码层变更，代码更新后重启服务即可
+# 注：ENABLE_AUTH=true 环境建议验证 .claude/skills/user/ 下已有技能文件位于 {username}/ 子目录
+# （如有遗留的 user/*.md 文件，init_rbac.py 中的 _migrate_user_skills_to_superadmin 可一次性迁移）
 
 # 重启服务
 sudo systemctl restart data-agent-backend

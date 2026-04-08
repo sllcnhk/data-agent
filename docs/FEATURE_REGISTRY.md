@@ -2,7 +2,7 @@
 
 > **适用对象**：LLM 模型、产品规划、开发者
 > **目的**：完整记录已实现功能、已知缺陷修复、以及待实现功能及优先级
-> **最后更新**：2026-04-05（**Excel → ClickHouse 数据导入**：`migrate_data_import.py` DB 迁移 + 9 个 REST 端点 + `run_import_job` 后台协程 + 取消/删除功能 + 大文件流式上传优化；**文件写入下载**：files_written SSE 事件 + GET /api/v1/files/download 安全端点 + FileDownloadCards UI + FILE_OUTPUT_DATE_SUBFOLDER 配置；技能路由可视化：skill_matched SSE 事件 + SkillLoader._last_match_info + ThoughtProcess 🧠 面板 + GET /skills/load-errors；侧边栏 Tab UI + 只读模式 + is_shared；对话用户隔离；附件上传；ClickHouse TCP→HTTP 自动回退）
+> **最后更新**：2026-04-08（**Skill 用户使用权限隔离 T1–T6**：SkillMD.owner + `_get_visible_user_skills(username)` + `build_skill_prompt_async(user_id=)` + `_expand_sub_skills` 跨用户防护 + Preview API `effective_user_id` + `get_match_details(username=)` bug 修复；无 DB 迁移；测试 87/87 通过；v2.4 2026-04-05：**Excel → ClickHouse 数据导入**：`migrate_data_import.py` DB 迁移 + 9 个 REST 端点 + `run_import_job` 后台协程 + 取消/删除功能 + 大文件流式上传优化；**文件写入下载**：files_written SSE 事件 + GET /api/v1/files/download 安全端点 + FileDownloadCards UI + FILE_OUTPUT_DATE_SUBFOLDER 配置；技能路由可视化：skill_matched SSE 事件 + SkillLoader._last_match_info + ThoughtProcess 🧠 面板 + GET /skills/load-errors；侧边栏 Tab UI + 只读模式 + is_shared；对话用户隔离；附件上传；ClickHouse TCP→HTTP 自动回退）
 
 ---
 
@@ -67,7 +67,7 @@
 | 角色列表端点 | `backend/api/users.py` | GET /roles：返回 4 个预置角色及其权限详情 |
 | RBAC 初始化脚本 | `backend/scripts/init_rbac.py` | 幂等脚本，写入 4 角色（viewer/analyst/admin/superadmin）+ 13 权限；admin 无 users:* 权限 |
 | 兼容模式 | `backend/api/deps.py` | `ENABLE_AUTH=false`（默认）→ AnonymousUser（is_superadmin=True），所有权限检查直接通过，旧行为完全不变 |
-| 多用户技能隔离 | `backend/api/skills.py` + `backend/skills/skill_loader.py` | `ENABLE_AUTH=true` 时用户技能写入 `user/{username}/`（含 "default" 用户，已修复旧有 `username!="default"` 守卫漏洞）；SkillLoader 启用 scan_subdirs=True 扫描子目录 |
+| 多用户技能写入隔离 | `backend/api/skills.py` + `backend/skills/skill_loader.py` | `ENABLE_AUTH=true` 时用户技能写入 `user/{username}/`（含 "default" 用户，已修复旧有 `username!="default"` 守卫漏洞）；SkillLoader 启用 scan_subdirs=True 扫描子目录；**读取可见性隔离**详见 T1–T6（单独子节）|
 | username 全链路注入 | `backend/api/conversations.py` + `backend/services/conversation_service.py` + `backend/agents/agentic_loop.py` | `send_message` 端点提取 JWT username → `send_message_stream(username=)` → `_build_context(username=)` → `context["username"]` → `_build_system_prompt()` 注入 `CURRENT_USER: {username}` 到 filesystem 工具提示，供 skill-creator 等写技能时确定正确路径 |
 | POST /skills/user-defined 返回 201 | `backend/api/skills.py` | `@router.post("/user-defined", status_code=201)` 和 `@router.post("/project-skills", status_code=201)`；符合 REST 创建资源语义（HTTP 201 Created） |
 | 角色管理 REST 端点（CRUD + 权限分配）| `backend/api/users.py` | POST/DELETE `/roles`（自定义角色增删，系统角色 `is_system=True` 删除返回 403）；POST/DELETE `/roles/{id}/permissions`（权限分配/撤销，需 `users:assign_role`）；`_role_out_dict()` 序列化含权限详情的角色对象 |
@@ -118,6 +118,22 @@
 | ThoughtProcess 🧠 技能路由面板 | `frontend/src/components/chat/ThoughtProcess.tsx` | 渲染模式标签/matched 技能（tier 徽标/hit_triggers/score）/always_inject 列表/字符数/load_errors 告警 |
 | GET /skills/load-errors API | `backend/api/skills.py` | 返回加载失败的技能文件列表；权限：`settings:read`（analyst/admin/superadmin） |
 | 持久化兼容 | `conversation_service.py:send_message_stream()` | skill_matched 纳入 thinking_events 收集范围，写入 extra_metadata，刷新后可回溯 |
+
+### Skill 用户使用权限隔离 T1–T6（已完成，2026-04-08）
+
+**背景**：原实现仅对 user-tier skill 的**写入**做了目录隔离（`user/{username}/`），但 `build_skill_prompt` 在构建对话 system prompt 时未按当前用户过滤，导致 superadmin 创建的技能对所有用户可见——读访问与隔离设计不符。
+
+| 任务 | 文件 | 说明 |
+|------|------|------|
+| T1: SkillMD.owner 字段 | `backend/skills/skill_loader.py:SkillMD` | 新增 `owner: str` 字段；`_extract_skill_owner(filepath, skills_dir)` 解析：`user/{username}/x.md` → `"username"`；`user/x.md` → `""`（遗留，所有人可见）|
+| T2: _get_visible_user_skills() | `backend/skills/skill_loader.py:SkillLoader` | 新增过滤方法：`username=="" \| "default"` → 返回全部（兼容匿名模式）；否则返回 `owner==""` 或 `owner==username` 的 skill |
+| T3: build_skill_prompt 用户过滤 | `backend/skills/skill_loader.py` | `build_skill_prompt(message, user_id=)` 和 `build_skill_prompt_async(message, llm_adapter, user_id=)` Phase 1/2 均只在 `_get_visible_user_skills(user_id)` 内匹配 |
+| T4: _expand_sub_skills 隔离 | `backend/skills/skill_loader.py` | `_expand_sub_skills(skill, user_id=)` 在可见范围内查找子技能，防止 project skill 通过 `sub_skills` 声明跨用户展开私有技能 |
+| T5: agentic_loop 传递 username | `backend/agents/agentic_loop.py` | `_build_system_prompt()` 调用改为 `await build_skill_prompt_async(message, llm_adapter, user_id=context["username"])` |
+| T6: Preview API 用户身份绑定 | `backend/api/skills.py:GET /preview` | `effective_user_id` = 登录用户 / `"default"`（匿名）/ `view_as`（superadmin override）；`get_match_details(username=effective_user_id)` 修复泄露 bug |
+| Bug fix: get_match_details 泄露 | `backend/skills/skill_loader.py` | 原迭代 `_user_skills`（全员），新增 `username` 参数，改为迭代 `_get_visible_user_skills(username)`；keyword 和 semantic 两条路径均已修复 |
+| RBAC 范围 | — | **无新菜单/路由/权限键**。Skills 菜单沿用 `skills.user:read`（analyst+）。`view_as` 通过 `is_superadmin` 控制，不新增权限键 |
+| 测试套件 | `tests/test_skill_user_isolation.py`（29）+ `test_skill_isolation_e2e.py`（43）+ `test_skill_prompt_isolation_e2e.py`（15）| 单元 + E2E + HTTP 三层覆盖，合计 87 个测试；87/87 通过 |
 
 ### P2 — 审批系统 + 上下文管理（已完成）
 

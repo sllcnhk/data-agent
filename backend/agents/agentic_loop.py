@@ -822,7 +822,9 @@ class AgenticLoop:
             try:
                 from backend.skills.skill_loader import get_skill_loader
                 skill_injection = await get_skill_loader().build_skill_prompt_async(
-                    message, llm_adapter=getattr(self, "llm_adapter", None)
+                    message,
+                    llm_adapter=getattr(self, "llm_adapter", None),
+                    user_id=current_username,
                 )
             except Exception as exc:
                 logger.warning(f"[AgenticLoop] SkillLoader error: {exc}")

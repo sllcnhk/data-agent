@@ -521,15 +521,17 @@ async def delete_project_skill(skill_name: str, _=Depends(require_admin)):
 @router.get("/preview", response_model=Dict[str, Any])
 async def preview_skill_trigger(
     message: str,
-    user_id: str = "default",
     mode: str = "",
+    view_as: str = "",
+    current_user=Depends(get_current_user),
 ):
     """
     预览给定消息会激活哪些 Skill（测试触发器）。
 
     参数：
-      - message: 要测试的用户消息
-      - mode: 强制覆盖匹配模式（keyword/hybrid/llm），空字符串使用系统配置
+      - message:  要测试的用户消息
+      - mode:     强制覆盖匹配模式（keyword/hybrid/llm），空字符串使用系统配置
+      - view_as:  仅 superadmin 可用；指定要模拟的用户名，预览该用户看到的 skill 视图
 
     返回：
       - triggered: 将被触发注入的 skill 列表（按层次排序）
@@ -537,7 +539,23 @@ async def preview_skill_trigger(
       - total_chars: 预估注入的总字符数
       - preview_prompt: 注入的完整 prompt 文本（截断到 2000 字符）
       - match_details: 每个命中 skill 的匹配方式 {name: {method, score, tier}}
+      - preview_user: 实际预览所用的用户名（superadmin override 时显示）
     """
+    from backend.api.deps import AnonymousUser
+
+    # 确定预览所用用户名
+    # superadmin 可通过 view_as 模拟其他用户视角；普通用户强制使用自身身份
+    is_anon = isinstance(current_user, AnonymousUser)
+    if view_as and not is_anon:
+        is_superadmin = getattr(current_user, "is_superadmin", False)
+        if not is_superadmin:
+            raise HTTPException(status_code=403, detail="view_as 参数仅 superadmin 可用")
+        effective_user_id = view_as
+    elif is_anon:
+        effective_user_id = "default"
+    else:
+        effective_user_id = current_user.username
+
     try:
         from backend.skills.skill_loader import get_skill_loader
         loader = get_skill_loader()
@@ -564,18 +582,19 @@ async def preview_skill_trigger(
 
             async with _mode_override():
                 preview_prompt = await loader.build_skill_prompt_async(
-                    message, llm_adapter=None, user_id=user_id
+                    message, llm_adapter=None, user_id=effective_user_id
                 )
         else:
             preview_prompt = await loader.build_skill_prompt_async(
-                message, llm_adapter=None, user_id=user_id
+                message, llm_adapter=None, user_id=effective_user_id
             )
 
         total_chars = len(preview_prompt)
 
-        # Collect triggered skills (keyword-based, for display)
+        # Collect triggered skills (keyword-based, for display, filtered by user)
         triggered_all = loader.find_triggered(message)
-        user_triggered = [s for s in triggered_all if s.tier == "user"]
+        visible_user_names = set(loader._get_visible_user_skills(effective_user_id).keys())
+        user_triggered = [s for s in triggered_all if s.tier == "user" and s.name in visible_user_names]
         proj_triggered = [s for s in triggered_all if s.tier == "project"]
         sys_triggered = [s for s in triggered_all if s.tier == "system"]
 
@@ -590,10 +609,12 @@ async def preview_skill_trigger(
             }
 
         # Build match_details from keyword hits + always_inject
-        match_details = loader.get_match_details(message)
+        # 传入 effective_user_id 确保 user-tier skill 按用户隔离
+        match_details = loader.get_match_details(message, username=effective_user_id)
 
         return {
             "message": message,
+            "preview_user": effective_user_id,
             "triggered": {
                 "user": [_skill_info(s) for s in user_triggered],
                 "project": [_skill_info(s) for s in proj_triggered],
@@ -604,6 +625,8 @@ async def preview_skill_trigger(
             "preview_prompt": preview_prompt[:2000] + ("..." if total_chars > 2000 else ""),
             "match_details": match_details,
         }
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 

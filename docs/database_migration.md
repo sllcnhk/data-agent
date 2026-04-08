@@ -1,6 +1,6 @@
 # 数据库迁移指南
 
-> **最后更新**：2026-04-07（**SQL→Excel 数据导出**：`migrate_data_export.py` 新建 `export_jobs` 表 + 种子 `data:export` 权限；**Excel 数据导入**：`migrate_data_import.py` 新建 `import_jobs` 表 + 种子 `data:import` 权限；**文件写入下载**：**无 DB 迁移**，文件路径元数据写入已有 `messages.extra_metadata["files_written"]` JSONB 列；技能路由可视化 T1-T6：**无新增 DB 迁移**，skill_matched SSE 事件 / SkillLoader._last_match_info / ThoughtProcess 🧠 面板均为代码层变更；新增 `migrate_add_is_shared.py`：`conversations.is_shared` 字段；对话用户隔离：`migrate_conversation_user_isolation.py`；其余历次变更均无数据库结构变更）
+> **最后更新**：2026-04-08（**Skill 用户使用权限隔离 T1–T6**：**无 DB 迁移**，纯代码层变更——SkillMD.owner 字段从 filepath 解析、`_get_visible_user_skills(username)` 过滤、`build_skill_prompt_async(user_id=)` 用户绑定、`_expand_sub_skills` 跨用户防护、Preview API effective_user_id；如有遗留 `user/*.md` 文件，`init_rbac.py → _migrate_user_skills_to_superadmin()` 可一次性迁移至 `user/superadmin/`；v2.2 2026-04-07：**SQL→Excel 数据导出**：`migrate_data_export.py` 新建 `export_jobs` 表 + 种子 `data:export` 权限；**Excel 数据导入**：`migrate_data_import.py` 新建 `import_jobs` 表 + 种子 `data:import` 权限；**文件写入下载**：**无 DB 迁移**，文件路径元数据写入已有 `messages.extra_metadata["files_written"]` JSONB 列；技能路由可视化：**无新增 DB 迁移**；新增 `migrate_add_is_shared.py`：`conversations.is_shared` 字段；对话用户隔离：`migrate_conversation_user_isolation.py`；其余历次变更均无数据库结构变更）
 
 本文档说明数据库迁移的两种方式：
 1. **项目自有手动迁移脚本**（`backend/migrations/`）— 当前主要方式，支持 up/down
@@ -26,6 +26,7 @@
 | 文件写入下载（T1-T7） | 2026-03-26 | **无 DB 迁移**。Agent 写文件时生成的文件路径元数据（`[{path,name,size,mime_type}]`）写入已有 `messages.extra_metadata["files_written"]` JSONB 列，无需结构变更。文件实体存储于 `customer_data/{username}/` 目录（文件系统层面）。新增 `backend/api/files.py` 下载端点与 `FILE_OUTPUT_DATE_SUBFOLDER` 配置项均为代码/配置层变更。 | ✅ 无需执行 |
 | Excel 数据导入 | 2026-04-05 | **DB 迁移脚本**：`backend/scripts/migrate_data_import.py`。① 新建 `import_jobs` 表（UUID PK、状态机字段、进度追踪字段、错误信息、JSONB 配置快照）；② 插入 `data:import` 权限记录；③ 将 `data:import` 权限分配给 superadmin 角色。幂等（`CREATE TABLE IF NOT EXISTS` + `INSERT ... ON CONFLICT DO NOTHING`）。 | ✅ 已执行 |
 | SQL→Excel 数据导出 | 2026-04-07 | **DB 迁移脚本**：`backend/scripts/migrate_data_export.py`。① 新建 `export_jobs` 表（UUID PK、状态机字段、行级/批次/Sheet 三层进度字段、输出文件路径/大小、JSONB 配置快照）；② 插入 `data:export` 权限记录；③ 将 `data:export` 权限分配给 superadmin 角色。幂等（`CREATE TABLE IF NOT EXISTS` + `INSERT ... ON CONFLICT DO NOTHING`）。 | ✅ 已执行 |
+| Skill 用户使用权限隔离 T1–T6 | 2026-04-08 | **无 DB 迁移**。变更均为代码层：`SkillMD.owner` 字段（filepath 解析）、`_get_visible_user_skills(username)` 方法、`build_skill_prompt_async(user_id=)` 参数、`_expand_sub_skills(user_id=)` 跨用户防护、Preview API `effective_user_id` 绑定及 `get_match_details(username=)` bug 修复。文件系统结构不变（仍为 `user/{username}/`）；如有遗留的 `user/*.md`（无 username 子目录），`init_rbac.py` 中的 `_migrate_user_skills_to_superadmin()` 可一次性迁移至 `user/superadmin/`（该函数在执行 `init_rbac.py` 时自动调用）。 | ✅ 无需执行 |
 
 ---
 

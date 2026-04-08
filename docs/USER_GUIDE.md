@@ -1,7 +1,7 @@
 # 数据智能体系统 — 核心使用手册
 
-**文档版本**: v2.5
-**适用系统版本**: P0 + P1 + P2 + P3 + 3-Tier Skill System + Semantic Skill Routing + RBAC + 角色管理页面 + 推理过程持久化 + ContinuationCard + ClickHouse 动态多区域配置 + Session 过期管理 + 对话打断（停止生成）+ 对话附件上传 + 用户技能目录隔离修复 + 对话用户隔离 + 侧边栏 Tab UI + 只读模式 + is_shared 群组框架 + 技能路由可视化 + 文件写入下载 + **Excel → ClickHouse 数据导入**（2026-04-05）
+**文档版本**: v2.6
+**适用系统版本**: P0 + P1 + P2 + P3 + 3-Tier Skill System + Semantic Skill Routing + RBAC + 角色管理页面 + 推理过程持久化 + ContinuationCard + ClickHouse 动态多区域配置 + Session 过期管理 + 对话打断（停止生成）+ 对话附件上传 + 用户技能目录隔离修复 + 对话用户隔离 + 侧边栏 Tab UI + 只读模式 + is_shared 群组框架 + 技能路由可视化 + 文件写入下载 + **Excel → ClickHouse 数据导入**（2026-04-05）+ **Skill 用户使用权限隔离 T1–T6**（2026-04-08）
 **读者对象**: 数据工程师、数据分析师、系统管理员
 
 ---
@@ -833,10 +833,12 @@ Tier 3 · 用户技能（user/）     — 用户在前端/API 自由创建、编
 
 #### 用户技能标签（My Skills）
 
-展示 `.claude/skills/user/` 目录的技能，**当前用户可增删改**。
+展示当前登录用户在 `.claude/skills/user/{username}/` 目录下创建的技能，**仅自己可见、可增删改**。
+
+> **用户技能隔离（T1–T6）**：`ENABLE_AUTH=true` 时，每位用户只能看到自己创建的技能（`owner == username`）和无主技能（`owner == ""`，遗留兼容）。其他用户的私有技能不会出现在列表中，也不会注入到你的对话 System Prompt 中。`ENABLE_AUTH=false`（匿名模式）时，所有用户技能对所有人可见（向后兼容）。
 
 操作说明：
-- 「新增技能」→ 填写名称、描述、触发词、内容 → 创建
+- 「新增技能」→ 填写名称、描述、触发词、内容 → 创建（存入 `user/{你的用户名}/`）
 - 「编辑」(铅笔图标) → 修改任意字段（版本自动递增）→ 保存
 - 「提升」(上升图标) → 将用户技能推广为项目技能（需管理员 Token）
 - 「删除」→ 确认删除
@@ -912,12 +914,17 @@ GET /api/v1/skills/project-skills
 
 #### 触发测试 API
 
+Preview API 使用**当前登录用户身份**决定哪些 user-tier skill 可见，结果与实际对话一致（T6 用户隔离）。superadmin 可通过 `view_as` 参数模拟其他用户的视角。
+
 ```bash
-# 测试消息会触发哪些技能（默认 hybrid 模式）
+# 测试消息会触发哪些技能（默认 hybrid 模式，以当前用户身份过滤 user-tier skill）
 GET /api/v1/skills/preview?message=帮我分析用户留存漏斗
 
 # 强制使用纯关键词模式（跳过 LLM 语义路由）
 GET /api/v1/skills/preview?message=帮我看看外呼接通情况&mode=keyword
+
+# superadmin 专属：以 alice 的视角预览（view_as 参数，非 superadmin 调用返回 403）
+GET /api/v1/skills/preview?message=xxx&view_as=alice
 
 # 响应示例
 {

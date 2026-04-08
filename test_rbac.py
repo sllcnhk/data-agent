@@ -957,7 +957,11 @@ class TestEnableAuthFalseCompat(unittest.TestCase):
         from backend.api import skills as skills_mod
         tmp_dir = Path(tempfile.mkdtemp())
         orig, orig_res = skills_mod._USER_SKILLS_DIR, skills_mod._USER_SKILLS_DIR_RESOLVED
-        skill_name = f"compat-skill-{uuid.uuid4().hex[:6]}"
+        # 注意：skill_name 经过 _slugify 后前导 _ 会被去掉变成 t-compat-xxx.md
+        # 兜底清理直接用 _slugify 计算出真实文件名
+        from backend.api.skills import _slugify as _slugify_skill
+        skill_name = f"_t_compat_{uuid.uuid4().hex[:6]}"
+        slug = _slugify_skill(skill_name)          # → "t-compat-xxxxxx"
         try:
             skills_mod._USER_SKILLS_DIR = tmp_dir
             skills_mod._USER_SKILLS_DIR_RESOLVED = tmp_dir.resolve()
@@ -974,6 +978,11 @@ class TestEnableAuthFalseCompat(unittest.TestCase):
             skills_mod._USER_SKILLS_DIR = orig
             skills_mod._USER_SKILLS_DIR_RESOLVED = orig_res
             shutil.rmtree(tmp_dir, ignore_errors=True)
+            # 兜底清理：_USER_SKILLS_DIR patch 失效时文件可能泄漏到真实 user/ 或 user/default/ 目录
+            for parent in (orig, orig / "default"):
+                leak = parent / f"{slug}.md"
+                if leak.exists():
+                    leak.unlink(missing_ok=True)
 
     def test_H3_skill_dir_is_flat_when_auth_disabled(self):
         """ENABLE_AUTH=false 时 _get_user_skill_dir 返回扁平 user/ 目录"""

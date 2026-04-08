@@ -57,14 +57,69 @@ def _cleanup_customer_data_dirs(label: str = "") -> int:
     return deleted
 
 
+def _cleanup_skill_files(label: str = "") -> int:
+    """
+    清理 .claude/skills/user/ 下测试产生的 skill 文件和子目录。
+
+    规则：
+    - .claude/skills/user/*.md         — 文件 stem 匹配测试前缀 → 删除文件
+    - .claude/skills/user/{dirname}/   — 目录名匹配测试前缀     → 删除整个子目录
+
+    测试前缀（两类）：
+    1. DB 测试前缀：^_[a-z][a-z0-9]*_（如 _t_、_si_、_rbact_）
+       对应 user-skill 子目录名（username 格式，不经过 slugify）
+    2. Slugified 测试前缀：^t-compat-、^t-rbac-（skill 名经 _slugify 后 _ 变 - ）
+       对应 test_H2 等通过 API 创建但 patch 泄漏到真实目录的 .md 文件
+
+    这覆盖两类典型场景：
+    1. _si_xxx_alice 等测试用户对应的 per-user skill 子目录残留
+    2. t-compat-xxx.md 等从 test_H2 泄漏到 flat user/ 目录的文件（兜底）
+    """
+    user_skills_dir = _ROOT / ".claude" / "skills" / "user"
+    if not user_skills_dir.is_dir():
+        return 0
+
+    # slugified 测试文件名前缀（_t_compat_ → t-compat-，_t_rbac_ → t-rbac- 等）
+    _SLUGIFIED_TEST_PREFIXES = ("t-compat-", "t-rbac-", "t-skill-", "t-test-")
+
+    def _is_test_skill(name: str) -> bool:
+        return _is_test_entity(name) or any(name.startswith(p) for p in _SLUGIFIED_TEST_PREFIXES)
+
+    deleted = 0
+    try:
+        for entry in user_skills_dir.iterdir():
+            if entry.is_file() and entry.suffix == ".md" and _is_test_skill(entry.stem):
+                try:
+                    entry.unlink()
+                    deleted += 1
+                except Exception as exc:
+                    print(f"\n[conftest] Failed to remove skill file {entry}: {exc}")
+            elif entry.is_dir() and _is_test_skill(entry.name):
+                try:
+                    shutil.rmtree(entry)
+                    deleted += 1
+                except Exception as exc:
+                    print(f"\n[conftest] Failed to remove skill dir {entry}: {exc}")
+    except Exception as exc:
+        print(f"\n[conftest] Skill cleanup scan failed (non-fatal): {exc}")
+
+    if deleted:
+        tag = f"[{label}] " if label else ""
+        print(f"\n[conftest] {tag}Cleanup: removed {deleted} test skill file/dir(s).")
+    return deleted
+
+
 def _cleanup_test_data(label: str = ""):
     """
-    清理数据库中的测试用户、角色和导入任务，以及 customer_data/ 下的测试用户目录。
+    清理数据库中的测试用户、角色和导入任务，以及 customer_data/ 下的测试用户目录，
+    以及 .claude/skills/user/ 下的测试 skill 文件/子目录。
     返回 (deleted_users, deleted_roles)。
     label 仅用于日志标注（如 "pre" / "post"）。
     """
     # 清理 customer_data/ 测试目录（不依赖 DB，先做）
     _cleanup_customer_data_dirs(label)
+    # 清理 .claude/skills/user/ 测试 skill 文件和子目录
+    _cleanup_skill_files(label)
 
     try:
         from backend.config.database import SessionLocal
