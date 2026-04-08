@@ -51,7 +51,7 @@ def _cleanup_skill_files(dry_run: bool = False) -> int:
     import re
     import shutil as _shutil
     _TEST_PATTERN = re.compile(r'^_[a-z][a-z0-9]*_')
-    _SLUGIFIED_TEST_PREFIXES = ("t-compat-", "t-rbac-", "t-skill-", "t-test-")
+    _SLUGIFIED_TEST_PREFIXES = ("t-compat-", "t-rbac-", "t-skill-", "t-test-", "compat-skill-")
 
     def _is_test_skill(name: str) -> bool:
         return bool(_TEST_PATTERN.match(name)) or any(name.startswith(p) for p in _SLUGIFIED_TEST_PREFIXES)
@@ -71,14 +71,26 @@ def _cleanup_skill_files(dry_run: bool = False) -> int:
                     deleted += 1
                 except OSError as exc:
                     logger.warning("  Failed to delete %s: %s", entry, exc)
-        elif entry.is_dir() and _is_test_skill(entry.name):
-            logger.info("%sWould delete skill dir: %s/", mode, entry.name)
-            if not dry_run:
-                try:
-                    _shutil.rmtree(entry)
-                    deleted += 1
-                except OSError as exc:
-                    logger.warning("  Failed to delete %s: %s", entry, exc)
+        elif entry.is_dir():
+            if _is_test_skill(entry.name):
+                logger.info("%sWould delete skill dir: %s/", mode, entry.name)
+                if not dry_run:
+                    try:
+                        _shutil.rmtree(entry)
+                        deleted += 1
+                    except OSError as exc:
+                        logger.warning("  Failed to delete %s: %s", entry, exc)
+            else:
+                # 扫描子目录内的测试遗留文件（如 superadmin/ 里残留的 compat-skill-*.md）
+                for subfile in entry.glob("*.md"):
+                    if _is_test_skill(subfile.stem):
+                        logger.info("%sWould delete skill file: %s/%s", mode, entry.name, subfile.name)
+                        if not dry_run:
+                            try:
+                                subfile.unlink()
+                                deleted += 1
+                            except OSError as exc:
+                                logger.warning("  Failed to delete %s: %s", subfile, exc)
 
     if deleted:
         logger.info("Deleted %d test skill file/dir(s) from .claude/skills/user/.", deleted)

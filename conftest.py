@@ -79,8 +79,8 @@ def _cleanup_skill_files(label: str = "") -> int:
     if not user_skills_dir.is_dir():
         return 0
 
-    # slugified 测试文件名前缀（_t_compat_ → t-compat-，_t_rbac_ → t-rbac- 等）
-    _SLUGIFIED_TEST_PREFIXES = ("t-compat-", "t-rbac-", "t-skill-", "t-test-")
+    # slugified 测试文件名前缀（_t_compat_ → t-compat-，原始 compat-skill- 也在此）
+    _SLUGIFIED_TEST_PREFIXES = ("t-compat-", "t-rbac-", "t-skill-", "t-test-", "compat-skill-")
 
     def _is_test_skill(name: str) -> bool:
         return _is_test_entity(name) or any(name.startswith(p) for p in _SLUGIFIED_TEST_PREFIXES)
@@ -94,12 +94,23 @@ def _cleanup_skill_files(label: str = "") -> int:
                     deleted += 1
                 except Exception as exc:
                     print(f"\n[conftest] Failed to remove skill file {entry}: {exc}")
-            elif entry.is_dir() and _is_test_skill(entry.name):
-                try:
-                    shutil.rmtree(entry)
-                    deleted += 1
-                except Exception as exc:
-                    print(f"\n[conftest] Failed to remove skill dir {entry}: {exc}")
+            elif entry.is_dir():
+                # 子目录：目录名匹配测试前缀 → 删整个子目录
+                # 子目录内文件：逐一检查（处理 superadmin/ 等真实用户目录里的测试遗留文件）
+                if _is_test_skill(entry.name):
+                    try:
+                        shutil.rmtree(entry)
+                        deleted += 1
+                    except Exception as exc:
+                        print(f"\n[conftest] Failed to remove skill dir {entry}: {exc}")
+                else:
+                    for subfile in entry.glob("*.md"):
+                        if _is_test_skill(subfile.stem):
+                            try:
+                                subfile.unlink()
+                                deleted += 1
+                            except Exception as exc:
+                                print(f"\n[conftest] Failed to remove skill file {subfile}: {exc}")
     except Exception as exc:
         print(f"\n[conftest] Skill cleanup scan failed (non-fatal): {exc}")
 
