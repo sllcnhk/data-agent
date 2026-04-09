@@ -130,11 +130,11 @@ class TestMdSkillsTierFields(unittest.TestCase):
                 names[name]["tier"], "system",
                 f"'{name}' should be tier=system"
             )
-        # clickhouse-analyst should be user tier if present
+        # clickhouse-analyst was migrated from user/ to project/ tier
         if "clickhouse-analyst" in names:
             self.assertEqual(
-                names["clickhouse-analyst"]["tier"], "user",
-                "clickhouse-analyst is in .claude/skills/user/ so tier should be user"
+                names["clickhouse-analyst"]["tier"], "project",
+                "clickhouse-analyst is in .claude/skills/project/ so tier should be project"
             )
 
 

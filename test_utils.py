@@ -34,6 +34,11 @@ def make_test_email(label: str = "user") -> str:
     return f"_t_{label}_{uuid.uuid4().hex[:6]}@test.local"
 
 
+def make_test_skill_name(label: str = "skill") -> str:
+    """生成唯一测试技能名，格式：_t_{label}_{6位hex}_（slug 化后：t-{label}-{hex}-）"""
+    return f"_t_{label}_{uuid.uuid4().hex[:6]}_"
+
+
 def is_test_entity(name: str) -> bool:
     """判断名称是否为测试数据（匹配 _xxx_ 前缀格式，与 conftest.py 逻辑一致）。"""
     import re
