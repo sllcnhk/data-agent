@@ -1,7 +1,7 @@
 ---
 name: db-maintainer
-version: "1.0"
-description: 数据库知识库维护工作流——自动同步表结构到本地db_knowledge文件
+version: "2.0"
+description: 数据库知识库维护工作流——自动同步表结构到本地db_knowledge文件，支持共享库与用户私有库两种模式
 triggers:
   - 更新知识库
   - 刷新表结构
@@ -12,6 +12,8 @@ triggers:
   - 同步知识库
   - refresh db_knowledge
   - update db_knowledge
+  - 更新共享知识库
+  - update shared knowledge
 category: analytics
 priority: high
 always_inject: false
@@ -20,7 +22,18 @@ layer: maintenance
 
 # 数据库知识库维护工作流
 
-> 用于将 ClickHouse 数据库的最新表结构同步到本地 `db_knowledge/` 文件，保持知识库的准确性。
+> 用于将 ClickHouse 数据库的最新表结构同步到 `db_knowledge/` 文件，保持知识库的准确性。
+
+## 知识库模式说明
+
+系统支持两种维护目标（文件系统根目录已指向 `customer_data/`）：
+
+| 模式 | 写入路径 | 谁来维护 | 触发关键词 |
+|------|---------|---------|-----------|
+| **共享库模式** | `{SHARED_DATA_ROOT}/db_knowledge/` | 管理员 / Claude Code CLI | "更新共享知识库"、"update shared" |
+| **用户库模式** | `{CURRENT_USER}/db_knowledge/` | 当前用户（默认） | "更新知识库"、"更新我的知识库" |
+
+> `{SHARED_DATA_ROOT}` = `_shared`，即 `_shared/db_knowledge/`
 
 ## 触发方式
 
@@ -28,6 +41,7 @@ layer: maintenance
 - "更新知识库" / "刷新表结构" / "同步表文档"
 - "更新 SG 的 db_knowledge" / "同步 IDN 表结构"
 - "把 XXX 表的结构写入知识库"
+- "更新共享知识库" / "update shared knowledge"（管理员专用，写入共享库）
 
 ---
 
@@ -40,7 +54,11 @@ layer: maintenance
 1. **目标环境**：SG / IDN / BR / MY / THAI / MX（或全部）
 2. **目标数据库**：`crm` / `data_statistics` / `integrated_data`（或全部）
 3. **更新范围**：全量更新 or 指定表名列表
-4. **知识库路径**：默认 `{CURRENT_USER}/db_knowledge/`
+4. **写入目标**：
+   - 用户说"共享"/"shared"/"所有人"/"project" → **共享库模式**：`_shared/db_knowledge/`
+   - 其他情况 → **用户库模式**：`{CURRENT_USER}/db_knowledge/`（默认）
+
+> ⚠️ 将结果记为 `<WRITE_ROOT>`，后续所有路径使用此变量。
 
 ### Step 1：获取当前表清单
 
@@ -55,7 +73,7 @@ ORDER BY database, name;
 
 同时读取本地索引（若存在）：
 ```
-read_file: {CURRENT_USER}/db_knowledge/_index.md
+read_file: <WRITE_ROOT>/db_knowledge/_index.md
 ```
 
 对比识别：
@@ -87,7 +105,7 @@ SELECT * FROM <database>.<table_name> LIMIT 3;
 
 **2d. 写入文档文件**
 
-生成 `{CURRENT_USER}/db_knowledge/tables/<table_name>.md`，格式如下：
+生成 `<WRITE_ROOT>/db_knowledge/tables/<table_name>.md`，格式如下：
 
 ```markdown
 # 表名：<database.table_name>
@@ -122,7 +140,7 @@ SELECT * FROM <database>.<table_name> LIMIT 3;
 
 ### Step 3：更新 `_index.md`
 
-更新全局索引文件中的表清单：
+更新 `<WRITE_ROOT>/db_knowledge/_index.md` 中的表清单：
 - 新增表 → 加入对应章节，链接到新建的 `tables/<表名>.md`
 - 删除表 → 标记为 `~~已废弃~~`
 - 版本号递增（如 v3.0 → v4.0）
@@ -131,13 +149,14 @@ SELECT * FROM <database>.<table_name> LIMIT 3;
 
 ```
 ✅ 知识库更新完成
+  写入目标: <WRITE_ROOT>/db_knowledge/（共享库 or 用户私有库）
   环境: <环境名>
   新增文档: N 张（列出表名）
   更新文档: M 张（列出表名）
   未变更: K 张
   废弃标记: P 张
 
-下次分析将使用最新本地知识库，无需重新探索数据库结构。
+下次分析将使用最新知识库，无需重新探索数据库结构。
 ```
 
 ---
@@ -147,7 +166,8 @@ SELECT * FROM <database>.<table_name> LIMIT 3;
 若用户只想更新特定表，可跳过 Step 1，直接：
 
 ```
-用户: 更新 crm.realtime_dwd_crm_call_record 的文档
+用户: 更新共享知识库中 crm.realtime_dwd_crm_call_record 的文档
+→ WRITE_ROOT = _shared
 → 执行 Step 2（仅该表）→ 更新 _index.md 中对应行 → 输出摘要
 ```
 
@@ -155,7 +175,8 @@ SELECT * FROM <database>.<table_name> LIMIT 3;
 
 ## 注意事项
 
-1. **写入权限**：只能写入 `{CURRENT_USER}/` 目录
+1. **写入权限**：用户库模式只能写入 `{CURRENT_USER}/`；共享库模式写入 `_shared/`（需管理员授权或 Claude Code CLI 操作）
 2. **超大表**：对于 TiB 级别的表，跳过 `SELECT *` 样例，改用 `LIMIT 1` 验证表可访问
 3. **视图**：`system.tables` 中 engine LIKE '%View%' 的跳过（不记录视图结构）
 4. **不覆盖已有内容**：若表文档已有人工补充的业务含义/枚举值等，更新时保留这些内容（追加新字段，不清空旧内容）
+5. **共享库更新后**：所有用户下次查询将自动使用最新共享知识库，无需各自更新

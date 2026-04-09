@@ -811,7 +811,9 @@ class AgenticLoop:
                     "- 直接调用 filesystem__write_file，无需先调用 list_allowed_directories"
                     " 或 list_directory 探索目录结构。\n"
                     "- 写完文件后，告知用户文件已创建、路径及字节数。\n"
-                    f"- CURRENT_USER: {current_username}"
+                    f"- CURRENT_USER: {current_username}\n"
+                    f"- SHARED_DATA_ROOT: _shared  "
+                    f"（共享项目知识库前缀，对应 customer_data/_shared/，所有用户可读）"
                 )
         else:
             tools_info = ""

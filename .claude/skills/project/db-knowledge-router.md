@@ -1,6 +1,6 @@
 ---
 name: db-knowledge-router
-version: "1.0"
+version: "2.0"
 description: ClickHouse分析启动协议——按需加载本地表知识，禁止重复探索数据库
 triggers:
   - 分析
@@ -26,20 +26,34 @@ layer: knowledge
 
 > 本规程在任何 ClickHouse 数据分析任务中强制执行，优先级高于 Agent 默认行为。
 
+## 知识库路径说明
+
+系统存在两级知识库（文件系统根目录已指向 `customer_data/`，路径均为相对路径）：
+
+| 级别 | 路径 | 维护方 | 说明 |
+|------|------|--------|------|
+| 共享项目库 | `{SHARED_DATA_ROOT}/db_knowledge/` | 管理员 / Claude Code | 全体用户可用，内容最权威 |
+| 用户私有库 | `{CURRENT_USER}/db_knowledge/` | 当前用户 | 个人探索记录、覆盖/补充共享库 |
+
+> `{SHARED_DATA_ROOT}` = `_shared`，完整路径 `_shared/db_knowledge/`。
+
+**优先级规则**：若用户私有库存在某表文档，优先使用私有库（可包含用户的特殊注解）；否则使用共享项目库。
+
 ## 分析前置检查（MANDATORY）
 
 在构建任何 SQL 之前，**必须**按以下步骤执行：
 
-### Step 1：检查本地知识库是否存在
+### Step 1：检查知识库（按优先级）
 
 ```
-read_file: {CURRENT_USER}/db_knowledge/_index.md
+① 优先检查用户私有库：read_file: {CURRENT_USER}/db_knowledge/_index.md
+② 若不存在，检查共享项目库：read_file: {SHARED_DATA_ROOT}/db_knowledge/_index.md
 ```
 
-- **若文件存在** → 进入 Step 2（使用本地知识库模式）
-- **若文件不存在** → 进入 Step 2b（数据库探索模式，需声明）
+- **若任一 `_index.md` 存在** → 进入 Step 2（使用知识库模式）
+- **若两者均不存在** → 进入 Step 2b（数据库探索模式，需声明）
 
-### Step 2：本地知识库模式（优先）
+### Step 2：知识库模式（优先）
 
 根据用户问题，从 `_index.md` 中识别相关表，**只加载涉及的文件**：
 
@@ -54,7 +68,7 @@ read_file: {CURRENT_USER}/db_knowledge/_index.md
 
 ### Step 2b：数据库探索模式（兜底，需声明）
 
-仅当 `db_knowledge` 不存在或明确找不到目标表时执行：
+仅当两级 `db_knowledge` 均不存在或明确找不到目标表时执行：
 
 ```
 声明：[探索模式] db_knowledge 中未找到 <表名>，执行数据库探索
@@ -62,7 +76,7 @@ read_file: {CURRENT_USER}/db_knowledge/_index.md
 
 然后才允许使用：`list_tables` / `describe_table` / `get_table_overview`
 
-> 探索完成后，可将获取的表结构写入 `{CURRENT_USER}/db_knowledge/tables/<表名>.md` 以供下次使用。
+> 探索完成后，可将获取的表结构写入 `{CURRENT_USER}/db_knowledge/tables/<表名>.md` 以供下次使用（写入用户私有库，不修改共享库）。
 > ⚠️ 路径说明：文件系统根目录已指向 `customer_data/`，直接用 `{CURRENT_USER}/子路径` 即可，**禁止重复写 `customer_data/`**（否则产生双层目录）。
 
 ### Step 3：确认目标环境

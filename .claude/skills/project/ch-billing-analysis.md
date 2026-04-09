@@ -1,6 +1,6 @@
 ---
 name: ch-billing-analysis
-version: "1.0"
+version: "2.0"
 description: 账单分析场景——月账单、日账单、费用异常、对账分析
 triggers:
   - 账单
@@ -35,9 +35,11 @@ layer: scenario
 
 | 指标 | 知识库文件 |
 |------|----------|
-| 月账单 | `{CURRENT_USER}/db_knowledge/metrics/monthly_bill.md` |
-| GMV | `{CURRENT_USER}/db_knowledge/metrics/gmv.md` |
-| 每通费用 | `{CURRENT_USER}/db_knowledge/metrics/cost_per_call.md` |
+| 月账单 | `{SHARED_DATA_ROOT}/db_knowledge/metrics/monthly_bill.md` |
+| GMV | `{SHARED_DATA_ROOT}/db_knowledge/metrics/gmv.md` |
+| 每通费用 | `{SHARED_DATA_ROOT}/db_knowledge/metrics/cost_per_call.md` |
+
+> ⚠️ 路径说明：`{SHARED_DATA_ROOT}` = `_shared`，完整路径为 `_shared/db_knowledge/metrics/...`。若当前用户在 `{CURRENT_USER}/db_knowledge/` 下有同名文件，可优先使用用户自定义版本。
 
 ## 核心表
 

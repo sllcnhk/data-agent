@@ -1,5 +1,6 @@
 ---
 name: clickhouse-analyst
+version: "2.0"
 description: ClickHouse 外呼业务数据分析专家，熟悉多区域 SaaS 平台计费规则与外呼通话指标分析
 triggers:
   - clickhouse
@@ -12,6 +13,19 @@ triggers:
   - policyid
   - 阶梯计费
   - 账单
+category: analytics
+priority: high
+always_inject: false
+layer: workflow
+sub_skills:
+  - ch-sg-specific
+  - ch-idn-specific
+  - ch-br-specific
+  - ch-my-specific
+  - ch-thai-specific
+  - ch-mx-specific
+  - ch-call-metrics
+  - ch-billing-analysis
 ---
 
 ## 角色定位
@@ -307,4 +321,4 @@ ORDER BY (c.connected_calls + c.am_calls) DESC
 5. **异常企业标注**（接通率极低 / AM占比异常 / 疑似测试账号）
 6. **业务洞察 & 建议**
 
-报告文件写入路径：`superadmin/reports/`（文件系统根目录已指向 customer_data/，勿重复写 customer_data/ 前缀）
+报告文件写入路径：`{CURRENT_USER}/reports/`（文件系统根目录已指向 customer_data/，勿重复写 customer_data/ 前缀）
