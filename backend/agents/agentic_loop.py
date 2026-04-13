@@ -488,14 +488,24 @@ class AgenticLoop:
                                     if isinstance(content_val, str)
                                     else len(content_val or b"")
                                 )
-                                written_files.append({
+                                mime = self._infer_mime_type(file_name)
+                                # 识别 HTML 报告（路径含 /reports/ 且为 text/html）
+                                is_report = (
+                                    mime == "text/html"
+                                    and "/reports/" in file_path.replace("\\", "/")
+                                )
+                                file_entry: Dict[str, Any] = {
                                     "path": file_path,
                                     "name": file_name,
                                     "size": file_size,
-                                    "mime_type": self._infer_mime_type(file_name),
-                                })
+                                    "mime_type": mime,
+                                }
+                                if is_report:
+                                    file_entry["is_report"] = True
+                                written_files.append(file_entry)
                                 logger.debug(
-                                    f"[AgenticLoop] 记录写入文件: path={file_path}, name={file_name}, size={file_size}"
+                                    f"[AgenticLoop] 记录写入文件: path={file_path}, name={file_name}, "
+                                    f"size={file_size}, is_report={is_report}"
                                 )
 
                         tool_results.append(

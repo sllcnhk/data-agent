@@ -181,7 +181,7 @@ app.add_middleware(
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # 导入路由
-from api import agents, skills, conversations, llm_configs, mcp, groups, approvals, auth, users, files, data_import, data_export
+from api import agents, skills, conversations, llm_configs, mcp, groups, approvals, auth, users, files, data_import, data_export, reports
 from api.users import roles_router, permissions_router
 
 
@@ -213,6 +213,7 @@ app.include_router(permissions_router, prefix="/api/v1")
 app.include_router(files.router, prefix="/api/v1")
 app.include_router(data_import.router, prefix="/api/v1")
 app.include_router(data_export.router, prefix="/api/v1")
+app.include_router(reports.router, prefix="/api/v1")
 
 
 # 全局异常处理器

@@ -1,6 +1,6 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Avatar, Button, Empty, Spin, Tag, Tooltip, message as antMessage } from 'antd';
-import { UserOutlined, RobotOutlined, ReloadOutlined, FileOutlined, FilePdfOutlined, FileImageOutlined, DownloadOutlined, FileTextOutlined, FileExcelOutlined, FileZipOutlined } from '@ant-design/icons';
+import { UserOutlined, RobotOutlined, ReloadOutlined, FileOutlined, FilePdfOutlined, FileImageOutlined, DownloadOutlined, FileTextOutlined, FileExcelOutlined, FileZipOutlined, BarChartOutlined, EyeOutlined } from '@ant-design/icons';
 import ReactMarkdown from 'react-markdown';
 import type { Message, AgentEvent, AgentInfo, LLMConfig, FileInfo } from '../../store/useChatStore';
 import { useChatStore } from '../../store/useChatStore';
@@ -8,6 +8,7 @@ import ThoughtProcess from './ThoughtProcess';
 import { AgentBadge } from './AgentBadge';
 import ContinuationCard from './ContinuationCard';
 import { fileApi } from '../../services/chatApi';
+import ReportPreviewModal from './ReportPreviewModal';
 
 interface ChatMessagesProps {
   messages: Message[];
@@ -40,7 +41,8 @@ const _getFileIcon = (mimeType: string, name: string) => {
 };
 
 const FileDownloadCards: React.FC<{ files: FileInfo[] }> = ({ files }) => {
-  const [downloading, setDownloading] = React.useState<string | null>(null);
+  const [downloading, setDownloading] = useState<string | null>(null);
+  const [previewFile, setPreviewFile] = useState<FileInfo | null>(null);
 
   const handleDownload = async (file: FileInfo) => {
     setDownloading(file.path);
@@ -54,57 +56,85 @@ const FileDownloadCards: React.FC<{ files: FileInfo[] }> = ({ files }) => {
   };
 
   return (
-    <div
-      style={{
-        marginTop: 12,
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 8,
-      }}
-    >
+    <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
       <div style={{ fontSize: 12, color: '#8c8c8c', marginBottom: 2 }}>
         📎 生成的文件（点击下载）
       </div>
-      {files.map((file) => (
-        <div
-          key={file.path}
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 10,
-            padding: '8px 12px',
-            background: '#f6f8fa',
-            borderRadius: 8,
-            border: '1px solid #e8e8e8',
-          }}
-        >
-          <span style={{ fontSize: 18 }}>{_getFileIcon(file.mime_type, file.name)}</span>
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <div
-              style={{
-                fontSize: 13,
-                fontWeight: 500,
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap',
-              }}
-            >
-              {file.name}
-            </div>
-            <div style={{ fontSize: 11, color: '#999' }}>
-              {_formatFileSize(file.size)}
-            </div>
-          </div>
-          <Button
-            size="small"
-            icon={<DownloadOutlined />}
-            loading={downloading === file.path}
-            onClick={() => handleDownload(file)}
+      {files.map((file) => {
+        const isReport = (file as any).is_report === true;
+        const reportId = (file as any).report_id;
+        return (
+          <div
+            key={file.path}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 10,
+              padding: '8px 12px',
+              background: isReport ? '#f0f7ff' : '#f6f8fa',
+              borderRadius: 8,
+              border: isReport ? '1px solid #91caff' : '1px solid #e8e8e8',
+            }}
           >
-            下载
-          </Button>
-        </div>
-      ))}
+            <span style={{ fontSize: 18 }}>
+              {isReport
+                ? <BarChartOutlined style={{ color: '#1677ff' }} />
+                : _getFileIcon(file.mime_type, file.name)}
+            </span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <div
+                  style={{
+                    fontSize: 13,
+                    fontWeight: 500,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {file.name}
+                </div>
+                {isReport && (
+                  <Tag color="blue" style={{ fontSize: 11, margin: 0 }}>交互报告</Tag>
+                )}
+              </div>
+              <div style={{ fontSize: 11, color: '#999' }}>
+                {_formatFileSize(file.size)}
+                {isReport && ' · 含图表 · 可刷新数据'}
+              </div>
+            </div>
+            {isReport && (
+              <Button
+                size="small"
+                type="primary"
+                icon={<EyeOutlined />}
+                onClick={() => setPreviewFile(file)}
+              >
+                预览
+              </Button>
+            )}
+            <Button
+              size="small"
+              icon={<DownloadOutlined />}
+              loading={downloading === file.path}
+              onClick={() => handleDownload(file)}
+            >
+              下载
+            </Button>
+          </div>
+        );
+      })}
+
+      {/* 报告预览弹窗 */}
+      {previewFile && (
+        <ReportPreviewModal
+          open={!!previewFile}
+          onClose={() => setPreviewFile(null)}
+          reportId={(previewFile as any).report_id}
+          filePath={previewFile.path}
+          fileName={previewFile.name}
+        />
+      )}
     </div>
   );
 };

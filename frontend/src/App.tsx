@@ -14,6 +14,7 @@ import Users from './pages/Users';
 import Roles from './pages/Roles';
 import DataImport from './pages/DataImport';
 import DataExport from './pages/DataExport';
+import Reports from './pages/Reports';
 import { useAuthStore } from '@/store/useAuthStore';
 
 const { Content } = Layout;
@@ -90,6 +91,7 @@ function App() {
                   <Route path="/roles" element={<Roles />} />
                   <Route path="/data-import" element={<DataImport />} />
                   <Route path="/data-export" element={<DataExport />} />
+                  <Route path="/reports" element={<Reports />} />
                 </Routes>
               </Content>
             </AppLayout>

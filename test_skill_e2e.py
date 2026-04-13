@@ -1518,6 +1518,95 @@ class TestUserSkillDirIsolation(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Section O — chart-reporter Skill 语义触发回归
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestO_ChartReporterSkillRegression(unittest.TestCase):
+    """O1-O4: chart-reporter.md skill 语义触发验证。"""
+
+    @classmethod
+    def setUpClass(cls):
+        skill_path = Path(".claude/skills/project/chart-reporter.md")
+        cls.skill_exists = skill_path.exists()
+        if cls.skill_exists:
+            cls.skill_content = skill_path.read_text(encoding="utf-8")
+
+    def test_O1_skill_file_exists(self):
+        self.assertTrue(self.skill_exists, ".claude/skills/project/chart-reporter.md 应存在")
+
+    def test_O2_skill_has_required_frontmatter(self):
+        if not self.skill_exists: self.skipTest("skill 不存在")
+        self.assertIn("name: chart-reporter", self.skill_content)
+        self.assertIn("triggers:", self.skill_content)
+        self.assertIn("layer:", self.skill_content)
+
+    def test_O3_skill_has_key_triggers(self):
+        if not self.skill_exists: self.skipTest("skill 不存在")
+        for kw in ["图表", "报告", "echarts", "折线图"]:
+            self.assertIn(kw, self.skill_content, f"triggers 应包含: {kw}")
+
+    def test_O4_skill_mentions_build_api(self):
+        if not self.skill_exists: self.skipTest("skill 不存在")
+        self.assertIn("/api/v1/reports/build", self.skill_content)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section P — AgenticLoop is_report 字段回归
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestP_AgenticLoopIsReportRegression(unittest.TestCase):
+    """P1-P3: agentic_loop.py 对 HTML 报告文件附加 is_report 字段。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.src = open("backend/agents/agentic_loop.py", encoding="utf-8").read()
+
+    def test_P1_is_report_field_present(self):
+        self.assertIn("is_report", self.src, "agentic_loop.py 应包含 is_report 字段")
+
+    def test_P2_reports_path_detection(self):
+        self.assertIn("/reports/", self.src, "应检测 /reports/ 路径")
+
+    def test_P3_text_html_mime_check(self):
+        self.assertIn("text/html", self.src, "应检查 text/html MIME 类型")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section Q — 非侵入回归（现有功能不受影响）
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestQ_NonIntrusiveRegression(unittest.TestCase):
+    """Q1-Q5: 报告功能不破坏现有技能和文件下载流程。"""
+
+    def test_Q1_skills_api_still_works(self):
+        r = _client.get("/api/v1/skills/md-skills")
+        self.assertEqual(r.status_code, 200, "GET /md-skills 应仍正常")
+
+    def test_Q2_report_builder_importable(self):
+        from backend.services.report_builder_service import (
+            build_report_html, generate_refresh_token
+        )
+        self.assertTrue(callable(build_report_html))
+        self.assertTrue(callable(generate_refresh_token))
+
+    def test_Q3_pdf_export_service_importable(self):
+        from backend.services.pdf_export_service import html_to_pdf
+        self.assertTrue(callable(html_to_pdf))
+
+    def test_Q4_pptx_export_service_importable(self):
+        from backend.services.pptx_export_service import html_to_pptx
+        self.assertTrue(callable(html_to_pptx))
+
+    def test_Q5_report_model_has_new_fields(self):
+        from backend.models.report import Report
+        self.assertTrue(hasattr(Report, "username"))
+        self.assertTrue(hasattr(Report, "refresh_token"))
+        self.assertTrue(hasattr(Report, "report_file_path"))
+        self.assertTrue(hasattr(Report, "llm_summary"))
+        self.assertTrue(hasattr(Report, "summary_status"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Runner
 # ─────────────────────────────────────────────────────────────────────────────
 

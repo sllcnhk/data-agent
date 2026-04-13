@@ -140,6 +140,19 @@ class Report(Base):
     auto_refresh = Column(Boolean, default=False, comment="是否自动刷新")
     refresh_interval = Column(Integer, nullable=True, comment="刷新间隔(秒)")
 
+    # ── 图表报告生成字段（2026-04-13 新增）──────────────────────────────────
+    # 所有者用户名（与 customer_data/{username}/ 路径对应）
+    username = Column(String(100), nullable=True, index=True, comment="所有者用户名")
+    # 数据刷新令牌（公开可用，无需登录即可刷新图表数据）
+    refresh_token = Column(String(64), nullable=True, unique=True, index=True, comment="数据刷新令牌")
+    # 生成的 HTML 报告文件相对路径（相对于 customer_data 根目录）
+    report_file_path = Column(Text, nullable=True, comment="HTML报告文件路径")
+    # LLM 生成的分析总结文字
+    llm_summary = Column(Text, nullable=True, comment="LLM生成的分析总结")
+    # 总结生成状态：pending / generating / done / failed
+    summary_status = Column(String(20), nullable=True, default="pending", comment="总结生成状态")
+    # ─────────────────────────────────────────────────────────────────────────
+
     # 统计
     view_count = Column(Integer, default=0, comment="浏览次数")
     last_viewed_at = Column(DateTime, nullable=True, comment="最后浏览时间")
@@ -198,6 +211,11 @@ class Report(Base):
             "cache_ttl": self.cache_ttl,
             "tags": self.tags,
             "extra_metadata": self.extra_metadata,
+            "username": self.username,
+            "refresh_token": self.refresh_token,
+            "report_file_path": self.report_file_path,
+            "llm_summary": self.llm_summary,
+            "summary_status": self.summary_status,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
