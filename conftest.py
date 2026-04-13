@@ -122,8 +122,8 @@ def _cleanup_skill_files(label: str = "") -> int:
 
 def _cleanup_test_data(label: str = ""):
     """
-    清理数据库中的测试用户、角色和导入任务，以及 customer_data/ 下的测试用户目录，
-    以及 .claude/skills/user/ 下的测试 skill 文件/子目录。
+    清理数据库中的测试用户、角色、报表、报告、推送任务，
+    以及 customer_data/ 下的测试用户目录和 .claude/skills/user/ 下的测试 skill 文件/子目录。
     返回 (deleted_users, deleted_roles)。
     label 仅用于日志标注（如 "pre" / "post"）。
     """
@@ -143,6 +143,44 @@ def _cleanup_test_data(label: str = ""):
 
     db = SessionLocal()
     try:
+        # 清理测试报表 / 报告（username 匹配测试前缀）
+        try:
+            from backend.models.report import Report
+            n = db.query(Report).filter(
+                Report.username.op('~')(r'^_[a-z][a-z0-9]*_')
+            ).delete(synchronize_session=False)
+            if n:
+                tag = f"[{label}] " if label else ""
+                print(f"\n[conftest] {tag}Cleanup: deleted {n} report(s).")
+        except Exception as exc:
+            print(f"\n[conftest] Report cleanup skipped (non-fatal): {exc}")
+
+        # 清理测试推送任务 / 执行日志（owner_username 或 name 匹配测试前缀）
+        try:
+            from backend.models.schedule_run_log import ScheduleRunLog
+            from backend.models.scheduled_report import ScheduledReport
+            # 先删执行日志（外键约束）
+            test_srs = (
+                db.query(ScheduledReport)
+                .filter(
+                    ScheduledReport.owner_username.op('~')(r'^_[a-z][a-z0-9]*_')
+                    | ScheduledReport.name.op('~')(r'^_[a-z][a-z0-9]*_')
+                )
+                .all()
+            )
+            for sr in test_srs:
+                db.query(ScheduleRunLog).filter(
+                    ScheduleRunLog.scheduled_report_id == sr.id
+                ).delete(synchronize_session=False)
+            n_sr = len(test_srs)
+            for sr in test_srs:
+                db.delete(sr)
+            if n_sr:
+                tag = f"[{label}] " if label else ""
+                print(f"\n[conftest] {tag}Cleanup: deleted {n_sr} scheduled report(s).")
+        except Exception as exc:
+            print(f"\n[conftest] ScheduledReport cleanup skipped (non-fatal): {exc}")
+
         # 清理测试导入/导出任务（username 匹配测试前缀）
         try:
             from backend.models.import_job import ImportJob

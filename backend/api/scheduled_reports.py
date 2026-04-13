@@ -124,7 +124,7 @@ def _check_sr_ownership(sr: ScheduledReport, username: str, is_superadmin: bool)
 # 1. 创建定时任务
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.post("/")
+@router.post("")
 async def create_schedule(
     req: CreateScheduleRequest,
     db: Session = Depends(get_db),
@@ -167,7 +167,7 @@ async def create_schedule(
 # 2. 任务列表（分页）
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/")
+@router.get("")
 async def list_schedules(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
