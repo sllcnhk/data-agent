@@ -1,6 +1,6 @@
 # 数据库迁移指南
 
-> **最后更新**：2026-04-13（**多图表 HTML 报告生成**：`migrate_reports_enhancement.py` 新增 `reports` 表 5 列（`refresh_token`/`export_job_id`/`export_format`/`llm_summary`/`is_summarized`）；`migrate_reports_permissions.py` 种子 3 条权限（`reports:read/create/delete`）并分配至 analyst/admin/superadmin；2026-04-08：**Skill 用户使用权限隔离 T1–T6**：**无 DB 迁移**；2026-04-07：**SQL→Excel 数据导出**：`migrate_data_export.py` 新建 `export_jobs` 表 + 种子 `data:export` 权限；2026-04-05：**Excel 数据导入**：`migrate_data_import.py` 新建 `import_jobs` 表 + 种子 `data:import` 权限；其余历次变更见下方记录表）
+> **最后更新**：2026-04-13（**数据管理中心 v1**：`migrate_datacenter_v1.py` 新增 3 张表（`scheduled_reports`/`schedule_run_logs`/`notification_logs`）+ `reports` 表新增 3 列（`doc_type`/`scheduled_report_id`/`version_seq`）；**多图表 HTML 报告生成**：`migrate_reports_enhancement.py` 新增 `reports` 表 5 列；`migrate_reports_permissions.py` 种子 3 条权限（`reports:read/create/delete`）；2026-04-08：**Skill 用户使用权限隔离 T1–T6**：**无 DB 迁移**；2026-04-07：**SQL→Excel 数据导出**：`migrate_data_export.py`；2026-04-05：**Excel 数据导入**：`migrate_data_import.py`；其余历次变更见下方记录表）
 
 本文档说明数据库迁移的两种方式：
 1. **项目自有手动迁移脚本**（`backend/migrations/`）— 当前主要方式，支持 up/down
@@ -29,6 +29,7 @@
 | 多图表 HTML 报告增强 | 2026-04-13 | **DB 迁移脚本**：`backend/scripts/migrate_reports_enhancement.py`。`reports` 表新增 5 列：`refresh_token VARCHAR(64)`（公开刷新令牌，SHA-256 随机值）、`export_job_id VARCHAR(64)`（关联导出任务）、`export_format VARCHAR(10)`、`llm_summary TEXT`（LLM 生成摘要）、`is_summarized BOOLEAN DEFAULT FALSE`（摘要生成状态）。幂等（`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`）。 | ✅ 已执行 |
 | 多图表报告权限 | 2026-04-13 | **DB 迁移脚本**：`backend/scripts/migrate_reports_permissions.py`。① 插入 3 条权限记录：`reports:read`（查看报告列表）、`reports:create`（生成报告）、`reports:delete`（删除报告）；② 将 `reports:read` + `reports:create` 分配给 analyst 角色；③ 将全部 3 条分配给 admin 角色；④ 将全部 3 条分配给 superadmin 角色。幂等（`INSERT ... ON CONFLICT DO NOTHING`）。 | ✅ 已执行 |
 | Skill 用户使用权限隔离 T1–T6 | 2026-04-08 | **无 DB 迁移**。变更均为代码层：`SkillMD.owner` 字段（filepath 解析）、`_get_visible_user_skills(username)` 方法、`build_skill_prompt_async(user_id=)` 参数、`_expand_sub_skills(user_id=)` 跨用户防护、Preview API `effective_user_id` 绑定及 `get_match_details(username=)` bug 修复。文件系统结构不变（仍为 `user/{username}/`）；如有遗留的 `user/*.md`（无 username 子目录），`init_rbac.py` 中的 `_migrate_user_skills_to_superadmin()` 可一次性迁移至 `user/superadmin/`（该函数在执行 `init_rbac.py` 时自动调用）。 | ✅ 无需执行 |
+| 数据管理中心 v1 | 2026-04-13 | **DB 迁移脚本**：`backend/scripts/migrate_datacenter_v1.py`。① `reports` 表新增 3 列：`doc_type VARCHAR(20) DEFAULT 'dashboard'`（报告类型：dashboard/document）、`scheduled_report_id UUID`（关联定时任务）、`version_seq INTEGER DEFAULT 1`（版本序号）；② 新建 `scheduled_reports` 表（UUID PK、owner_username、name、doc_type、cron_expr、timezone、report_spec JSONB、notify_channels JSONB、is_active 等）；③ 新建 `schedule_run_logs` 表（UUID PK、scheduled_report_id FK、status、error_msg、duration_sec、notify_summary JSONB 等）；④ 新建 `notification_logs` 表。幂等（`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` + `checkfirst=True`）。 | ✅ 已执行 |
 
 ---
 
@@ -395,6 +396,119 @@ INSERT INTO role_permissions (role_id, permission_id) ...
 - `backend/api/reports.py` — 所有端点使用 `require_permission("reports", "read"|"create"|"delete")`
 - `backend/scripts/init_rbac.py` — `PERMISSIONS` 列表已包含 3 条记录；角色初始化时同步分配（新环境首次 init 无需额外执行此脚本）
 - `frontend/src/components/AppLayout.tsx` — `ALL_MENU_ITEMS` 新增 `{ key: '/reports', perm: 'reports:read' }` 项
+
+---
+
+### migrate_datacenter_v1.py（2026-04-13）— 数据管理中心 v1
+
+**运行方式**：
+
+```bash
+# Windows + Anaconda（推荐方式）
+D:\ProgramData\Anaconda3\envs\dataagent\python.exe backend/scripts/migrate_datacenter_v1.py
+
+# Linux/Mac
+python backend/scripts/migrate_datacenter_v1.py
+```
+
+脚本幂等，多次运行无副作用。
+
+**变更内容**：
+
+**1. `reports` 表新增字段**
+
+```sql
+-- 报告类型（dashboard=交互式报表 / document=文档报告）
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS doc_type VARCHAR(20) NOT NULL DEFAULT 'dashboard';
+
+-- 关联定时任务（定时触发生成时回填）
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS scheduled_report_id UUID;
+
+-- 版本序号（同一任务多次执行时递增）
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS version_seq INTEGER DEFAULT 1;
+```
+
+**2. 新建 `scheduled_reports` 表**
+
+```sql
+CREATE TABLE IF NOT EXISTS scheduled_reports (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name             VARCHAR(200) NOT NULL,       -- 任务名称
+    description      TEXT,
+    owner_username   VARCHAR(100) NOT NULL,        -- 所有者用户名
+    doc_type         VARCHAR(20)  NOT NULL DEFAULT 'dashboard',
+    cron_expr        VARCHAR(100) NOT NULL,        -- 5-field cron 表达式
+    timezone         VARCHAR(60)  NOT NULL DEFAULT 'Asia/Shanghai',
+    report_spec      JSONB        NOT NULL,        -- 报告规格 JSON
+    include_summary  BOOLEAN      NOT NULL DEFAULT FALSE,
+    is_active        BOOLEAN      NOT NULL DEFAULT TRUE,
+    last_run_at      TIMESTAMP,
+    next_run_at      TIMESTAMP,
+    run_count        INTEGER      NOT NULL DEFAULT 0,
+    fail_count       INTEGER      NOT NULL DEFAULT 0,
+    notify_channels  JSONB,                        -- 通知渠道配置数组
+    created_at       TIMESTAMP    NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMP    NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_scheduled_reports_owner      ON scheduled_reports(owner_username);
+CREATE INDEX IF NOT EXISTS idx_scheduled_reports_active     ON scheduled_reports(is_active);
+CREATE INDEX IF NOT EXISTS idx_scheduled_reports_created_at ON scheduled_reports(created_at);
+```
+
+**3. 新建 `schedule_run_logs` 表**
+
+```sql
+CREATE TABLE IF NOT EXISTS schedule_run_logs (
+    id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    scheduled_report_id   UUID        NOT NULL,   -- FK → scheduled_reports.id
+    report_id             UUID,                   -- 本次生成的 Report ID（成功时填写）
+    status                VARCHAR(20) NOT NULL DEFAULT 'pending',  -- pending/running/success/failed
+    error_msg             TEXT,
+    duration_sec          INTEGER,
+    notify_summary        JSONB,                  -- 通知发送结果摘要
+    run_at                TIMESTAMP   NOT NULL DEFAULT NOW(),
+    finished_at           TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_logs_scheduled_report_id ON schedule_run_logs(scheduled_report_id);
+CREATE INDEX IF NOT EXISTS idx_run_logs_status              ON schedule_run_logs(status);
+CREATE INDEX IF NOT EXISTS idx_run_logs_run_at              ON schedule_run_logs(run_at);
+```
+
+**4. 新建 `notification_logs` 表**
+
+```sql
+CREATE TABLE IF NOT EXISTS notification_logs (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    schedule_run_log_id UUID,
+    channel_type        VARCHAR(20),   -- email / wecom / feishu / webhook
+    status              VARCHAR(20),   -- success / failed
+    error_msg           TEXT,
+    sent_at             TIMESTAMP NOT NULL DEFAULT NOW()
+);
+```
+
+**权限与 RBAC**：本脚本不种子权限记录。`schedules:read/write/admin` 权限在 `init_rbac.py` 中维护，执行 `init_rbac.py` 时自动写入（新环境与升级均可重复执行）。
+
+**通知渠道格式**（`notify_channels` JSONB 数组示例）：
+
+```json
+[
+  {"type": "email",   "to": ["a@b.com"], "subject_tpl": "{{name}} - {{date}}"},
+  {"type": "wecom",   "webhook_url": "https://qyapi.weixin.qq.com/..."},
+  {"type": "feishu",  "webhook_url": "https://open.feishu.cn/..."},
+  {"type": "webhook", "url": "https://hook.example.com/", "method": "POST"}
+]
+```
+
+相关代码：
+- `backend/models/scheduled_report.py` — `ScheduledReport` ORM 模型
+- `backend/models/schedule_run_log.py` — `ScheduleRunLog` ORM 模型
+- `backend/models/notification_log.py` — `NotificationLog` ORM 模型
+- `backend/api/scheduled_reports.py` — 9 个 REST 端点
+- `backend/services/scheduler_service.py` — APScheduler 封装（add_or_update_job / remove_job）
+- `backend/services/notify_service.py` — 多渠道通知发送（email/WeCom/Feishu/Webhook）
 
 ---
 

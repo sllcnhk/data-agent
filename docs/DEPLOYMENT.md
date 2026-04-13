@@ -761,6 +761,29 @@ grep "MCPManager.*Initialization complete" /opt/data-agent/logs/backend.log
 # 期望：[MCPManager] Initialization complete: 3 server(s) registered: clickhouse-idn, clickhouse-thai, ...
 ```
 
+### 可选：定时推送通知（notify_service）
+
+```ini
+# ── 邮件通知（SMTP）─────────────────────────────
+SMTP_HOST=smtp.example.com
+SMTP_PORT=465
+SMTP_USER=noreply@example.com
+SMTP_PASSWORD=<SMTP密码>
+SMTP_USE_TLS=true                   # true（SSL/TLS） | false（STARTTLS/明文）
+SMTP_FROM=noreply@example.com       # 发件人地址（默认同 SMTP_USER）
+
+# ── 企业微信机器人（WeCom）──────────────────────
+# 每个定时任务在 notify_channels 中单独配置 webhook_url，无全局配置项
+
+# ── 飞书机器人（Feishu）────────────────────────
+# 同上，每个任务单独配置
+
+# ── Webhook 通用渠道 ────────────────────────────
+# 同上，每个任务单独配置 url / method / headers
+```
+
+> 通知渠道按任务独立配置（存储在 `scheduled_reports.notify_channels` JSONB 字段），上述 SMTP 全局配置仅影响邮件发送；WeCom / Feishu / Webhook 的 URL 均在任务创建时直接填写，无全局密钥。
+
 ### 可选：Skill 语义路由
 
 ```ini
@@ -841,6 +864,9 @@ python backend/scripts/migrate_data_import.py
 # SQL→Excel 数据导出迁移（创建 export_jobs 表 + data:export 权限；幂等）
 python backend/scripts/migrate_data_export.py
 
+# 数据管理中心迁移（创建 scheduled_reports / schedule_run_logs / notification_logs 表；幂等）
+python backend/scripts/migrate_datacenter_v1.py
+
 # 验证表结构
 python -c "
 from backend.core.database import get_engine
@@ -890,6 +916,12 @@ python backend/scripts/migrate_reports_enhancement.py
 python backend/scripts/migrate_reports_permissions.py
 # 首次安装 Playwright Chromium（PDF/PPTX 导出依赖）
 playwright install chromium
+
+# v2.5+ 数据管理中心（定时推送任务）：执行 DB 迁移（幂等，已执行过会跳过）
+# 新建 scheduled_reports / schedule_run_logs / notification_logs 表
+# reports 表新增 doc_type / scheduled_report_id / version_seq 列
+python backend/scripts/migrate_datacenter_v1.py
+# APScheduler 定时任务引擎在后端启动时自动初始化（无需额外步骤）
 
 # 重启服务
 sudo systemctl restart data-agent-backend

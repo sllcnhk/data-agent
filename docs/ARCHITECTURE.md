@@ -2,7 +2,7 @@
 
 > **适用对象**：LLM 模型（Claude Code / 其他 AI）、新加入开发者
 > **目的**：快速理解系统整体架构、模块职责、数据流向和交互接口
-> **最后更新**：2026-04-08（**Skill 用户使用权限隔离 T1–T6**：`SkillMD.owner` 字段从 filepath 解析；`_get_visible_user_skills(username)` 可见性过滤；`build_skill_prompt_async(user_id=)` 用户隔离；`_expand_sub_skills` 防跨用户 sub_skill 展开；Preview API `effective_user_id` 绑定 + superadmin `view_as` override；`get_match_details(username=)` 修复泄露 bug；测试套件 29+43+15=87 个测试全通过；v2.4 2026-04-05：**Excel → ClickHouse 数据导入**：`migrate_data_import.py` DB 迁移 + 9 个 `/data-import/*` REST 端点 + `run_import_job` 后台协程（TabSeparated 格式 + 协作式取消）+ 大文件流式上传优化；**文件写入下载**：`files_written` SSE 事件 + `GET /api/v1/files/download` 安全下载端点 + 文件下载卡片 UI + `FILE_OUTPUT_DATE_SUBFOLDER` 月份子目录配置；技能路由可视化：`skill_matched` SSE 事件、`SkillLoader._last_match_info`、ThoughtProcess 🧠 技能路由面板、`GET /skills/load-errors`；侧边栏 Tab UI + 只读模式 + is_shared 群组框架；对话用户隔离；对话附件上传；ClickHouse TCP→HTTP 自动回退；对话打断；用户技能目录隔离修复）
+> **最后更新**：2026-04-13（**数据管理中心 + 定时推送任务 v2.5**：`scheduler_service.py` APScheduler + `notify_service.py` 4 渠道通知 + 9 端点 `/scheduled-reports/*` REST API + `DataCenterLayout` + 3 个前端子页面 + 3 个 Co-pilot 技能 + `schedules:read/write/admin` RBAC 权限；`reports` 表新增 `doc_type/scheduled_report_id/version_seq`；`migrate_datacenter_v1.py` DB 迁移；307 重定向 Bug 修复；**v2.4 2026-04-13**：多图表 HTML 报告生成；**2026-04-08**：Skill 用户使用权限隔离 T1–T6；**2026-04-05**：Excel → ClickHouse 数据导入 + 文件写入下载；技能路由可视化；侧边栏 Tab UI + 只读模式 + is_shared；对话用户隔离；对话附件上传；ClickHouse TCP→HTTP 自动回退；对话打断；用户技能目录隔离修复）
 
 ---
 
@@ -59,6 +59,8 @@ data-agent/
 │   │   ├── groups.py               # /groups 对话分组
 │   │   ├── files.py                # ★ GET /files/download — 安全文件下载端点（路径验证 + 用户隔离）
 │   │   ├── data_import.py          # ★ /data-import/* — Excel → ClickHouse 数据导入（9 端点，superadmin 专属）
+│   │   ├── reports.py              # ★ /reports/* — 报告 CRUD + doc_type 过滤 + PUT /{id}/spec 重生成
+│   │   ├── scheduled_reports.py    # ★ /scheduled-reports/* — 9 端点定时任务 CRUD（schedules:read/write 权限）
 │   │   └── llm_configs.py          # /llm-configs LLM 配置
 │   ├── core/
 │   │   ├── approval_manager.py     # ApprovalManager 单例（async Event 暂停）
@@ -81,7 +83,9 @@ data-agent/
 │   │       └── http_client.py      # ★ ClickHouseHTTPClient（requests-based，execute() 兼容 clickhouse-driver）
 │   ├── services/
 │   │   ├── conversation_service.py # ★ SSE 流处理、自动续接、上下文压缩
-│   │   └── data_import_service.py  # ★ run_import_job() 后台协程（分批 insert_tsv + 协作式取消）
+│   │   ├── data_import_service.py  # ★ run_import_job() 后台协程（分批 insert_tsv + 协作式取消）
+│   │   ├── scheduler_service.py    # ★ APScheduler 封装（add_or_update_job / remove_job）；随 FastAPI lifespan 启停
+│   │   └── notify_service.py       # ★ NotifyService — 多渠道通知（email/WeCom/Feishu/Webhook）
 │   ├── skills/
 │   │   ├── skill_loader.py         # SkillLoader 单例；3层加载；SkillMD.owner（filepath 解析）；_get_visible_user_skills(username)；build_skill_prompt_async(user_id=)；_MAX_INJECT_CHARS=16000 保护
 │   │   ├── skill_semantic_router.py  # ★ LLM 批量路由器（单次调用对候选 skill 打分，0-1.0）
@@ -97,11 +101,15 @@ data-agent/
 │   │   ├── refresh_token.py        # ★ RefreshToken（jti uuid，轮换/revoke 状态）
 │   │   ├── import_job.py           # ★ ImportJob（数据导入任务，状态机 + 进度追踪 + JSONB 配置快照）
 │   │   ├── export_job.py           # ★ ExportJob（SQL→Excel 导出任务，状态机 + 批次/Sheet 进度追踪）
+│   │   ├── scheduled_report.py     # ★ ScheduledReport（定时推送任务；cron_expr / notify_channels JSONB）
+│   │   ├── schedule_run_log.py     # ★ ScheduleRunLog（每次执行日志；status / notify_summary JSONB）
+│   │   ├── notification_log.py     # ★ NotificationLog（通知渠道发送记录）
 │   │   └── ...                     # 其他模型（Conversation/Message/Task/Report 等）
 │   ├── scripts/
-│   │   ├── init_rbac.py            # ★ 初始化 4 角色 + 15 权限（幂等，首次部署运行）
+│   │   ├── init_rbac.py            # ★ 初始化 4 角色 + 18 权限（幂等，首次部署运行）
 │   │   ├── migrate_data_import.py  # ★ 创建 import_jobs 表 + 种子 data:import 权限（幂等）
-│   │   └── migrate_data_export.py  # ★ 创建 export_jobs 表 + 种子 data:export 权限（幂等）
+│   │   ├── migrate_data_export.py  # ★ 创建 export_jobs 表 + 种子 data:export 权限（幂等）
+│   │   └── migrate_datacenter_v1.py # ★ 创建 scheduled_reports/run_logs/notification_logs 表 + reports 新增字段（幂等）
 │   └── config/
 │       └── settings.py             # Pydantic Settings（环境变量映射，含 RBAC 配置项）
 ├── frontend/src/
@@ -109,6 +117,11 @@ data-agent/
 │   ├── pages/Roles.tsx             # ★ 角色权限管理页面（卡片视图 + 权限分配弹窗；users:read 权限）
 │   ├── pages/DataImport.tsx        # ★ Excel 数据导入页面（3步骤向导：选连接/上传→配置Sheet→进度监控；data:import 权限）
 │   ├── pages/DataExport.tsx        # ★ SQL→Excel 数据导出页面（SQL编辑→预览→提交→进度轮询→下载；data:export 权限）
+│   ├── pages/DataCenterLayout.tsx  # ★ 数据管理中心公共布局（侧边导航：报表清单/报告清单/推送任务；reports:read 权限）
+│   ├── pages/DataCenterDashboards.tsx # ★ 报表清单页（dashboard 类型报告管理：预览/下载/删除）
+│   ├── pages/DataCenterDocuments.tsx  # ★ 报告清单页（document 类型报告管理：详情/PDF导出/删除）
+│   ├── pages/DataCenterSchedules.tsx  # ★ 推送任务页（定时任务 CRUD/启停/立即执行/历史/渠道测试）
+│   ├── pages/DataCenterCopilot.tsx    # ★ Co-pilot 面板（嵌入对话入口，快速创建/更新报表推送任务）
 │   ├── services/dataImportApi.ts   # ★ 数据导入 API 客户端（9 个方法，大文件 timeout=10min）
 │   ├── services/dataExportApi.ts   # ★ 数据导出 API 客户端（8 个方法，execute/poll/download/cancel）
 │   ├── store/useChatStore.ts       # Zustand store（消息、审批、续接、isCancelling 状态）
@@ -143,7 +156,10 @@ data-agent/
         │   ├── project-guide.md
         │   └── skill-creator.md
         ├── project/                # Tier 2：项目技能（管理员 REST API 维护）
-        │   └── *.md
+        │   ├── chart-reporter.md   # 多图表 HTML 报告生成指引（触发报告生成 skill）
+        │   ├── update-report.md    # ★ Co-pilot：更新现有报告（触发 PUT /reports/{id}/spec）
+        │   ├── update-schedule.md  # ★ Co-pilot：更新定时推送任务（触发 PUT /scheduled-reports/{id}）
+        │   └── create-schedule.md  # ★ Co-pilot：创建定时推送任务（触发 POST /scheduled-reports）
         └── user/                   # ★ Tier 3：用户技能（API 和前端均可增删改）
             ├── *.md                # ENABLE_AUTH=false / owner=""：所有用户共用（向后兼容遗留技能）
             └── {username}/         # ENABLE_AUTH=true：每个用户独立子目录
@@ -1051,6 +1067,59 @@ LLM 总结生成
 
 ---
 
+### 4.21 定时推送任务与数据管理中心（2026-04-13）
+
+```
+FastAPI lifespan（main.py）
+  └─ startup → scheduler_service.start_scheduler()
+                  └─ APScheduler BackgroundScheduler（in-process，线程池执行）
+                       ├─ 从 DB 恢复所有 is_active=True 的 ScheduledReport → add_job()
+                       └─ 持续监听 trigger fire → _execute_scheduled_report(schedule_id)
+
+_execute_scheduled_report(schedule_id)
+  ├─ 查询 ScheduledReport（is_active 二次检查）
+  ├─ 创建 ScheduleRunLog(status="running")
+  ├─ ReportBuilderService.build_report_html(sr.report_spec, sr.include_summary)
+  │    └─ 同多图表 HTML 报告生成流程（见 4.20）
+  ├─ Report DB 记录写入（关联 scheduled_report_id / 递增 version_seq）
+  ├─ notify_service.send_all(sr.notify_channels, report=report)
+  │    └─ for channel in notify_channels:
+  │         NotifyService.send_one(channel, report)
+  │              ├─ type=email → smtplib.SMTP（SMTP_HOST/PORT/USER/PASSWORD env vars）
+  │              ├─ type=wecom → requests.POST webhook_url（Markdown 卡片消息）
+  │              ├─ type=feishu → requests.POST webhook_url（富文本卡片消息）
+  │              └─ type=webhook → requests.request(method, url, headers, json)
+  ├─ ScheduleRunLog 更新（status=success/failed / duration_sec / notify_summary）
+  └─ ScheduledReport.run_count++ / fail_count++ / last_run_at = now
+
+add_or_update_job(sr) — 外部调用入口
+  ├─ 若 sr.is_active=True → scheduler.add_job(id=str(sr.id), CronTrigger.from_crontab(sr.cron_expr))
+  └─ 若 sr.is_active=False → remove_job(str(sr.id))（幂等：job 不存在时静默忽略）
+
+DataCenter 前端数据流
+  ├─ GET /api/v1/reports?doc_type=dashboard → DataCenterDashboards 报表清单
+  ├─ GET /api/v1/reports?doc_type=document  → DataCenterDocuments 报告清单
+  └─ GET/POST/PUT/DELETE /api/v1/scheduled-reports/* → DataCenterSchedules 推送任务
+       ├─ 创建任务 → POST "" → DB 写入 → add_or_update_job(sr) → 注册到 APScheduler
+       ├─ toggle  → PUT /{id}/toggle → DB is_active 翻转 → add/remove job
+       ├─ run-now → POST /{id}/run-now → BackgroundTasks.add_task(_execute_scheduled_report)
+       ├─ history → GET /{id}/history → 查询 schedule_run_logs
+       └─ channel-test → POST /{id}/channels/test → notify_service.send_one(is_test=True)
+```
+
+**权限设计**：
+
+| 操作 | 权限键 | 默认角色 |
+|------|--------|---------|
+| 查看定时任务列表/详情/历史 | `schedules:read` | analyst+ |
+| 创建/修改/删除/立即执行/测试渠道 | `schedules:write` | analyst+ |
+| 查看所有用户的定时任务（无 owner 过滤）| `schedules:admin` | admin+ |
+| 访问数据管理中心菜单 | `reports:read` | analyst+ |
+
+**数据管理中心菜单入口**：`AppLayout.tsx` → `{ key: '/data-center', perm: 'reports:read' }`（analyst 及以上可见）
+
+---
+
 ## 5. SSE 事件类型参考
 
 前端通过 `text/event-stream` 接收以下事件（均为 JSON）：
@@ -1165,7 +1234,7 @@ LLM 总结生成
 ### 权限 `/permissions`
 | 方法 | 路径 | 权限要求 | 说明 |
 |------|------|---------|------|
-| GET | `/permissions` | `users:read` | 全量权限定义列表（共 15 条，含 resource/action/description）|
+| GET | `/permissions` | `users:read` | 全量权限定义列表（共 18 条，含 resource/action/description）|
 
 ### 文件下载 `/files`
 
@@ -1213,13 +1282,32 @@ LLM 总结生成
 | 方法 | 路径 | 权限 | 说明 |
 |------|------|------|------|
 | POST | `/reports/build` | `reports:create` | 从 spec 生成 HTML 报告，写入 `customer_data/{username}/reports/`，返回 `report_id/file_path/refresh_token/summary_status` |
-| GET | `/reports` | `reports:read` | 分页列表（superadmin 见全部；普通用户仅见自己的）|
+| GET | `/reports` | `reports:read` | 分页列表，支持 `doc_type=dashboard\|document` 过滤（superadmin 见全部；普通用户仅见自己的）|
 | GET | `/reports/{id}` | `reports:read` + ownership | 报告详情 + `download_url` |
+| PUT | `/reports/{id}/spec` | `reports:create` + ownership | 用新 spec 重新生成 HTML，自动递增 `version_seq` |
 | DELETE | `/reports/{id}` | `reports:delete` + ownership | 删除记录 + HTML 文件 |
 | GET | `/reports/{id}/refresh-data?token=` | 无需 JWT（token 鉴权）| 重新执行所有图表 SQL，返回最新数据 |
 | POST | `/reports/{id}/export` | `reports:read` + ownership | 异步导出 PDF/PPTX，返回 `job_id` |
 | GET | `/reports/{id}/export-status?job_id=` | `reports:read` + ownership | 轮询导出任务状态 + 下载 URL |
 | GET | `/reports/{id}/summary-status` | `reports:read` + ownership | 查询 LLM 总结生成状态 |
+| POST | `/reports/{id}/share` | `reports:read` + ownership | 生成公开分享链接（share_token）|
+| GET | `/reports/shared/{token}` | 无需 JWT | 通过 share_token 公开访问报告详情 |
+
+### 定时推送任务 `/scheduled-reports`
+
+> 全部端点均通过 `require_permission("schedules", "read"|"write")` 保护。`_check_sr_ownership()` 确保非 superadmin 只能操作自己的任务；持有 `schedules:admin` 权限的用户可查看所有用户的任务。
+
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| POST | `/scheduled-reports` | `schedules:write` | 创建定时任务（验证 cron_expr，注册到 APScheduler）|
+| GET | `/scheduled-reports` | `schedules:read` | 任务列表（分页；普通用户仅见自己的；schedules:admin 见全部）|
+| GET | `/scheduled-reports/{id}` | `schedules:read` + ownership | 任务详情 |
+| PUT | `/scheduled-reports/{id}` | `schedules:write` + ownership | 更新任务（cron 变更时重新注册 job）|
+| DELETE | `/scheduled-reports/{id}` | `schedules:write` + ownership | 删除任务 + 从调度器移除 |
+| PUT | `/scheduled-reports/{id}/toggle` | `schedules:write` + ownership | 切换启用/停用（is_active 翻转 + add/remove job）|
+| POST | `/scheduled-reports/{id}/run-now` | `schedules:write` + ownership | 立即触发一次执行（BackgroundTasks 异步）|
+| GET | `/scheduled-reports/{id}/history` | `schedules:read` + ownership | 执行历史日志（分页，倒序）|
+| POST | `/scheduled-reports/{id}/channels/test` | `schedules:write` + ownership | 测试指定通知渠道（is_test=True 发送测试消息）|
 
 ### 分组管理 `/groups`
 
@@ -1464,6 +1552,9 @@ ENABLE_AUTH=false                       ENABLE_AUTH=true
 | `reports:read` | — | ✓ | ✓ | ✓ |
 | `reports:create` | — | ✓ | ✓ | ✓ |
 | `reports:delete` | — | — | ✓ | ✓ |
+| `schedules:read` | — | ✓ | ✓ | ✓ |
+| `schedules:write` | — | ✓ | ✓ | ✓ |
+| `schedules:admin` | — | — | ✓ | ✓ |
 
 > `is_superadmin=True` 的用户跳过角色表，直接被授予系统中所有权限（`get_user_permissions` 返回全量权限列表）。
 

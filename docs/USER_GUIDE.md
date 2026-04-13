@@ -1,7 +1,7 @@
 # 数据智能体系统 — 核心使用手册
 
-**文档版本**: v2.7
-**适用系统版本**: P0 + P1 + P2 + P3 + 3-Tier Skill System + Semantic Skill Routing + RBAC + 角色管理页面 + 推理过程持久化 + ContinuationCard + ClickHouse 动态多区域配置 + Session 过期管理 + 对话打断（停止生成）+ 对话附件上传 + 用户技能目录隔离修复 + 对话用户隔离 + 侧边栏 Tab UI + 只读模式 + is_shared 群组框架 + 技能路由可视化 + 文件写入下载 + **Excel → ClickHouse 数据导入**（2026-04-05）+ **Skill 用户使用权限隔离 T1–T6**（2026-04-08）+ **多图表 HTML 报告生成**（2026-04-13）
+**文档版本**: v2.8
+**适用系统版本**: P0 + P1 + P2 + P3 + 3-Tier Skill System + Semantic Skill Routing + RBAC + 角色管理页面 + 推理过程持久化 + ContinuationCard + ClickHouse 动态多区域配置 + Session 过期管理 + 对话打断（停止生成）+ 对话附件上传 + 用户技能目录隔离修复 + 对话用户隔离 + 侧边栏 Tab UI + 只读模式 + is_shared 群组框架 + 技能路由可视化 + 文件写入下载 + **Excel → ClickHouse 数据导入**（2026-04-05）+ **Skill 用户使用权限隔离 T1–T6**（2026-04-08）+ **多图表 HTML 报告生成**（2026-04-13）+ **数据管理中心 + 定时推送任务**（2026-04-13）
 **读者对象**: 数据工程师、数据分析师、系统管理员
 
 ---
@@ -22,6 +22,7 @@
 12. [Excel → ClickHouse 数据导入（superadmin 专属）](#12-excel--clickhouse-数据导入superadmin-专属)
 13. [SQL → Excel 数据导出（superadmin 专属）](#13-sql--excel-数据导出superadmin-专属)
 14. [多图表 HTML 报告生成](#14-多图表-html-报告生成)
+15. [数据管理中心](#15-数据管理中心)（含 15.4 推送任务 + 15.5 Co-pilot 技能）
 
 ---
 
@@ -1609,7 +1610,7 @@ Authorization: Bearer <superadmin-token>
 GET /api/v1/permissions
 Authorization: Bearer <superadmin-token>
 
-# 响应：15 条权限定义列表，每条含 id / resource / action / description
+# 响应：18 条权限定义列表，每条含 id / resource / action / description
 ```
 
 完整权限键列表：
@@ -1631,6 +1632,12 @@ Authorization: Bearer <superadmin-token>
 | `users:assign_role` | 为用户和角色分配/撤销权限 |
 | `data:import` | Excel 数据导入到 ClickHouse（superadmin 专属）|
 | `data:export` | SQL 查询结果导出为 Excel（superadmin 专属）|
+| `reports:read` | 查看/列出图表报告（analyst+）|
+| `reports:create` | 生成图表报告（analyst+）|
+| `reports:delete` | 删除图表报告（admin+）|
+| `schedules:read` | 查看定时推送任务列表/详情/历史（analyst+）|
+| `schedules:write` | 创建/修改/删除/立即执行定时任务（analyst+）|
+| `schedules:admin` | 以管理员身份查看所有用户的定时任务（admin+）|
 
 ---
 
@@ -1867,7 +1874,7 @@ POST   /api/v1/roles/{id}/permissions            # 为角色分配权限（需 u
 DELETE /api/v1/roles/{id}/permissions/{perm_id}  # 移除角色权限（需 users:assign_role）
 
 # 权限管理（需 users:read 权限）
-GET    /api/v1/permissions                       # 全量权限定义列表（共 13 条）
+GET    /api/v1/permissions                       # 全量权限定义列表（共 18 条）
 
 # Excel 数据导入（需 data:import 权限，仅 superadmin）
 GET    /api/v1/data-import/connections              # 可写 ClickHouse 连接列表
@@ -2598,4 +2605,125 @@ _ETL_KEYWORDS = frozenset({
 
 ---
 
-*文档由 Claude Sonnet 4.6 生成 · data-agent v2.7 · 2026-04-13（新增：第 14 节 多图表 HTML 报告生成；更新目录新增第 13/14 节链接；版本号升至 v2.7；报告 RBAC 权限矩阵（reports:read/create/delete）；API 快速参考；14.5 数据刷新机制；14.6 PDF/PPTX 导出；14.7 AI 摘要）*
+---
+
+## 15. 数据管理中心
+
+数据管理中心（Data Center）是一个独立的功能区域，汇聚了对话中生成的报表和报告，并提供定时推送任务管理能力。
+
+> **权限要求**：需要 `reports:read` 权限（analyst 及以上角色）。
+
+### 15.1 入口
+
+有两种方式进入数据管理中心：
+
+1. **对话侧边栏底部浮动按钮**：在聊天界面左下角点击「数据管理中心」图标，跳转至 `/data-center`
+2. **导航菜单**：左侧主菜单点击「数据管理中心」（`DatabaseOutlined` 图标）
+
+进入后，顶部有三个子标签：**报表清单 / 报告清单 / 推送任务**。
+
+### 15.2 报表清单（DataCenterDashboards）
+
+路径：`/data-center/dashboards`
+
+列出所有 `doc_type=dashboard` 的交互式 HTML 报告（通过聊天对话生成的可刷新报表）。
+
+| 操作 | 说明 |
+|------|------|
+| 预览 | 在弹窗 iframe 中全屏展示 HTML 报表，支持实时数据刷新和筛选器交互 |
+| 下载 | 下载本地 HTML 文件 |
+| PDF/PPTX 导出 | 调用导出接口生成文档（需等待后台任务完成） |
+| 删除 | 删除 DB 记录和磁盘 HTML 文件（需 `reports:delete` 权限）|
+
+### 15.3 报告清单（DataCenterDocuments）
+
+路径：`/data-center/documents`
+
+列出所有 `doc_type=document` 的文档式报告（以文档形式呈现的分析报告）。
+
+| 操作 | 说明 |
+|------|------|
+| 查看详情 | 展开报告详情页，含 LLM 摘要和报告元数据 |
+| 预览 | iframe 全屏预览 HTML 内容 |
+| PDF/PPTX 导出 | 同报表清单，支持 PDF 和 PPTX 两种格式 |
+| 删除 | 同上 |
+
+### 15.4 推送任务（DataCenterSchedules）
+
+路径：`/data-center/schedules`
+
+管理定时推送任务——在指定时间自动生成报告并发送通知。
+
+> **权限要求**：查看任务列表需 `schedules:read`；创建/修改/删除任务需 `schedules:write`。
+
+#### 创建定时任务
+
+点击「新建任务」按钮，填写：
+
+| 字段 | 说明 |
+|------|------|
+| 任务名称 | 人类可读的任务标识，如「每周销售报告」|
+| Cron 表达式 | 标准 5-field cron，如 `0 9 * * 1`（每周一上午 9 点）|
+| 时区 | 默认 `Asia/Shanghai` |
+| 报告类型 | `dashboard`（报表）或 `document`（报告）|
+| 报告规格 | 与生成报告时相同的 spec JSON（图表配置、SQL、筛选器等）|
+| 是否 AI 总结 | 开启后自动生成 LLM 摘要并附在通知中 |
+| 通知渠道 | 支持多渠道，每个渠道独立配置（见下表）|
+
+**支持的通知渠道**：
+
+| 渠道类型 | 配置字段 |
+|---------|---------|
+| 邮件（email）| `to`（收件人列表）、`subject_tpl`（主题模板，支持 `{{name}}`/`{{date}}` 变量）|
+| 企业微信机器人（wecom）| `webhook_url`（企微群机器人 Webhook URL）|
+| 飞书机器人（feishu）| `webhook_url`（飞书群机器人 Webhook URL）|
+| 通用 Webhook（webhook）| `url`、`method`（GET/POST）、可选 `headers`/`json_body` |
+
+#### 任务操作
+
+| 操作 | 说明 |
+|------|------|
+| 启用/停用 | 切换开关——停用后调度器不再自动触发，但任务配置保留 |
+| 立即执行 | 点击「立即执行」后台异步触发一次，约 5-30 秒内可在执行历史中看到结果 |
+| 查看执行历史 | 展开 Drawer 显示历史执行日志（执行时间/状态/耗时/通知摘要）|
+| 测试通知渠道 | 对单个渠道发送测试消息（标记 `is_test=True`，不生成真实报告）|
+| 编辑 | 更新任务配置（cron 变更后自动重新注册调度器 job）|
+| 删除 | 删除任务及历史日志（同时从调度器移除）|
+
+**Cron 表达式示例**：
+
+| 表达式 | 含义 |
+|--------|------|
+| `0 9 * * 1` | 每周一上午 9:00 |
+| `0 8 * * 1-5` | 工作日每天上午 8:00 |
+| `0 9 1 * *` | 每月 1 日上午 9:00 |
+| `0 */4 * * *` | 每 4 小时一次 |
+| `30 7 * * *` | 每天上午 7:30 |
+
+### 15.5 通过 Co-pilot 管理报表和推送任务
+
+数据管理中心内嵌 Co-pilot 面板（`/data-center/schedules`「AI 助手」入口），可通过自然语言完成：
+
+- **创建定时任务**：「帮我创建一个每周一早上 9 点发送销售报告的推送任务，发送到邮件 a@b.com」
+  - 触发 `create-schedule.md` skill → AI 自动调用 `POST /scheduled-reports`
+- **更新推送任务**：「把刚才那个任务改成每天发一次」
+  - 触发 `update-schedule.md` skill → AI 自动调用 `PUT /scheduled-reports/{id}`
+- **更新报表**：「帮我把这个报表的时间范围改成最近 30 天」
+  - 触发 `update-report.md` skill → AI 自动调用 `PUT /reports/{id}/spec`
+
+> **提示**：如果 AI 不自动触发上述 skill，可在消息中明确说「推送任务」「定时发送」「更新报表」等关键词，帮助路由到正确的 Co-pilot skill。
+
+### 15.6 RBAC 权限说明
+
+| 角色 | 可查看报表/报告 | 管理推送任务 | 查看所有用户任务 | 删除报告 |
+|------|:--------------:|:----------:|:--------------:|:-------:|
+| viewer | — | — | — | — |
+| analyst | ✅ | ✅（自己的）| — | — |
+| admin | ✅ | ✅（自己的）| ✅ | ✅ |
+| superadmin | ✅（全部）| ✅（全部）| ✅ | ✅ |
+
+> `schedules:admin` 权限允许在任务列表中不按 `owner_username` 过滤，即可看到系统内所有用户创建的定时任务。admin 角色默认持有此权限。
+
+---
+
+*文档由 Claude Sonnet 4.6 生成 · data-agent v2.8 · 2026-04-13（新增：第 15 节 数据管理中心（DataCenter + 定时推送任务）；版本号升至 v2.8；权限列表新增 reports:*/schedules:* 共 6 条；全文权限计数更新为 18 条；目录新增第 15 节链接；DEPLOYMENT.md 新增 SMTP 通知环境变量与 migrate_datacenter_v1.py 部署步骤）*
