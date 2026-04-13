@@ -26,7 +26,9 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from backend.api.deps import get_current_user
+import secrets
+
+from backend.api.deps import get_current_user, require_permission
 from backend.config.database import get_db
 from backend.config.settings import settings
 from backend.models.report import Report
@@ -110,7 +112,7 @@ async def build_report(
     req: BuildReportRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(require_permission("reports", "create")),
 ):
     """
     根据 spec 生成 HTML 报告文件，存入 customer_data/{username}/reports/，
@@ -289,7 +291,7 @@ async def refresh_report_data(
     report = db.query(Report).filter(Report.id == uid).first()
     if not report:
         raise HTTPException(404, "报告不存在")
-    if report.refresh_token != token:
+    if not secrets.compare_digest(report.refresh_token or "", token):
         raise HTTPException(403, "无效的刷新令牌")
 
     # 重新执行每个图表的 SQL
@@ -356,7 +358,7 @@ async def list_reports(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(require_permission("reports", "read")),
 ):
     username = getattr(current_user, "username", "default")
     is_superadmin = getattr(current_user, "is_superadmin", False)
@@ -382,7 +384,7 @@ async def list_reports(
 async def get_report(
     report_id: str,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(require_permission("reports", "read")),
 ):
     username = getattr(current_user, "username", "default")
     report = _get_report_or_404(report_id, db)
@@ -394,7 +396,7 @@ async def get_report(
 async def delete_report(
     report_id: str,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(require_permission("reports", "delete")),
 ):
     username = getattr(current_user, "username", "default")
     report = _get_report_or_404(report_id, db)
@@ -416,9 +418,11 @@ async def delete_report(
 async def get_summary_status(
     report_id: str,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(require_permission("reports", "read")),
 ):
+    username = getattr(current_user, "username", "default")
     report = _get_report_or_404(report_id, db)
+    _check_ownership(report, username)
     return {
         "success": True,
         "data": {
@@ -446,7 +450,7 @@ async def export_report(
     req: ExportReportRequest,
     background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(require_permission("reports", "read")),
 ):
     """
     异步导出 PDF 或 PPTX。返回 job_id，前端轮询 /export-status。
@@ -486,8 +490,14 @@ async def export_report(
 async def get_export_status(
     report_id: str,
     job_id: str = Query(...),
-    current_user=Depends(get_current_user),
+    db: Session = Depends(get_db),
+    current_user=Depends(require_permission("reports", "read")),
 ):
+    username = getattr(current_user, "username", "default")
+    # 验证报告归属（防止跨用户查询）
+    report = _get_report_or_404(report_id, db)
+    _check_ownership(report, username)
+
     job = _export_jobs.get(job_id)
     if not job or job["report_id"] != report_id:
         raise HTTPException(404, "导出任务不存在")

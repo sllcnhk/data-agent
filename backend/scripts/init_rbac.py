@@ -43,6 +43,9 @@ PERMISSIONS = [
     ("settings",        "write",        "修改系统设置"),
     ("data",            "import",       "Excel 数据导入 ClickHouse"),
     ("data",            "export",       "SQL 结果导出为 Excel"),
+    ("reports",         "read",         "查看/列出图表报告"),
+    ("reports",         "create",       "生成图表报告"),
+    ("reports",         "delete",       "删除图表报告"),
 ]
 
 
@@ -61,6 +64,7 @@ ROLES = {
             "skills.project:read",
             "skills.system:read",
             "settings:read",   # 可查看已注册 MCP 服务器列表（MCPStatus 组件所需）
+            "reports:read", "reports:create",
         ],
     },
     "admin": {
@@ -72,6 +76,7 @@ ROLES = {
             "skills.system:read",
             "models:read", "models:write",
             "settings:read", "settings:write",
+            "reports:read", "reports:create", "reports:delete",
         ],
     },
     "superadmin": {
