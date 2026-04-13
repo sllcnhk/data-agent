@@ -11,7 +11,7 @@
 | 数据库 | 业务定位 | 核心表数 | 数据量级 |
 |--------|---------|---------|---------|
 | `crm` | 外呼 CRM 主库（ODS+DWD层） | ~128 张 | ~1.05 TiB |
-| `integrated_data` | 跨系统集成层（计费/企业维度）| ~20 张 | ~4 GiB |
+| `integrated_data` | 跨环境汇集统计层（全环境聚合，无明细）| ~20 张 | ~4 GiB |
 | `data_statistics` | 统计汇总层（DWS）| ~15 张 | ~700 MiB |
 | `om_statistics` | 运营监控层（CDR话单）| ~10 张 | ~86 GiB |
 
@@ -143,24 +143,71 @@ dim_call_task（手动创建，is_automatic_task=0）
 
 ---
 
+## 七（补充）、integrated_data 跨环境汇集库核心表
+
+> **连接服务器**：clickhouse-sg（SG 环境）；**schema**：`integrated_data`
+> **特点**：仅统计聚合，无明细；`SaaS` / `Environment` 字段区分各环境数据
+> **关联 Skill**：`ch-integrated-data`（触发词：汇集库、全环境、新老客、integrated_data）
+
+### 事实表
+
+| 表名 | 用途 | 粒度 | 过滤规范 | 详细文档 |
+|------|------|------|---------|---------|
+| `Fact_Daily_Call` | 日度呼叫聚合（按 call_code_type 行）| 天×企业×话术 | `statistic_is_delete=0` + `FINAL` | [→ tables/Fact_Daily_Call.md](tables/Fact_Daily_Call.md) |
+| `Fact_Call_Unique_Phone` | 唯一号码接触/接通统计 | 天×企业×话术 | `statistic_is_delete=0` + `statistic_type='dialogue'` + `call_type IN (1,3)` | [→ tables/Fact_Call_Unique_Phone.md](tables/Fact_Call_Unique_Phone.md) |
+| `Fact_Daily_Call_Contacts_Offline` | 离线导入外呼数据（UNION ALL 补充）| 天×话术 | 只过滤 `s_day` 范围，**无 FINAL、无 is_delete** | [→ tables/Fact_Daily_Call_Contacts_Offline.md](tables/Fact_Daily_Call_Contacts_Offline.md) |
+
+### 维度表（均需 `FINAL`）
+
+| 表名 | 用途 | 关键字段 | 详细文档 |
+|------|------|---------|---------|
+| `Dim_Enterprise` | 企业维度（含 test_flag）| `Enterprise_ID`, `Name_Test_Flag`, `Environment` | [→ tables/Dim_Enterprise.md](tables/Dim_Enterprise.md) |
+| `Dim_Dialogue` | 话术维度（含 IVR 判断字段）| `template_code`, `switch`, `speech_name`, `Unique_id` | [→ tables/Dim_Dialogue.md](tables/Dim_Dialogue.md) |
+| `Dim_Unique_ID` | 项目属性（新老客/销售/行业）| `Unique_ID`, `Existing_Customer`, `Sales_Team`, `Contract_Code` | [→ tables/Dim_Unique_ID.md](tables/Dim_Unique_ID.md) |
+| `Dim_Unique_ID_Sales_Split` | 销售归因分摊（Sales_Team 为空时回退）| `Contract_Code`, `ts`（去重团队数）, `S_Sales_Team` | [→ tables/Dim_Unique_ID_Sales_Split.md](tables/Dim_Unique_ID_Sales_Split.md) |
+
+### integrated_data 五条必知业务规则
+
+1. **IVR 判断**：`switch='0'` 优先，其次 speech_name regex 匹配（见 `Dim_Dialogue.md`）
+2. **新老客二分**：`Existing_Customer NOT IN ('Existing')` → `'New'`，否则保持原值
+3. **Sales_Team 回退**：`null/空` + `ts=1` → Split 表；IDN-Sampoerna 特例 → `'Indonesia'`
+4. **测试企业过滤**：`test_flag=0` + 排除 4 个 hardcode 名称（zhujinli/zhouli/ding yang/PM_XUNLIN）
+5. **双路数据**：在线路（Fact_Daily_Call + Fact_Call_Unique_Phone join）UNION ALL 离线路（Fact_Daily_Call_Contacts_Offline）
+
+---
+
 ## 八、文件目录结构
 
 ```
-customer_data/db_knowledge/
-├── _index.md                          ← 本文件（L1 常驻摘要）
-├── relationships.md                   ← L2 完整 ERD + 业务链路图
-├── tables/                            ← L2 各表详细文档
-│   ├── dim_automatic_task.md          ← 策略定义表
-│   ├── dim_automatic_action.md        ← Action 节点定义表
-│   ├── dim_automatic_plan.md          ← 线索批次表
-│   ├── dim_automatic_task_customer.md ← 策略线索明细（父子流转）
-│   ├── dim_automatic_plan_action_task.md ← 核心桥梁表 ⭐
-│   ├── dim_call_task.md               ← 外呼任务表 ⭐
-│   ├── dim_call_task_customer.md      ← 任务线索明细（重拨）
-│   └── realtime_dwd_crm_call_record.md ← 呼叫记录宽表 ⭐
-└── metrics/                           ← L3 指标口径文档
+_shared/db_knowledge/
+├── _index.md                                    ← 本文件（L1 常驻摘要）
+├── relationships.md                             ← L2 完整 ERD + 业务链路图
+├── tables/                                      ← L2 各表详细文档
+│   │
+│   │  ── crm 库（SG 明细库，外呼 ODS/DWD）──
+│   ├── dim_automatic_task.md                    ← 策略定义表
+│   ├── dim_automatic_action.md                  ← Action 节点定义表（18种）
+│   ├── dim_automatic_plan.md                    ← 线索批次表
+│   ├── dim_automatic_task_customer.md           ← 策略线索明细（父子流转）
+│   ├── dim_automatic_plan_action_task.md        ← 核心桥梁表 ⭐
+│   ├── dim_call_task.md                         ← 外呼任务表 ⭐
+│   ├── dim_call_task_customer.md                ← 任务线索明细（重拨）
+│   ├── realtime_dwd_crm_call_record.md          ← 呼叫记录宽表 ⭐
+│   │
+│   │  ── integrated_data 库（全环境汇集统计，无明细）──
+│   ├── Fact_Daily_Call.md                       ← 日度呼叫聚合 ⭐
+│   ├── Fact_Call_Unique_Phone.md                ← 唯一号码接触/接通统计 ⭐
+│   ├── Fact_Daily_Call_Contacts_Offline.md      ← 离线导入外呼数据
+│   ├── Dim_Enterprise.md                        ← 企业维度（含 test_flag）⭐
+│   ├── Dim_Dialogue.md                          ← 话术维度（含 IVR 判断）⭐
+│   ├── Dim_Unique_ID.md                         ← 项目属性（新老客/销售）⭐
+│   ├── Dim_Unique_ID_Sales_Split.md             ← 销售归因分摊
+│   └── （其他计费表：Fact_Bill_DS/Usage, Bill_Monthly）
+│
+└── metrics/                                     ← L3 指标口径文档
     ├── cost_per_call.md
     ├── connect_rate.md
+    ├── ai_duration.md
     ├── gmv.md
     └── monthly_bill.md
 ```
