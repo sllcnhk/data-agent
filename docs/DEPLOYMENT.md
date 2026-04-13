@@ -1,6 +1,6 @@
 # 部署指南
 
-> 版本：v2.3 · 2026-04-08（**Skill 用户使用权限隔离 T1–T6**：SkillMD.owner + `_get_visible_user_skills` + `build_skill_prompt_async(user_id=)` + sub_skill 展开隔离 + Preview API effective_user_id；**无 DB 迁移**，纯代码层变更；v2.2 · 2026-04-07：**SQL→Excel 数据导出**：`migrate_data_export.py` DB 迁移（`export_jobs` 表 + `data:export` 权限）；流式写 xlsx + 多 Sheet 自动分割 + 大整数安全转换；v2.1 · 2026-04-05：**Excel 数据导入**：`migrate_data_import.py` DB 迁移（`import_jobs` 表 + `data:import` 权限）；流式上传支持 100MB 大文件；**文件写入下载**：`files_written` SSE 事件 + `GET /api/v1/files/download` 安全下载端点 + `FILE_OUTPUT_DATE_SUBFOLDER` 配置，**无 DB 迁移**；技能路由可视化：`skill_matched` SSE 事件 + `SkillLoader._last_match_info` + ThoughtProcess 🧠 面板 + `GET /skills/load-errors`，**无 DB 迁移**；侧边栏 Tab UI + is_shared：`migrate_add_is_shared.py` DB 迁移；对话用户隔离：`migrate_conversation_user_isolation.py` DB 迁移 + 所有对话/分组端点补全鉴权；customer_data 用户隔离；对话附件上传）
+> 版本：v2.4 · 2026-04-13（**多图表 HTML 报告生成**：`migrate_reports_enhancement.py` DB 迁移（`reports` 表新增 5 列）+ `migrate_reports_permissions.py` DB 迁移（`reports:read/create/delete` 权限）；Playwright Chromium 依赖；ECharts/AntV 多图表交互 HTML；PDF/PPTX 导出；LLM 报告摘要；RBAC 权限矩阵扩展；v2.3 · 2026-04-08：**Skill 用户使用权限隔离 T1–T6**：SkillMD.owner + `_get_visible_user_skills` + `build_skill_prompt_async(user_id=)` + sub_skill 展开隔离 + Preview API effective_user_id；**无 DB 迁移**，纯代码层变更；v2.2 · 2026-04-07：**SQL→Excel 数据导出**：`migrate_data_export.py` DB 迁移（`export_jobs` 表 + `data:export` 权限）；流式写 xlsx + 多 Sheet 自动分割 + 大整数安全转换；v2.1 · 2026-04-05：**Excel 数据导入**：`migrate_data_import.py` DB 迁移（`import_jobs` 表 + `data:import` 权限）；流式上传支持 100MB 大文件）
 >
 > 本文档说明如何将数据智能分析 Agent 系统从 Windows 开发环境迁移到 Linux 服务器，供团队多人共用。
 
@@ -54,6 +54,9 @@
 | Redis | 6+ | 会话缓存、Celery broker |
 | ChromaDB | 0.4+ | Skill 语义路由缓存（本地向量库） |
 | Celery | 5.3+ | 异步任务队列 |
+| Playwright | 1.40+ | HTML 报告 → PDF/PPTX 导出（Headless Chromium 截图/打印）|
+| python-pptx | 0.6.23+ | PPTX 幻灯片组装（封面 + 图表截图 + 结尾页）|
+| Pillow | 10.0+ | PPTX 导出时图片处理 |
 
 ### 前端
 
@@ -253,9 +256,19 @@ EOF
 python -m alembic upgrade head
 
 # 初始化 RBAC 角色和权限数据（幂等，重复运行无副作用）
-# 写入 4 个预置角色（viewer/analyst/admin/superadmin）和 15 条权限定义
+# 写入 4 个预置角色（viewer/analyst/admin/superadmin）和 18 条权限定义（含 reports:read/create/delete）
 # ENABLE_AUTH=true 时必须执行；ENABLE_AUTH=false 时可跳过
 python backend/scripts/init_rbac.py
+
+# 已有数据库升级时，补充执行以下增量迁移脚本（幂等）
+# reports 表字段增强（username / refresh_token / report_file_path / llm_summary / summary_status）
+python backend/scripts/migrate_reports_enhancement.py
+# reports 权限写入 DB（init_rbac.py 已包含，此脚本供已有 DB 单独补录）
+python backend/scripts/migrate_reports_permissions.py
+
+# PDF/PPTX 导出依赖 Playwright Chromium（首次安装后执行一次）
+# 若服务器无法访问外网，提前下载 Chromium 离线包或使用 weasyprint 作为 PDF 回退
+playwright install chromium
 ```
 
 ### 5.5 构建前端
@@ -871,6 +884,12 @@ python backend/scripts/migrate_data_export.py
 # v2.3+ Skill 用户使用权限隔离（T1–T6）：无 DB 迁移，纯代码层变更，代码更新后重启服务即可
 # 注：ENABLE_AUTH=true 环境建议验证 .claude/skills/user/ 下已有技能文件位于 {username}/ 子目录
 # （如有遗留的 user/*.md 文件，init_rbac.py 中的 _migrate_user_skills_to_superadmin 可一次性迁移）
+
+# v2.4+ 多图表 HTML 报告生成：执行 DB 迁移（幂等，已执行过会跳过）
+python backend/scripts/migrate_reports_enhancement.py
+python backend/scripts/migrate_reports_permissions.py
+# 首次安装 Playwright Chromium（PDF/PPTX 导出依赖）
+playwright install chromium
 
 # 重启服务
 sudo systemctl restart data-agent-backend

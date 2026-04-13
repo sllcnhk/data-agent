@@ -1,6 +1,6 @@
 # 数据库迁移指南
 
-> **最后更新**：2026-04-08（**Skill 用户使用权限隔离 T1–T6**：**无 DB 迁移**，纯代码层变更——SkillMD.owner 字段从 filepath 解析、`_get_visible_user_skills(username)` 过滤、`build_skill_prompt_async(user_id=)` 用户绑定、`_expand_sub_skills` 跨用户防护、Preview API effective_user_id；如有遗留 `user/*.md` 文件，`init_rbac.py → _migrate_user_skills_to_superadmin()` 可一次性迁移至 `user/superadmin/`；v2.2 2026-04-07：**SQL→Excel 数据导出**：`migrate_data_export.py` 新建 `export_jobs` 表 + 种子 `data:export` 权限；**Excel 数据导入**：`migrate_data_import.py` 新建 `import_jobs` 表 + 种子 `data:import` 权限；**文件写入下载**：**无 DB 迁移**，文件路径元数据写入已有 `messages.extra_metadata["files_written"]` JSONB 列；技能路由可视化：**无新增 DB 迁移**；新增 `migrate_add_is_shared.py`：`conversations.is_shared` 字段；对话用户隔离：`migrate_conversation_user_isolation.py`；其余历次变更均无数据库结构变更）
+> **最后更新**：2026-04-13（**多图表 HTML 报告生成**：`migrate_reports_enhancement.py` 新增 `reports` 表 5 列（`refresh_token`/`export_job_id`/`export_format`/`llm_summary`/`is_summarized`）；`migrate_reports_permissions.py` 种子 3 条权限（`reports:read/create/delete`）并分配至 analyst/admin/superadmin；2026-04-08：**Skill 用户使用权限隔离 T1–T6**：**无 DB 迁移**；2026-04-07：**SQL→Excel 数据导出**：`migrate_data_export.py` 新建 `export_jobs` 表 + 种子 `data:export` 权限；2026-04-05：**Excel 数据导入**：`migrate_data_import.py` 新建 `import_jobs` 表 + 种子 `data:import` 权限；其余历次变更见下方记录表）
 
 本文档说明数据库迁移的两种方式：
 1. **项目自有手动迁移脚本**（`backend/migrations/`）— 当前主要方式，支持 up/down
@@ -26,6 +26,8 @@
 | 文件写入下载（T1-T7） | 2026-03-26 | **无 DB 迁移**。Agent 写文件时生成的文件路径元数据（`[{path,name,size,mime_type}]`）写入已有 `messages.extra_metadata["files_written"]` JSONB 列，无需结构变更。文件实体存储于 `customer_data/{username}/` 目录（文件系统层面）。新增 `backend/api/files.py` 下载端点与 `FILE_OUTPUT_DATE_SUBFOLDER` 配置项均为代码/配置层变更。 | ✅ 无需执行 |
 | Excel 数据导入 | 2026-04-05 | **DB 迁移脚本**：`backend/scripts/migrate_data_import.py`。① 新建 `import_jobs` 表（UUID PK、状态机字段、进度追踪字段、错误信息、JSONB 配置快照）；② 插入 `data:import` 权限记录；③ 将 `data:import` 权限分配给 superadmin 角色。幂等（`CREATE TABLE IF NOT EXISTS` + `INSERT ... ON CONFLICT DO NOTHING`）。 | ✅ 已执行 |
 | SQL→Excel 数据导出 | 2026-04-07 | **DB 迁移脚本**：`backend/scripts/migrate_data_export.py`。① 新建 `export_jobs` 表（UUID PK、状态机字段、行级/批次/Sheet 三层进度字段、输出文件路径/大小、JSONB 配置快照）；② 插入 `data:export` 权限记录；③ 将 `data:export` 权限分配给 superadmin 角色。幂等（`CREATE TABLE IF NOT EXISTS` + `INSERT ... ON CONFLICT DO NOTHING`）。 | ✅ 已执行 |
+| 多图表 HTML 报告增强 | 2026-04-13 | **DB 迁移脚本**：`backend/scripts/migrate_reports_enhancement.py`。`reports` 表新增 5 列：`refresh_token VARCHAR(64)`（公开刷新令牌，SHA-256 随机值）、`export_job_id VARCHAR(64)`（关联导出任务）、`export_format VARCHAR(10)`、`llm_summary TEXT`（LLM 生成摘要）、`is_summarized BOOLEAN DEFAULT FALSE`（摘要生成状态）。幂等（`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`）。 | ✅ 已执行 |
+| 多图表报告权限 | 2026-04-13 | **DB 迁移脚本**：`backend/scripts/migrate_reports_permissions.py`。① 插入 3 条权限记录：`reports:read`（查看报告列表）、`reports:create`（生成报告）、`reports:delete`（删除报告）；② 将 `reports:read` + `reports:create` 分配给 analyst 角色；③ 将全部 3 条分配给 admin 角色；④ 将全部 3 条分配给 superadmin 角色。幂等（`INSERT ... ON CONFLICT DO NOTHING`）。 | ✅ 已执行 |
 | Skill 用户使用权限隔离 T1–T6 | 2026-04-08 | **无 DB 迁移**。变更均为代码层：`SkillMD.owner` 字段（filepath 解析）、`_get_visible_user_skills(username)` 方法、`build_skill_prompt_async(user_id=)` 参数、`_expand_sub_skills(user_id=)` 跨用户防护、Preview API `effective_user_id` 绑定及 `get_match_details(username=)` bug 修复。文件系统结构不变（仍为 `user/{username}/`）；如有遗留的 `user/*.md`（无 username 子目录），`init_rbac.py` 中的 `_migrate_user_skills_to_superadmin()` 可一次性迁移至 `user/superadmin/`（该函数在执行 `init_rbac.py` 时自动调用）。 | ✅ 无需执行 |
 
 ---
@@ -300,6 +302,99 @@ ON CONFLICT DO NOTHING;
 - `backend/models/export_job.py` — `ExportJob` ORM 模型 + `to_dict()`
 - `backend/api/data_export.py` — 8 个端点：连接列表 / SQL预览 / 执行 / 状态 / 取消 / 删除 / 历史列表 / 下载
 - `backend/services/data_export_service.py` — `run_export_job()` 后台协程（流式写 xlsx + 多 Sheet 分割 + 大整数转换 + 协作式取消）
+
+---
+
+### migrate_reports_enhancement.py（2026-04-13）— 多图表 HTML 报告增强字段
+
+**运行方式**：
+
+```bash
+# Windows + Anaconda（推荐方式）
+D:\ProgramData\Anaconda3\envs\dataagent\python.exe backend/scripts/migrate_reports_enhancement.py
+
+# Linux/Mac
+python backend/scripts/migrate_reports_enhancement.py
+```
+
+脚本幂等，多次运行无副作用（`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`）。
+
+**变更列**：
+
+```sql
+-- reports 表新增 5 列
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS refresh_token    VARCHAR(64);
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS export_job_id   VARCHAR(64);
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS export_format   VARCHAR(10);
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS llm_summary     TEXT;
+ALTER TABLE reports ADD COLUMN IF NOT EXISTS is_summarized   BOOLEAN NOT NULL DEFAULT FALSE;
+```
+
+| 新增列 | 类型 | 用途 |
+|--------|------|------|
+| `refresh_token` | `VARCHAR(64)` | SHA-256 随机令牌，用于公开刷新接口（`GET /reports/{id}/refresh-data`）鉴权，避免暴露用户 JWT |
+| `export_job_id` | `VARCHAR(64)` | 关联 PDF/PPTX 导出任务 ID（写入后可轮询进度） |
+| `export_format` | `VARCHAR(10)` | 最后一次导出格式：`pdf` / `pptx` |
+| `llm_summary` | `TEXT` | LLM 生成的报告摘要文字，存储后可复用 |
+| `is_summarized` | `BOOLEAN` | 标记摘要已生成，避免重复调 LLM（默认 `false`） |
+
+相关代码：
+- `backend/models/report.py` — `Report` ORM 模型新增 5 个字段 + `to_dict()` 导出
+- `backend/services/report_service.py` — `create_report()` 生成并写入 `refresh_token`；`generate_summary()` 调 LLM 并更新 `llm_summary`/`is_summarized`
+
+---
+
+### migrate_reports_permissions.py（2026-04-13）— 报告 RBAC 权限种子
+
+**运行方式**：
+
+```bash
+# Windows + Anaconda（推荐方式）
+D:\ProgramData\Anaconda3\envs\dataagent\python.exe backend/scripts/migrate_reports_permissions.py
+
+# Linux/Mac
+python backend/scripts/migrate_reports_permissions.py
+```
+
+脚本幂等（`INSERT ... ON CONFLICT DO NOTHING`）。
+
+**新增权限与角色分配**：
+
+```sql
+-- Step 1: 插入 3 条权限记录
+INSERT INTO permissions (id, resource, action, description)
+VALUES
+  (gen_random_uuid(), 'reports', 'read',   '查看/列出图表报告'),
+  (gen_random_uuid(), 'reports', 'create', '生成图表报告'),
+  (gen_random_uuid(), 'reports', 'delete', '删除图表报告')
+ON CONFLICT (resource, action) DO NOTHING;
+
+-- Step 2: 角色分配
+-- analyst: reports:read + reports:create
+INSERT INTO role_permissions (role_id, permission_id) ...
+
+-- admin: reports:read + reports:create + reports:delete
+INSERT INTO role_permissions (role_id, permission_id) ...
+
+-- superadmin: 全部 3 条
+INSERT INTO role_permissions (role_id, permission_id) ...
+```
+
+**权限矩阵（执行后）**：
+
+| 角色 | reports:read | reports:create | reports:delete |
+|------|:---:|:---:|:---:|
+| viewer | — | — | — |
+| analyst | ✅ | ✅ | — |
+| admin | ✅ | ✅ | ✅ |
+| superadmin | ✅ | ✅ | ✅ |
+
+**前端菜单**：侧边栏「图表报告」（`BarChartOutlined` 图标），需 `reports:read` 权限。viewer 用户不可见。
+
+相关代码：
+- `backend/api/reports.py` — 所有端点使用 `require_permission("reports", "read"|"create"|"delete")`
+- `backend/scripts/init_rbac.py` — `PERMISSIONS` 列表已包含 3 条记录；角色初始化时同步分配（新环境首次 init 无需额外执行此脚本）
+- `frontend/src/components/AppLayout.tsx` — `ALL_MENU_ITEMS` 新增 `{ key: '/reports', perm: 'reports:read' }` 项
 
 ---
 

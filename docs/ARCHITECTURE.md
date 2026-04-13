@@ -974,6 +974,83 @@ GET /skills/preview?message=xxx（T6）
 
 ---
 
+### 4.20 多图表 HTML 报告生成（2026-04-13）
+
+**设计动机**：用户在聊天中完成数据分析后，希望将结果以可视化图表 + 可刷新数据 + LLM 总结的形式汇出为可复用的 HTML 报告，并可进一步导出为 PDF 或 PPTX。
+
+```
+AgenticLoop / 用户直接调用 POST /reports/build
+  ↓ spec（charts / filters / data / include_summary）
+  │
+  ├─ ReportBuilderService.build_report_html()
+  │    ├─ ECharts 5.x（15+ 类型）/ AntV G2 4.x / D3.js v7 / llm_custom(new Function)
+  │    ├─ _css(theme)          — light/dark 主题，响应式 Grid，打印媒体查询
+  │    ├─ _js_engine()         — buildLine/buildBar/buildPie/... + formatVal + onFilterChange + refreshAllData
+  │    ├─ _render_filter_html()— date_range / select / multi_select / radio 筛选器（纯客户端过滤）
+  │    ├─ _render_summary_html()— AI 总结区域（含占位 spinner）
+  │    ├─ _safe_json()         — JSON 嵌入防 XSS（</ → <\/）
+  │    └─ 返回完整 self-contained HTML（CDN 引用 ECharts/dayjs/G2/D3）
+  │
+  ├─ 写入 customer_data/{username}/reports/{slug}_{ts}.html
+  ├─ 数据库插入 Report 记录（username / refresh_token / report_file_path / summary_status）
+  ├─ is_report=true 标记注入 SSE files_written 事件 → 前端渲染"预览"按钮
+  └─ 如 include_summary=true → BackgroundTask 异步调用 LLM → 更新 DB + HTML
+
+数据刷新（Report HTML 内"刷新"按钮调用）
+  GET /api/v1/reports/{id}/refresh-data?token={refresh_token}
+    ├─ 无需 JWT（用 refresh_token 公开鉴权，secrets.compare_digest 防时序攻击）
+    ├─ 遍历 report.charts[]，对每个有 SQL 的图表重新执行 ClickHouse/MySQL 查询
+    └─ 返回 {data: {c1: [...], c2: [...]}, llm_summary, refreshed_at}
+
+PDF/PPTX 导出
+  POST /api/v1/reports/{id}/export (format: pdf|pptx)
+    ├─ pdf: html_to_pdf() — Playwright headless Chromium → PDF（A4 横版，等待 2s 动画）
+    │        fallback: weasyprint → 复制 HTML（_fallback.html）
+    └─ pptx: html_to_pptx() — Playwright 截图 (.chart-card) → python-pptx
+             封面 + 全页概览 + 每图表独立页 + 结尾页（16:9 EMU）
+  轮询: GET /api/v1/reports/{id}/export-status?job_id=...
+
+LLM 总结生成
+  summary_status: pending → generating → done | failed | skipped
+  _async_generate_summary() 后台任务 → generate_llm_summary(spec, llm_adapter)
+  → rpt.llm_summary / rpt.summary_status 更新 DB
+  → GET /api/v1/reports/{id}/summary-status 轮询
+```
+
+**安全设计**：
+
+| 层 | 机制 |
+|----|------|
+| 端点权限 | 全部 JWT 端点使用 `require_permission("reports", "create"|"read"|"delete")` |
+| 跨用户隔离 | `_check_ownership(report, username)` → 403 |
+| 刷新令牌 | `secrets.compare_digest()` 防时序攻击；`secrets.token_urlsafe(48)` 生成 |
+| XSS 防护 | `_safe_json()`：`</` → `<\/` 防止 `</script>` 提前关闭 |
+| 用户技能目录 | 报告写入 `customer_data/{username}/reports/`，与其他用户隔离 |
+
+**RBAC 新增权限**：
+
+| 权限键 | viewer | analyst | admin | superadmin |
+|--------|--------|---------|-------|------------|
+| `reports:read` | — | ✓ | ✓ | ✓ |
+| `reports:create` | — | ✓ | ✓ | ✓ |
+| `reports:delete` | — | — | ✓ | ✓ |
+
+**核心文件**：
+
+| 文件 | 职责 |
+|------|------|
+| `backend/services/report_builder_service.py` | HTML 生成引擎（ECharts/AntV/D3）|
+| `backend/services/pdf_export_service.py` | PDF 导出（Playwright + weasyprint 回退）|
+| `backend/services/pptx_export_service.py` | PPTX 导出（截图 + python-pptx）|
+| `backend/api/reports.py` | 8 个 REST 端点 |
+| `backend/models/report.py` | Report ORM（新增 5 字段）|
+| `frontend/src/pages/Reports.tsx` | 报告列表管理页 |
+| `frontend/src/components/chat/ReportPreviewModal.tsx` | iframe 全屏预览 + 导出 |
+| `frontend/src/components/chat/ChatMessages.tsx` | 报告文件卡片（预览/下载按钮）|
+| `.claude/skills/project/chart-reporter.md` | Skill 文件（触发词 + spec 文档）|
+
+---
+
 ## 5. SSE 事件类型参考
 
 前端通过 `text/event-stream` 接收以下事件（均为 JSON）：
@@ -1128,6 +1205,21 @@ GET /skills/preview?message=xxx（T6）
 | DELETE | `/data-export/jobs/{job_id}` | 删除任务记录及本地 xlsx 文件（**仅允许终态**：completed/cancelled/failed，活跃任务须先取消） |
 | GET | `/data-export/jobs` | 历史导出任务列表（分页，按 created_at 倒序），参数：`page`/`page_size` |
 | GET | `/data-export/jobs/{job_id}/download` | 下载已完成的 xlsx 文件（`FileResponse`，触发浏览器另存为对话框） |
+
+### 图表报告 `/reports`
+
+> `POST /build`、`GET /list`、`GET /{id}`、`DELETE /{id}` 等需相应 `reports:*` 权限；`GET /refresh-data` 为公开端点（refresh_token 鉴权，无需 JWT）。
+
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| POST | `/reports/build` | `reports:create` | 从 spec 生成 HTML 报告，写入 `customer_data/{username}/reports/`，返回 `report_id/file_path/refresh_token/summary_status` |
+| GET | `/reports` | `reports:read` | 分页列表（superadmin 见全部；普通用户仅见自己的）|
+| GET | `/reports/{id}` | `reports:read` + ownership | 报告详情 + `download_url` |
+| DELETE | `/reports/{id}` | `reports:delete` + ownership | 删除记录 + HTML 文件 |
+| GET | `/reports/{id}/refresh-data?token=` | 无需 JWT（token 鉴权）| 重新执行所有图表 SQL，返回最新数据 |
+| POST | `/reports/{id}/export` | `reports:read` + ownership | 异步导出 PDF/PPTX，返回 `job_id` |
+| GET | `/reports/{id}/export-status?job_id=` | `reports:read` + ownership | 轮询导出任务状态 + 下载 URL |
+| GET | `/reports/{id}/summary-status` | `reports:read` + ownership | 查询 LLM 总结生成状态 |
 
 ### 分组管理 `/groups`
 
@@ -1369,6 +1461,9 @@ ENABLE_AUTH=false                       ENABLE_AUTH=true
 | `users:assign_role` | — | — | — | ✓ |
 | `data:import` | — | — | — | ✓ |
 | `data:export` | — | — | — | ✓ |
+| `reports:read` | — | ✓ | ✓ | ✓ |
+| `reports:create` | — | ✓ | ✓ | ✓ |
+| `reports:delete` | — | — | ✓ | ✓ |
 
 > `is_superadmin=True` 的用户跳过角色表，直接被授予系统中所有权限（`get_user_permissions` 返回全量权限列表）。
 

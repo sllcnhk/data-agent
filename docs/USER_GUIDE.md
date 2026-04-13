@@ -1,7 +1,7 @@
 # 数据智能体系统 — 核心使用手册
 
-**文档版本**: v2.6
-**适用系统版本**: P0 + P1 + P2 + P3 + 3-Tier Skill System + Semantic Skill Routing + RBAC + 角色管理页面 + 推理过程持久化 + ContinuationCard + ClickHouse 动态多区域配置 + Session 过期管理 + 对话打断（停止生成）+ 对话附件上传 + 用户技能目录隔离修复 + 对话用户隔离 + 侧边栏 Tab UI + 只读模式 + is_shared 群组框架 + 技能路由可视化 + 文件写入下载 + **Excel → ClickHouse 数据导入**（2026-04-05）+ **Skill 用户使用权限隔离 T1–T6**（2026-04-08）
+**文档版本**: v2.7
+**适用系统版本**: P0 + P1 + P2 + P3 + 3-Tier Skill System + Semantic Skill Routing + RBAC + 角色管理页面 + 推理过程持久化 + ContinuationCard + ClickHouse 动态多区域配置 + Session 过期管理 + 对话打断（停止生成）+ 对话附件上传 + 用户技能目录隔离修复 + 对话用户隔离 + 侧边栏 Tab UI + 只读模式 + is_shared 群组框架 + 技能路由可视化 + 文件写入下载 + **Excel → ClickHouse 数据导入**（2026-04-05）+ **Skill 用户使用权限隔离 T1–T6**（2026-04-08）+ **多图表 HTML 报告生成**（2026-04-13）
 **读者对象**: 数据工程师、数据分析师、系统管理员
 
 ---
@@ -20,6 +20,8 @@
 10. [用户认证与多用户管理（RBAC）](#10-用户认证与多用户管理rbac)（含 10.9 Session 过期行为说明）
 11. [快速参考卡](#11-快速参考卡)
 12. [Excel → ClickHouse 数据导入（superadmin 专属）](#12-excel--clickhouse-数据导入superadmin-专属)
+13. [SQL → Excel 数据导出（superadmin 专属）](#13-sql--excel-数据导出superadmin-专属)
+14. [多图表 HTML 报告生成](#14-多图表-html-报告生成)
 
 ---
 
@@ -1775,6 +1777,8 @@ python backend/scripts/migrate_conversation_user_isolation.py
 | 下载 Agent 生成的文件（CSV/Excel/JSON 等）| 助手消息末尾 → **「📎 生成的文件」卡片** → 点击「下载」按钮（见 5.9 节）|
 | 将 Excel 文件批量导入 ClickHouse | 侧边栏 → **「数据导入」**（仅 superadmin；见第 12 节）|
 | 将 SQL 查询结果导出为 Excel | 侧边栏 → **「数据导出」**（仅 superadmin；见第 13 节）|
+| 生成多图表交互式 HTML 报告 | 聊天框提及「图表报告」，或侧边栏 → **「图表报告」**（需 `reports:create` 权限；见第 14 节）|
+| 导出报告为 PDF / PPTX | 报告列表 → 点击「导出 PDF」/「导出 PPTX」（异步任务，轮询后下载；见 14.6 节）|
 | 查看本次回答调了哪些工具 | 助手消息上方 → 点击**「推理过程」** 折叠面板 |
 | 刷新页面后查看历史推理过程 | 推理过程已持久化，刷新后仍可展开（见 5.4 节）|
 | 了解 Agent 自动续接了几次 | 消息列表中查看 🔄 续接提示横幅（`[N/3]`）|
@@ -2122,6 +2126,204 @@ DELETE /api/v1/data-export/jobs/{job_id}
 
 ---
 
+## 14. 多图表 HTML 报告生成
+
+> **权限要求**：
+> - **生成报告**：需要 `reports:create` 权限（analyst 及以上角色）
+> - **查看报告列表**：需要 `reports:read` 权限（analyst 及以上角色）
+> - **删除报告**：需要 `reports:delete` 权限（admin 及以上角色）
+>
+> **入口**：侧边栏导航 → **「图表报告」**（`BarChartOutlined` 图标）。`ENABLE_AUTH=false` 时（单用户模式），可直接使用。
+
+### 14.1 功能概述
+
+通过聊天触发后端生成一个**自包含 HTML 页面**，内嵌 ECharts/AntV 图表、JSON 数据和客户端筛选器。后续可导出为 PDF 或 PPTX，并可由 LLM 自动生成报告摘要。
+
+核心能力：
+
+- **多图表布局**：每份报告可包含多张图表（折线图、柱状图、饼图、散点图、热力图等），使用 ECharts CDN 渲染
+- **内嵌筛选器**：`date_range`（日期范围）、`select`（单选）、`multi_select`（多选）、`radio`（单选按钮）四种筛选控件，全部客户端运算，无需联网
+- **数据可刷新**：每份报告附带 `refresh_token`，用于调用 `GET /api/v1/reports/{id}/refresh-data` 公开接口重新查询最新数据、不需要用户 JWT
+- **预览弹窗**：在报告列表页点击「预览」可直接在 Modal 中渲染 HTML，无需下载
+- **PDF / PPTX 导出**：后台 Playwright Chromium 截图 → PDF；python-pptx 图表截图 → PPTX 幻灯片（每张图表一页）
+- **AI 摘要**：点击「生成摘要」，LLM 根据图表规格和数据生成结构化分析文字，存储后可复用
+
+### 14.2 通过聊天触发报告生成
+
+在聊天框中提及"图表"、"报告"、"可视化"等关键词，Agent 会自动识别并调用报告生成工具：
+
+```
+用户：请帮我生成上季度各地区销售额的多图表报告，
+      包含折线图（月度趋势）和饼图（区域占比）。
+```
+
+Agent 返回报告 ID 和预览链接后，即可在「图表报告」页面查看。
+
+也可以直接通过 API 提交报告规格：
+
+```bash
+POST /api/v1/reports/build
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "spec": {
+    "title": "销售季度报告",
+    "description": "上季度各地区销售分析",
+    "charts": [
+      {
+        "id": "line1",
+        "type": "line",
+        "title": "月度趋势",
+        "x_field": "month",
+        "y_fields": ["revenue"],
+        "data": [{"month": "1月", "revenue": 120000}, ...]
+      },
+      {
+        "id": "pie1",
+        "type": "pie",
+        "title": "区域占比",
+        "name_field": "region",
+        "value_field": "revenue",
+        "data": [{"region": "华东", "revenue": 450000}, ...]
+      }
+    ],
+    "filters": [
+      {
+        "id": "region_filter",
+        "type": "select",
+        "label": "选择地区",
+        "field": "region",
+        "options": ["华东", "华南", "华北"],
+        "target_charts": ["pie1"]
+      }
+    ]
+  }
+}
+```
+
+### 14.3 报告列表页操作
+
+进入侧边栏「图表报告」后，可见所有（自己生成的）报告列表。每行显示：报告标题、创建时间、状态标签、摘要生成状态。
+
+| 操作 | 说明 |
+|------|------|
+| 预览 | 在 Modal 弹窗中渲染 HTML 报告，支持全屏 |
+| 导出 PDF | 后台 Playwright 截图生成 PDF，轮询完成后自动下载 |
+| 导出 PPTX | 后台截图每张图表生成幻灯片，轮询完成后自动下载 |
+| 生成摘要 | LLM 分析图表数据，生成结构化中文摘要；已摘要的报告直接展示 |
+| 刷新数据 | 使用 `refresh_token` 调后端重查数据，更新报告内嵌 JSON |
+| 删除 | 仅 `reports:delete` 权限角色（admin+）可操作 |
+
+### 14.4 筛选器说明
+
+HTML 报告内嵌四种客户端筛选控件，无需服务器参与：
+
+| 筛选类型 | `type` 值 | 效果 |
+|---------|-----------|------|
+| 日期范围选择 | `date_range` | 按日期字段过滤，支持起止日期双端输入 |
+| 下拉单选 | `select` | 从预设选项中选一个值，过滤目标图表数据 |
+| 多选复选框 | `multi_select` | 可勾选多个值，OR 逻辑过滤 |
+| 单选按钮组 | `radio` | 互斥选项，切换时立即更新图表 |
+
+筛选器通过 `target_charts` 字段指定作用范围，可以跨图表联动（一个筛选器控制多张图表）。
+
+### 14.5 数据刷新机制
+
+报告生成时，后端为每份报告生成一个 64 字符随机 `refresh_token` 存入数据库。客户端可用此令牌调用公开接口重新查询数据：
+
+```bash
+GET /api/v1/reports/{id}/refresh-data?token=<refresh_token>
+# 无需 JWT；后端用 secrets.compare_digest 验证令牌
+# 返回最新数据并更新报告内嵌 JSON
+```
+
+适用场景：将报告 HTML 分享给无账号的同事后，对方仍可点击页面内「刷新数据」按钮获取最新数据。
+
+### 14.6 PDF / PPTX 导出说明
+
+导出为异步任务，提交后轮询进度：
+
+```bash
+# 提交导出任务
+POST /api/v1/reports/{id}/export
+{"format": "pdf"}   # 或 "pptx"
+→ 返回: {"job_id": "...", "status": "pending"}
+
+# 轮询进度
+GET /api/v1/reports/{id}/export-status?job_id=<job_id>
+→ 返回: {"status": "running"|"completed"|"failed", "progress": 0.0~1.0}
+
+# 下载（status=completed 后）
+GET /api/v1/reports/{id}/export-download?job_id=<job_id>
+```
+
+**依赖要求**（服务器端）：
+- PDF 导出：需安装 `playwright` + `playwright install chromium`
+- PPTX 导出：需安装 `python-pptx` + `Pillow`（`pip install -r requirements.txt` 已包含）
+
+### 14.7 AI 摘要功能
+
+点击「生成摘要」后，后台向 LLM 发送以下内容并生成中文分析：
+- 报告标题与描述
+- 各图表类型、标题、轴字段定义
+- 各图表前 50 行数据样本
+
+摘要结果存入 `reports.llm_summary` 列，标记 `is_summarized=true`，后续再次点击直接读取缓存，不重复调用 LLM。
+
+```bash
+# 触发摘要生成（异步，立即返回）
+POST /api/v1/reports/{id}/summarize
+
+# 查询摘要状态
+GET /api/v1/reports/{id}/summary-status
+→ 返回: {"is_summarized": true, "llm_summary": "..."}
+```
+
+### 14.8 API 快速参考
+
+```bash
+# 生成报告
+POST /api/v1/reports/build
+Authorization: Bearer <token>
+{"spec": {...}}
+→ 返回: {"id": "report-uuid", "html_content": "<!DOCTYPE html>...", "refresh_token": "..."}
+
+# 列出报告（分页）
+GET /api/v1/reports?page=1&page_size=10
+Authorization: Bearer <token>
+
+# 获取报告详情
+GET /api/v1/reports/{id}
+Authorization: Bearer <token>
+
+# 删除报告（需 reports:delete 权限）
+DELETE /api/v1/reports/{id}
+Authorization: Bearer <token>
+
+# 提交导出任务
+POST /api/v1/reports/{id}/export
+Authorization: Bearer <token>
+{"format": "pdf"}
+
+# 轮询导出进度
+GET /api/v1/reports/{id}/export-status?job_id=<job_id>
+Authorization: Bearer <token>
+
+# 触发摘要生成
+POST /api/v1/reports/{id}/summarize
+Authorization: Bearer <token>
+
+# 查询摘要状态
+GET /api/v1/reports/{id}/summary-status
+Authorization: Bearer <token>
+
+# 公开刷新数据（无需 JWT）
+GET /api/v1/reports/{id}/refresh-data?token=<refresh_token>
+```
+
+---
+
 ## ClickHouse 双权限连接与 Agent 绑定
 
 ### 概述
@@ -2396,4 +2598,4 @@ _ETL_KEYWORDS = frozenset({
 
 ---
 
-*文档由 Claude Sonnet 4.6 生成 · data-agent v1.8 · 2026-03-25（新增：10.10 节对话用户隔离；superadmin 侧边栏双 Tab UI + 只读模式 + 黄色 banner；migrate_conversation_user_isolation.py；migrate_add_is_shared.py；存量数据迁移说明）*
+*文档由 Claude Sonnet 4.6 生成 · data-agent v2.7 · 2026-04-13（新增：第 14 节 多图表 HTML 报告生成；更新目录新增第 13/14 节链接；版本号升至 v2.7；报告 RBAC 权限矩阵（reports:read/create/delete）；API 快速参考；14.5 数据刷新机制；14.6 PDF/PPTX 导出；14.7 AI 摘要）*
