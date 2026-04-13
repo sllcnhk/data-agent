@@ -138,12 +138,27 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Skill watcher startup warning (non-critical): {e}")
 
+    # 启动定时报告调度器（APScheduler）
+    try:
+        from backend.services.scheduler_service import start as start_scheduler
+        start_scheduler()
+        logger.info("Scheduler (APScheduler) started")
+    except Exception as e:
+        logger.warning("Scheduler startup warning (non-critical): %s", e)
+
     logger.info("System startup complete")
 
     yield
 
     # 关闭逻辑
     logger.info("Shutting down Data Agent System...")
+
+    # 停止定时报告调度器
+    try:
+        from backend.services.scheduler_service import shutdown as shutdown_scheduler
+        shutdown_scheduler()
+    except Exception:
+        pass
 
     # 停止技能文件监视器
     try:
@@ -183,6 +198,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 # 导入路由
 from api import agents, skills, conversations, llm_configs, mcp, groups, approvals, auth, users, files, data_import, data_export, reports
 from api.users import roles_router, permissions_router
+from api import scheduled_reports
 
 
 # 健康检查端点
@@ -214,6 +230,7 @@ app.include_router(files.router, prefix="/api/v1")
 app.include_router(data_import.router, prefix="/api/v1")
 app.include_router(data_export.router, prefix="/api/v1")
 app.include_router(reports.router, prefix="/api/v1")
+app.include_router(scheduled_reports.router, prefix="/api/v1")
 
 
 # 全局异常处理器

@@ -63,10 +63,24 @@ class BuildReportRequest(BaseModel):
     spec: Dict[str, Any] = Field(..., description="报告规格 JSON（见 ReportBuilderService 文档）")
     conversation_id: Optional[str] = Field(None, description="来源对话 ID")
     include_summary: bool = Field(False, description="是否异步生成 LLM 总结")
+    doc_type: str = Field("dashboard", description="报告类型: dashboard | document")
 
 
 class ExportReportRequest(BaseModel):
     format: str = Field("pdf", description="导出格式: pdf | pptx")
+
+
+class UpdateSpecRequest(BaseModel):
+    spec: Dict[str, Any] = Field(..., description="完整报告规格 JSON")
+
+
+class UpdateShareRequest(BaseModel):
+    share_scope: str = Field("private", description="共享范围: public | team | private")
+    allowed_users: List[str] = Field(default_factory=list, description="允许访问的用户名列表")
+
+
+class CopilotRequest(BaseModel):
+    title: Optional[str] = Field(None, description="对话标题（可选）")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -181,6 +195,10 @@ async def build_report(
         theme=spec.get("theme", "light"),
         extra_metadata={"spec_version": "1.0", "file_name": filename},
     )
+    try:
+        report.doc_type = req.doc_type
+    except AttributeError:
+        pass  # doc_type 列尚未迁移，跳过
     db.add(report)
     db.commit()
     db.refresh(report)
@@ -358,6 +376,7 @@ async def _run_query(sql: str, env: str, conn_type: str = "clickhouse") -> List[
 async def list_reports(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
+    doc_type: Optional[str] = Query(None, description="过滤类型: dashboard | document"),
     db: Session = Depends(get_db),
     current_user=Depends(require_permission("reports", "read")),
 ):
@@ -367,6 +386,11 @@ async def list_reports(
     q = db.query(Report)
     if not is_superadmin:
         q = q.filter(Report.username == username)
+    if doc_type is not None:
+        try:
+            q = q.filter(Report.doc_type == doc_type)
+        except AttributeError:
+            pass  # doc_type 列尚未迁移，跳过过滤
     total = q.count()
     reports = q.order_by(Report.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
 
@@ -464,8 +488,19 @@ async def serve_report_html_by_token(
     report = db.query(Report).filter(Report.id == uid).first()
     if not report:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="报告不存在")
-    if not secrets.compare_digest(report.refresh_token or "", token):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无效的刷新令牌")
+
+    # Public reports: skip token check
+    try:
+        _share_scope_val = report.share_scope
+        if hasattr(_share_scope_val, "value"):
+            _share_scope_val = _share_scope_val.value
+        if _share_scope_val and _share_scope_val == "public":
+            pass  # Public access — no token needed, fall through to file serving
+        elif not secrets.compare_digest(report.refresh_token or "", token):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无效的刷新令牌")
+    except AttributeError:
+        if not secrets.compare_digest(report.refresh_token or "", token):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无效的刷新令牌")
 
     if not report.report_file_path:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="报告文件路径未记录")
@@ -487,6 +522,128 @@ async def serve_report_html_by_token(
         headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{encoded}"
 
     return HTMLResponse(content=content, headers=headers)
+
+
+@router.put("/{report_id}/spec")
+async def update_report_spec(
+    report_id: str,
+    req: UpdateSpecRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_permission("reports", "create")),
+):
+    """
+    用新的 spec 重新生成报告 HTML，并更新数据库中的 charts/filters/theme 等字段。
+    """
+    username = getattr(current_user, "username", "default")
+    report = _get_report_or_404(report_id, db)
+    _check_ownership(report, username)
+
+    try:
+        html_content = build_report_html(
+            spec=req.spec,
+            report_id=str(report.id),
+            refresh_token=report.refresh_token,
+            api_base_url=_api_base_url(),
+        )
+    except Exception as e:
+        logger.error("[Reports] spec 更新 HTML 生成失败: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"HTML 生成失败: {e}")
+
+    if not report.report_file_path:
+        raise HTTPException(status_code=400, detail="报告尚无 HTML 文件路径，无法覆写")
+
+    html_path = _CUSTOMER_DATA_ROOT / report.report_file_path
+    html_path.parent.mkdir(parents=True, exist_ok=True)
+    html_path.write_text(html_content, encoding="utf-8")
+
+    # 更新数据库字段
+    report.charts = req.spec.get("charts", report.charts)
+    report.data_sources = _build_data_sources(req.spec) or report.data_sources
+    report.filters = req.spec.get("filters", report.filters)
+    report.theme = req.spec.get("theme", report.theme)
+    if req.spec.get("title"):
+        report.name = req.spec["title"]
+    db.commit()
+
+    logger.info("[Reports] spec 更新完成: id=%s", report_id)
+    return {
+        "success": True,
+        "data": {
+            "report_id": str(report.id),
+            "updated_at": datetime.utcnow().isoformat(),
+        },
+    }
+
+
+@router.put("/{report_id}/share")
+async def update_report_share(
+    report_id: str,
+    req: UpdateShareRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_permission("reports", "create")),
+):
+    """
+    更新报告的共享范围（public / team / private）和允许访问的用户列表。
+    """
+    username = getattr(current_user, "username", "default")
+    report = _get_report_or_404(report_id, db)
+    _check_ownership(report, username)
+
+    try:
+        report.share_scope = req.share_scope
+        report.allowed_users = req.allowed_users
+        db.commit()
+    except AttributeError:
+        # share_scope / allowed_users 列尚未迁移，跳过
+        pass
+
+    return {"success": True}
+
+
+@router.post("/{report_id}/copilot")
+async def create_report_copilot(
+    report_id: str,
+    req: CopilotRequest = CopilotRequest(),
+    db: Session = Depends(get_db),
+    current_user=Depends(require_permission("reports", "read")),
+):
+    """
+    为指定报告创建一个 Co-pilot 对话，系统提示中注入报告上下文。
+    返回新建对话 ID，前端跳转到对话页面。
+    """
+    from backend.services.conversation_service import ConversationService
+
+    username = getattr(current_user, "username", "default")
+    report = _get_report_or_404(report_id, db)
+    _check_ownership(report, username)
+
+    copilot_system_prompt = (
+        f"[Co-pilot 模式] 当前报表：{report.name}\n"
+        f"图表数量：{len(report.charts or [])}\n"
+        f"图表配置：{json.dumps(report.charts or [], ensure_ascii=False)[:2000]}\n"
+        f"过滤器：{json.dumps(report.filters or [], ensure_ascii=False)[:500]}\n"
+        f"主题：{report.theme}\n\n"
+        "请基于以上报表信息协助用户修改报表。"
+    )
+
+    user_id = getattr(current_user, "id", None)
+    if user_id is not None and str(user_id) == "default":
+        user_id = None
+
+    svc = ConversationService(db)
+    conv_title = req.title or f"报表助手 — {report.name}"
+    conv = svc.create_conversation(
+        title=conv_title,
+        system_prompt=copilot_system_prompt,
+        metadata={"context_type": "report", "context_id": str(report.id)},
+        user_id=user_id,
+    )
+
+    logger.info("[Reports] co-pilot 对话已创建: report_id=%s, conv_id=%s", report_id, conv.id)
+    return {
+        "success": True,
+        "data": {"conversation_id": str(conv.id)},
+    }
 
 
 @router.get("/{report_id}")

@@ -46,6 +46,9 @@ PERMISSIONS = [
     ("reports",         "read",         "查看/列出图表报告"),
     ("reports",         "create",       "生成图表报告"),
     ("reports",         "delete",       "删除图表报告"),
+    ("schedules",       "read",         "查看定时推送任务"),
+    ("schedules",       "write",        "创建/修改/删除/触发定时推送任务"),
+    ("schedules",       "admin",        "管理员查看所有用户的定时推送任务"),
 ]
 
 
@@ -65,6 +68,7 @@ ROLES = {
             "skills.system:read",
             "settings:read",   # 可查看已注册 MCP 服务器列表（MCPStatus 组件所需）
             "reports:read", "reports:create",
+            "schedules:read", "schedules:write",
         ],
     },
     "admin": {
@@ -77,6 +81,7 @@ ROLES = {
             "models:read", "models:write",
             "settings:read", "settings:write",
             "reports:read", "reports:create", "reports:delete",
+            "schedules:read", "schedules:write", "schedules:admin",
         ],
     },
     "superadmin": {

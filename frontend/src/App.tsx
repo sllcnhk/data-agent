@@ -15,6 +15,10 @@ import Roles from './pages/Roles';
 import DataImport from './pages/DataImport';
 import DataExport from './pages/DataExport';
 import Reports from './pages/Reports';
+import DataCenterLayout from './components/DataCenterLayout';
+import DataCenterDashboards from './pages/DataCenterDashboards';
+import DataCenterDocuments from './pages/DataCenterDocuments';
+import DataCenterSchedules from './pages/DataCenterSchedules';
 import { useAuthStore } from '@/store/useAuthStore';
 
 const { Content } = Layout;
@@ -74,6 +78,12 @@ function App() {
             <Chat />
           </RequireAuth>
         } />
+
+        {/* 数据管理中心（独立布局） */}
+        <Route path="/data-center" element={<RequireAuth><DataCenterLayout><DataCenterDashboards /></DataCenterLayout></RequireAuth>} />
+        <Route path="/data-center/dashboards" element={<RequireAuth><DataCenterLayout><DataCenterDashboards /></DataCenterLayout></RequireAuth>} />
+        <Route path="/data-center/documents" element={<RequireAuth><DataCenterLayout><DataCenterDocuments /></DataCenterLayout></RequireAuth>} />
+        <Route path="/data-center/schedules" element={<RequireAuth><DataCenterLayout><DataCenterSchedules /></DataCenterLayout></RequireAuth>} />
 
         {/* 其他页面使用 AppLayout */}
         <Route path="/*" element={

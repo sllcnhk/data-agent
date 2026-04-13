@@ -41,6 +41,11 @@ from backend.models.report import (
     ShareScope
 )
 
+# DataCenter 模块（定时报告 + 通知）
+from backend.models.scheduled_report import ScheduledReport
+from backend.models.schedule_run_log import ScheduleRunLog
+from backend.models.notification_log import NotificationLog
+
 __all__ = [
     # Conversation
     "Conversation",
@@ -64,4 +69,9 @@ __all__ = [
     "ReportType",
     "ChartType",
     "ShareScope",
+
+    # DataCenter
+    "ScheduledReport",
+    "ScheduleRunLog",
+    "NotificationLog",
 ]

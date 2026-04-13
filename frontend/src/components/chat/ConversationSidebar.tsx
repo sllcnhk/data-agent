@@ -21,6 +21,7 @@ import {
   FolderOutlined,
   MoreOutlined,
   UserOutlined,
+  BarChartOutlined,
 } from '@ant-design/icons';
 import type { Conversation, ConversationGroup } from '../../store/useChatStore';
 import type { OtherUserConversations } from '../../services/chatApi';
@@ -481,6 +482,36 @@ const ConversationSidebar: React.FC<ConversationSidebarProps> = ({
           {myConversationsContent}
         </div>
       )}
+
+      {/* 数据管理中心入口 */}
+      <Tooltip title="数据管理中心" placement="right">
+        <div
+          onClick={() => window.open('/data-center', '_blank')}
+          style={{
+            margin: '8px 12px',
+            padding: '8px 12px',
+            borderRadius: 8,
+            background: 'linear-gradient(135deg, #1677ff14, #1677ff08)',
+            border: '1px solid #1677ff30',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            cursor: 'pointer',
+            transition: 'all 0.2s',
+          }}
+          onMouseEnter={e => {
+            (e.currentTarget as HTMLDivElement).style.background = 'linear-gradient(135deg, #1677ff22, #1677ff12)';
+            (e.currentTarget as HTMLDivElement).style.borderColor = '#1677ff60';
+          }}
+          onMouseLeave={e => {
+            (e.currentTarget as HTMLDivElement).style.background = 'linear-gradient(135deg, #1677ff14, #1677ff08)';
+            (e.currentTarget as HTMLDivElement).style.borderColor = '#1677ff30';
+          }}
+        >
+          <BarChartOutlined style={{ color: '#1677ff', fontSize: 16 }} />
+          <span style={{ fontSize: 13, color: '#1677ff', fontWeight: 500 }}>数据管理</span>
+        </div>
+      </Tooltip>
 
       {/* 新建分组对话框 */}
       <Modal
