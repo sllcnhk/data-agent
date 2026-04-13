@@ -65,6 +65,34 @@ class TestChannelRequest(BaseModel):
 # 辅助函数
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _validate_cron(expr: str) -> None:
+    """
+    基础 5-field cron 表达式校验。
+    格式：minute(0-59) hour(0-23) dom(1-31) month(1-12) dow(0-7)
+    每个字段支持: * / - , 整数
+    """
+    parts = expr.strip().split()
+    if len(parts) != 5:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="cron_expr 必须是标准 5-field cron 表达式，如 '0 9 * * 1'",
+        )
+    # 使用 APScheduler 本身做语法验证（不启动）
+    try:
+        from apscheduler.triggers.cron import CronTrigger
+        CronTrigger.from_crontab(expr)
+    except Exception:
+        # fallback: accept if APScheduler not available (let scheduler fail later)
+        import re
+        allowed = re.compile(r'^[\d\*\/\-\,]+$')
+        for p in parts:
+            if not allowed.match(p):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"cron_expr 字段无效: {p!r}",
+                )
+
+
 def _get_sr_or_404(schedule_id: str, db: Session) -> ScheduledReport:
     """验证 UUID 格式，查询 DB，若不存在则抛出 404。"""
     try:
@@ -108,11 +136,7 @@ async def create_schedule(
     - 创建成功后立即注册到 APScheduler
     """
     # 验证 cron 表达式
-    if len(req.cron_expr.split()) != 5:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="cron_expr 必须是标准 5-field cron 表达式，如 '0 9 * * 1'",
-        )
+    _validate_cron(req.cron_expr)
 
     username = getattr(current_user, "username", "default")
 
@@ -236,11 +260,8 @@ async def update_schedule(
     _check_sr_ownership(sr, username, is_superadmin)
 
     # 验证新 cron 表达式（若提供）
-    if req.cron_expr is not None and len(req.cron_expr.split()) != 5:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="cron_expr 必须是标准 5-field cron 表达式，如 '0 9 * * 1'",
-        )
+    if req.cron_expr is not None:
+        _validate_cron(req.cron_expr)
 
     old_cron = sr.cron_expr
     old_is_active = sr.is_active

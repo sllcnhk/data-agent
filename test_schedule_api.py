@@ -31,22 +31,28 @@ _PREFIX = f"_sa_{uuid.uuid4().hex[:6]}_"
 
 # ─── APScheduler 模块级 patch ────────────────────────────────────────────────
 # 在导入任何应用代码之前 patch sys.modules，防止 apscheduler 导入失败
+#
+# IMPORTANT: Do NOT use patch.dict("sys.modules", ...) here!
+# patch.dict saves a snapshot of sys.modules at start() time and then CLEARS
+# the entire sys.modules dict on stop(), replacing it with the snapshot.
+# This wipes all backend.* modules and PyO3 C extensions (pydantic_core, bcrypt),
+# which cannot be re-initialized — causing ImportError in subsequent test files.
+# Instead, manually inject mocks and clean up only those keys in teardown.
 
-_scheduler_patcher = patch.dict(
-    "sys.modules",
-    {
-        "apscheduler": MagicMock(),
-        "apscheduler.schedulers": MagicMock(),
-        "apscheduler.schedulers.background": MagicMock(),
-        "apscheduler.triggers": MagicMock(),
-        "apscheduler.triggers.cron": MagicMock(),
-        "apscheduler.jobstores": MagicMock(),
-        "apscheduler.jobstores.sqlalchemy": MagicMock(),
-        "apscheduler.executors": MagicMock(),
-        "apscheduler.executors.pool": MagicMock(),
-    },
-)
-_scheduler_patcher.start()
+_APSCHEDULER_MOCK_KEYS = [
+    "apscheduler",
+    "apscheduler.schedulers",
+    "apscheduler.schedulers.background",
+    "apscheduler.triggers",
+    "apscheduler.triggers.cron",
+    "apscheduler.jobstores",
+    "apscheduler.jobstores.sqlalchemy",
+    "apscheduler.executors",
+    "apscheduler.executors.pool",
+]
+for _key in _APSCHEDULER_MOCK_KEYS:
+    if _key not in sys.modules:
+        sys.modules[_key] = MagicMock()
 
 # ─── auth 设置 patch ─────────────────────────────────────────────────────────
 
@@ -235,7 +241,9 @@ def teardown_module(_=None):
     finally:
         _g_db.close()
 
-    _scheduler_patcher.stop()
+    # Remove only the apscheduler mock keys we injected (safe, targeted cleanup)
+    for _key in _APSCHEDULER_MOCK_KEYS:
+        sys.modules.pop(_key, None)
 
 
 # ─── TestClient 工厂 ──────────────────────────────────────────────────────────

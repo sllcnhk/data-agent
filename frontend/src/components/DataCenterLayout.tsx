@@ -31,8 +31,8 @@ interface MenuItem {
 }
 
 const ALL_MENU_ITEMS: MenuItem[] = [
-  { key: '/data-center/dashboards', icon: <BarChartOutlined />, label: '报表清单' },
-  { key: '/data-center/documents',  icon: <FileTextOutlined />,  label: '报告清单' },
+  { key: '/data-center/dashboards', icon: <BarChartOutlined />, label: '报表清单',  perm: 'reports:read' },
+  { key: '/data-center/documents',  icon: <FileTextOutlined />,  label: '报告清单', perm: 'reports:read' },
   { key: '/data-center/schedules',  icon: <CalendarOutlined />,  label: '推送任务', perm: 'schedules:read' },
 ];
 

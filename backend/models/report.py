@@ -141,6 +141,8 @@ class Report(Base):
     refresh_interval = Column(Integer, nullable=True, comment="刷新间隔(秒)")
 
     # ── 图表报告生成字段（2026-04-13 新增）──────────────────────────────────
+    # 报告类型：dashboard（报表）| document（报告）
+    doc_type = Column(String(20), nullable=False, default="dashboard", comment="报告类型: dashboard | document")
     # 所有者用户名（与 customer_data/{username}/ 路径对应）
     username = Column(String(100), nullable=True, index=True, comment="所有者用户名")
     # 数据刷新令牌（公开可用，无需登录即可刷新图表数据）
@@ -211,6 +213,7 @@ class Report(Base):
             "cache_ttl": self.cache_ttl,
             "tags": self.tags,
             "extra_metadata": self.extra_metadata,
+            "doc_type": self.doc_type,
             "username": self.username,
             "refresh_token": self.refresh_token,
             "report_file_path": self.report_file_path,

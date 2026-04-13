@@ -98,7 +98,9 @@ def _get_report_or_404(report_id: str, db: Session) -> Report:
     return report
 
 
-def _check_ownership(report: Report, username: str) -> None:
+def _check_ownership(report: Report, username: str, is_superadmin: bool = False) -> None:
+    if is_superadmin:
+        return  # superadmin can access all reports
     if report.username and report.username != username:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问该报告")
 
@@ -536,7 +538,7 @@ async def update_report_spec(
     """
     username = getattr(current_user, "username", "default")
     report = _get_report_or_404(report_id, db)
-    _check_ownership(report, username)
+    _check_ownership(report, username, getattr(current_user, "is_superadmin", False))
 
     try:
         html_content = build_report_html(
@@ -587,7 +589,7 @@ async def update_report_share(
     """
     username = getattr(current_user, "username", "default")
     report = _get_report_or_404(report_id, db)
-    _check_ownership(report, username)
+    _check_ownership(report, username, getattr(current_user, "is_superadmin", False))
 
     try:
         report.share_scope = req.share_scope
@@ -615,7 +617,7 @@ async def create_report_copilot(
 
     username = getattr(current_user, "username", "default")
     report = _get_report_or_404(report_id, db)
-    _check_ownership(report, username)
+    _check_ownership(report, username, getattr(current_user, "is_superadmin", False))
 
     copilot_system_prompt = (
         f"[Co-pilot 模式] 当前报表：{report.name}\n"
@@ -654,7 +656,7 @@ async def get_report(
 ):
     username = getattr(current_user, "username", "default")
     report = _get_report_or_404(report_id, db)
-    _check_ownership(report, username)
+    _check_ownership(report, username, getattr(current_user, "is_superadmin", False))
     return {"success": True, "data": _report_to_dict(report)}
 
 
@@ -666,7 +668,7 @@ async def delete_report(
 ):
     username = getattr(current_user, "username", "default")
     report = _get_report_or_404(report_id, db)
-    _check_ownership(report, username)
+    _check_ownership(report, username, getattr(current_user, "is_superadmin", False))
 
     # 删除本地 HTML 文件
     if report.report_file_path:
@@ -688,7 +690,7 @@ async def get_summary_status(
 ):
     username = getattr(current_user, "username", "default")
     report = _get_report_or_404(report_id, db)
-    _check_ownership(report, username)
+    _check_ownership(report, username, getattr(current_user, "is_superadmin", False))
     return {
         "success": True,
         "data": {
@@ -727,7 +729,7 @@ async def export_report(
     """
     username = getattr(current_user, "username", "default")
     report = _get_report_or_404(report_id, db)
-    _check_ownership(report, username)
+    _check_ownership(report, username, getattr(current_user, "is_superadmin", False))
 
     if req.format not in ("pdf", "pptx"):
         raise HTTPException(400, "format 必须是 pdf 或 pptx")
@@ -766,7 +768,7 @@ async def get_export_status(
     username = getattr(current_user, "username", "default")
     # 验证报告归属（防止跨用户查询）
     report = _get_report_or_404(report_id, db)
-    _check_ownership(report, username)
+    _check_ownership(report, username, getattr(current_user, "is_superadmin", False))
 
     job = _export_jobs.get(job_id)
     if not job or job["report_id"] != report_id:

@@ -13,6 +13,7 @@ import {
   ImportOutlined,
   ExportOutlined,
   BarChartOutlined,
+  DatabaseOutlined,
 } from '@ant-design/icons';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from '@/store/useAuthStore';
@@ -40,8 +41,9 @@ const ALL_MENU_ITEMS: MenuItem[] = [
   { key: '/skills',      icon: <ToolOutlined />,          label: '技能中心', perm: 'skills.user:read' },
   { key: '/users',       icon: <TeamOutlined />,          label: '用户管理', perm: 'users:read' },
   { key: '/roles',       icon: <SafetyOutlined />,        label: '角色权限', perm: 'users:read' },
-  { key: '/reports',     icon: <BarChartOutlined />,      label: '图表报告', perm: 'reports:read' },
-  { key: '/data-import', icon: <ImportOutlined />,         label: '数据导入', perm: 'data:import' },
+  { key: '/reports',      icon: <BarChartOutlined />,      label: '图表报告', perm: 'reports:read' },
+  { key: '/data-center',  icon: <DatabaseOutlined />,      label: '数据管理中心', perm: 'reports:read' },
+  { key: '/data-import',  icon: <ImportOutlined />,        label: '数据导入', perm: 'data:import' },
   { key: '/data-export', icon: <ExportOutlined />,         label: '数据导出', perm: 'data:export' },
   { key: '/logs',        icon: <FileTextOutlined />,      label: '日志查看' },
 ];

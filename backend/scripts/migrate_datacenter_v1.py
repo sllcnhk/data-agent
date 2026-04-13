@@ -90,6 +90,52 @@ def run():
         else:
             logger.info("  ~ reports.version_seq already exists")
 
+        if not _col_exists(conn, "reports", "username"):
+            conn.execute(text(
+                "ALTER TABLE reports ADD COLUMN username VARCHAR(100)"
+            ))
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_reports_username ON reports (username)"
+            ))
+            logger.info("  + reports.username")
+        else:
+            logger.info("  ~ reports.username already exists")
+
+        if not _col_exists(conn, "reports", "refresh_token"):
+            conn.execute(text(
+                "ALTER TABLE reports ADD COLUMN refresh_token VARCHAR(64)"
+            ))
+            conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_reports_refresh_token ON reports (refresh_token) WHERE refresh_token IS NOT NULL"
+            ))
+            logger.info("  + reports.refresh_token")
+        else:
+            logger.info("  ~ reports.refresh_token already exists")
+
+        if not _col_exists(conn, "reports", "report_file_path"):
+            conn.execute(text(
+                "ALTER TABLE reports ADD COLUMN report_file_path TEXT"
+            ))
+            logger.info("  + reports.report_file_path")
+        else:
+            logger.info("  ~ reports.report_file_path already exists")
+
+        if not _col_exists(conn, "reports", "llm_summary"):
+            conn.execute(text(
+                "ALTER TABLE reports ADD COLUMN llm_summary TEXT"
+            ))
+            logger.info("  + reports.llm_summary")
+        else:
+            logger.info("  ~ reports.llm_summary already exists")
+
+        if not _col_exists(conn, "reports", "summary_status"):
+            conn.execute(text(
+                "ALTER TABLE reports ADD COLUMN summary_status VARCHAR(20) DEFAULT 'pending'"
+            ))
+            logger.info("  + reports.summary_status")
+        else:
+            logger.info("  ~ reports.summary_status already exists")
+
         # ── 2-4. 新建三张表（若不存在）─────────────────────────────────────
         logger.info("[2/4] Creating 'scheduled_reports' table ...")
         Base.metadata.tables["scheduled_reports"].create(bind=engine, checkfirst=True)
