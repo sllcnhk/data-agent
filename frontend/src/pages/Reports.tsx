@@ -44,6 +44,8 @@ interface ReportItem {
   name: string;
   description?: string;
   report_file_path?: string;
+  refresh_token?: string;
+  html_url?: string;
   download_url?: string;
   theme: string;
   summary_status?: string;
@@ -230,12 +232,12 @@ const Reports: React.FC = () => {
               </Button>
             </Tooltip>
           )}
-          {record.download_url && (
+          {(record.download_url || record.report_file_path) && (
             <Tooltip title="下载 HTML">
               <Button
                 size="small"
                 icon={<DownloadOutlined />}
-                onClick={() => window.open(window.location.origin + record.download_url, '_blank')}
+                onClick={() => window.open(window.location.origin + (record.download_url || ''), '_blank')}
               >
                 HTML
               </Button>
@@ -317,7 +319,8 @@ const Reports: React.FC = () => {
           open={!!previewReport}
           onClose={() => setPreviewReport(null)}
           reportId={previewReport.id}
-          filePath={previewReport.report_file_path || ''}
+          refreshToken={previewReport.refresh_token}
+          filePath={previewReport.report_file_path}
           fileName={previewReport.name + '.html'}
         />
       )}

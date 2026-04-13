@@ -131,6 +131,7 @@ const FileDownloadCards: React.FC<{ files: FileInfo[] }> = ({ files }) => {
           open={!!previewFile}
           onClose={() => setPreviewFile(null)}
           reportId={(previewFile as any).report_id}
+          refreshToken={(previewFile as any).refresh_token}
           filePath={previewFile.path}
           fileName={previewFile.name}
         />

@@ -382,6 +382,218 @@ class TestI_RoutesReachable(unittest.TestCase):
         self._no_server_error(res)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# J — GET /reports/{id}/html  &  GET /reports/html-serve
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _WorkingMockQuery:
+    """能正确按 UUID filter 的 MockQuery（用于 J 组测试）。"""
+
+    def __init__(self, store: dict):
+        self._store = store
+        self._target_id: str | None = None
+        self._offset: int = 0
+        self._limit: int | None = None
+
+    def filter(self, *args):
+        for filt in args:
+            try:
+                self._target_id = str(filt.right.value)
+            except AttributeError:
+                pass
+        return self
+
+    def first(self):
+        if self._target_id:
+            return self._store.get(self._target_id)
+        return None
+
+    def count(self):
+        return len(self._store)
+
+    def order_by(self, *args):
+        return self
+
+    def offset(self, n):
+        self._offset = n
+        return self
+
+    def limit(self, n):
+        self._limit = n
+        return self
+
+    def all(self):
+        items = list(self._store.values())
+        items = items[self._offset:]
+        if self._limit is not None:
+            items = items[: self._limit]
+        return items
+
+
+class _WorkingMockSession:
+    """能正确按 UUID filter 的 MockSession（用于 J 组测试）。"""
+
+    def __init__(self):
+        self._store: dict = {}
+
+    def query(self, model, *_):
+        return _WorkingMockQuery(self._store)
+
+    def add(self, obj):
+        self._store[str(obj.id)] = obj
+
+    def commit(self): pass
+
+    def refresh(self, obj): pass
+
+    def delete(self, obj):
+        self._store.pop(str(obj.id), None)
+
+    def rollback(self): pass
+
+    def close(self): pass
+
+
+class TestJ_HtmlEndpoints(unittest.TestCase):
+    """
+    J1–J9：验证新增的 GET /reports/{id}/html 和 GET /reports/html-serve 端点。
+
+    J1  有效 refresh_token → 200 text/html
+    J2  无效 refresh_token → 403
+    J3  不存在的 report_id → 404
+    J4  缺少 token 参数   → 422
+    J5  download=true     → 200 + Content-Disposition: attachment
+    J6  文件已被删除       → 404
+    J7  html-serve: ENABLE_AUTH=false + 有效路径 → 200 text/html
+    J8  html-serve: 文件不存在 → 404
+    J9  html-serve: 缺少 path 参数 → 422
+    """
+
+    # 专用临时目录（与 E 组隔离）
+    _tmpdir: Path
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmpdir = Path(tempfile.mkdtemp(prefix="test_report_J_"))
+
+        # 专用 mock session（真正按 UUID 查找）
+        cls._session = _WorkingMockSession()
+        cls._store = cls._session._store
+
+        # 构建专用 FastAPI app
+        from fastapi import FastAPI as _FA
+        cls._j_app = _FA()
+        cls._j_app.include_router(reports_router, prefix="/api/v1")
+        cls._j_app.dependency_overrides[get_db] = lambda: cls._session
+        cls._j_app.dependency_overrides[get_current_user] = _get_anon_user
+        cls._client = TestClient(cls._j_app, raise_server_exceptions=False)
+
+        # patch _CUSTOMER_DATA_ROOT → 临时目录
+        cls._patcher = patch("backend.api.reports._CUSTOMER_DATA_ROOT", cls._tmpdir)
+        cls._patcher.start()
+
+        # 创建测试报告（HTML 文件写到临时目录）
+        cls.report_id = str(uuid.uuid4())
+        cls.refresh_token = "valid_refresh_token_abc_xyz_12345678"
+
+        report_dir = cls._tmpdir / "default" / "reports"
+        report_dir.mkdir(parents=True, exist_ok=True)
+        cls._html_file = report_dir / "test_j.html"
+        cls._html_file.write_text(
+            "<!DOCTYPE html><html><body>Test J Report</body></html>",
+            encoding="utf-8",
+        )
+        rel_path = str(cls._html_file.relative_to(cls._tmpdir))
+
+        rpt = Report(
+            id=uuid.UUID(cls.report_id),
+            name="J 组测试报告",
+            username="default",
+            refresh_token=cls.refresh_token,
+            report_file_path=rel_path,
+            charts=[],
+            data_sources=[],
+        )
+        cls._store[cls.report_id] = rpt
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._patcher.stop()
+        shutil.rmtree(cls._tmpdir, ignore_errors=True)
+
+    # ── GET /reports/{id}/html ────────────────────────────────────────────────
+
+    def test_J1_valid_token_returns_html(self):
+        res = self._client.get(
+            f"/api/v1/reports/{self.report_id}/html?token={self.refresh_token}"
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertIn("text/html", res.headers.get("content-type", ""))
+        self.assertIn("Test J Report", res.text)
+
+    def test_J2_invalid_token_returns_403(self):
+        res = self._client.get(
+            f"/api/v1/reports/{self.report_id}/html?token=WRONG_TOKEN"
+        )
+        self.assertEqual(res.status_code, 403, res.text)
+
+    def test_J3_nonexistent_report_returns_404(self):
+        res = self._client.get(
+            f"/api/v1/reports/{uuid.uuid4()}/html?token={self.refresh_token}"
+        )
+        self.assertEqual(res.status_code, 404, res.text)
+
+    def test_J4_missing_token_returns_422(self):
+        res = self._client.get(f"/api/v1/reports/{self.report_id}/html")
+        self.assertEqual(res.status_code, 422, res.text)
+
+    def test_J5_download_true_has_content_disposition(self):
+        res = self._client.get(
+            f"/api/v1/reports/{self.report_id}/html?token={self.refresh_token}&download=true"
+        )
+        self.assertEqual(res.status_code, 200, res.text)
+        cd = res.headers.get("content-disposition", "")
+        self.assertIn("attachment", cd)
+
+    def test_J6_file_deleted_returns_404(self):
+        """删除文件后，端点应返回 404（文件不存在）。"""
+        rid = str(uuid.uuid4())
+        token = "token_for_missing_file_test"
+        rpt = Report(
+            id=uuid.UUID(rid),
+            name="文件已删除报告",
+            username="default",
+            refresh_token=token,
+            report_file_path="default/reports/missing.html",
+            charts=[],
+            data_sources=[],
+        )
+        self._store[rid] = rpt
+        res = self._client.get(f"/api/v1/reports/{rid}/html?token={token}")
+        self.assertEqual(res.status_code, 404, res.text)
+        del self._store[rid]
+
+    # ── GET /reports/html-serve ───────────────────────────────────────────────
+
+    def test_J7_html_serve_no_auth_returns_html(self):
+        """ENABLE_AUTH=false 时 html-serve 跳过 token 验证，直接返回文件。"""
+        # 文件路径相对 customer_data 根：default/reports/test_j.html
+        rel = "default/reports/test_j.html"
+        res = self._client.get(f"/api/v1/reports/html-serve?path={rel}")
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertIn("text/html", res.headers.get("content-type", ""))
+        self.assertIn("Test J Report", res.text)
+
+    def test_J8_html_serve_missing_file_returns_404(self):
+        rel = "default/reports/nonexistent_xyz.html"
+        res = self._client.get(f"/api/v1/reports/html-serve?path={rel}")
+        self.assertEqual(res.status_code, 404, res.text)
+
+    def test_J9_html_serve_missing_path_returns_422(self):
+        res = self._client.get("/api/v1/reports/html-serve")
+        self.assertEqual(res.status_code, 422, res.text)
+
+
 if __name__ == "__main__":
     import pytest, sys
     sys.exit(pytest.main([__file__, "-v", "-s"]))

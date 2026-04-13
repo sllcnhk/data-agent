@@ -34,10 +34,12 @@ const API_BASE = (import.meta.env.VITE_API_BASE_URL || '/api/v1') as string;
 interface ReportPreviewModalProps {
   open: boolean;
   onClose: () => void;
-  /** report_id（来自 POST /reports/build 返回） */
+  /** report_id（来自 POST /reports/build 或 GET /reports 响应） */
   reportId?: string;
-  /** HTML 文件下载路径（customer_data/xxx/reports/xxx.html） */
-  filePath: string;
+  /** refresh_token（来自 GET /reports 响应，配合 reportId 使用无需 JWT） */
+  refreshToken?: string;
+  /** HTML 文件路径（customer_data/xxx/reports/xxx.html）；无 refreshToken 时用 JWT 访问 */
+  filePath?: string;
   fileName: string;
 }
 
@@ -47,6 +49,7 @@ const ReportPreviewModal: React.FC<ReportPreviewModalProps> = ({
   open,
   onClose,
   reportId,
+  refreshToken,
   filePath,
   fileName,
 }) => {
@@ -59,10 +62,23 @@ const ReportPreviewModal: React.FC<ReportPreviewModalProps> = ({
   const [exportDownloadUrl, setExportDownloadUrl] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // HTML 文件通过 /files/download 代理，附带 token
-  const iframeSrc = filePath
-    ? `${API_BASE}/files/download?path=${encodeURIComponent(filePath)}${accessToken ? `&access_token=${accessToken}` : ''}`
-    : '';
+  /**
+   * iframe src 构造规则：
+   * 优先：reportId + refreshToken → /reports/{id}/html?token=  （无需 JWT，适合列表页预览）
+   * 降级：filePath + accessToken  → /reports/html-serve?path=&token=  （JWT 作为 query param，适合聊天页预览）
+   *
+   * 说明：浏览器加载 iframe src 时不会附带 Authorization header，
+   *       因此两个端点都接受 query param 形式的 token。
+   */
+  const iframeSrc = (() => {
+    if (reportId && refreshToken) {
+      return `${API_BASE}/reports/${reportId}/html?token=${encodeURIComponent(refreshToken)}`;
+    }
+    if (filePath) {
+      return `${API_BASE}/reports/html-serve?path=${encodeURIComponent(filePath)}${accessToken ? `&token=${encodeURIComponent(accessToken)}` : ''}`;
+    }
+    return '';
+  })();
 
   // 重置状态
   useEffect(() => {

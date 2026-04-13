@@ -22,13 +22,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 import secrets
 
 from backend.api.deps import get_current_user, require_permission
+from backend.core.auth.jwt import decode_token
 from backend.config.database import get_db
 from backend.config.settings import settings
 from backend.models.report import Report
@@ -380,6 +381,114 @@ async def list_reports(
     }
 
 
+@router.get("/html-serve")
+async def serve_report_html_by_path(
+    path: str = Query(..., description="文件路径（含或不含 customer_data/ 前缀均可）"),
+    token: str = Query("", description="JWT access token（iframe 场景下无法发 Authorization header，以此替代）"),
+    db: Session = Depends(get_db),
+):
+    """
+    为 iframe 预览提供的报告 HTML 服务端点（JWT 以 query param 方式鉴权）。
+
+    浏览器加载 iframe src 时不发送自定义 Authorization header，因此以 query param
+    传递 JWT 进行验证。路径必须属于当前用户的 customer_data/{username}/ 目录。
+
+    ENABLE_AUTH=false 时跳过 token 验证（单用户模式）。
+    """
+    if settings.enable_auth:
+        if not token:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未登录，请先登录")
+        payload = decode_token(token, settings.jwt_secret, settings.jwt_algorithm)
+        if not payload:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token 无效或已过期")
+
+        from backend.models.user import User
+        user_id = payload.get("sub")
+        user = db.query(User).filter(User.id == user_id, User.is_active == True).first()  # noqa: E712
+        if not user:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户不存在")
+
+        username = user.username
+    else:
+        username = "default"
+
+    # 解析路径（兼容含/不含 customer_data/ 前缀两种格式）
+    normalized = path.replace("\\", "/")
+    customer_data_name = _CUSTOMER_DATA_ROOT.name
+    if normalized.startswith(customer_data_name + "/"):
+        rel = normalized[len(customer_data_name) + 1:]
+    else:
+        rel = normalized
+
+    abs_path = (_CUSTOMER_DATA_ROOT / rel).resolve()
+
+    # 所有权验证：文件必须在 customer_data/{username}/ 下
+    if settings.enable_auth:
+        user_root = (_CUSTOMER_DATA_ROOT / username).resolve()
+        try:
+            abs_path.relative_to(user_root)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问此文件")
+
+    if not abs_path.exists() or not abs_path.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文件不存在")
+
+    try:
+        content = abs_path.read_text(encoding="utf-8")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"文件读取失败: {e}")
+
+    return HTMLResponse(content=content)
+
+
+@router.get("/{report_id}/html")
+async def serve_report_html_by_token(
+    report_id: str,
+    token: str = Query(..., description="Report.refresh_token（无需登录）"),
+    download: bool = Query(False, description="True 时以附件方式下载而非内嵌预览"),
+    db: Session = Depends(get_db),
+):
+    """
+    通过 refresh_token 访问报告 HTML（无需 JWT）。
+
+    适用场景：
+    - 报告列表页「预览」按钮（refresh_token 来自 GET /reports 响应）
+    - 报告列表页「下载 HTML」按钮（download=true）
+    - 将报告嵌入邮件/文档，允许无账号人员访问
+    """
+    try:
+        uid = uuid.UUID(report_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="无效的报告 ID")
+
+    report = db.query(Report).filter(Report.id == uid).first()
+    if not report:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="报告不存在")
+    if not secrets.compare_digest(report.refresh_token or "", token):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无效的刷新令牌")
+
+    if not report.report_file_path:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="报告文件路径未记录")
+
+    file_path = (_CUSTOMER_DATA_ROOT / report.report_file_path).resolve()
+    if not file_path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="报告文件不存在（可能已被删除）")
+
+    try:
+        content = file_path.read_text(encoding="utf-8")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"文件读取失败: {e}")
+
+    headers = {}
+    if download:
+        filename = file_path.name
+        import urllib.parse
+        encoded = urllib.parse.quote(filename)
+        headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{encoded}"
+
+    return HTMLResponse(content=content, headers=headers)
+
+
 @router.get("/{report_id}")
 async def get_report(
     report_id: str,
@@ -434,8 +543,12 @@ async def get_summary_status(
 
 def _report_to_dict(r: Report) -> Dict:
     d = r.to_dict()
-    # 补充下载 URL（前端用于打开 HTML 文件）
-    if r.report_file_path:
+    # 补充预览/下载 URL（前端通过 refresh_token 访问，无需 JWT）
+    if r.report_file_path and r.refresh_token:
+        d["html_url"] = f"/api/v1/reports/{r.id}/html?token={r.refresh_token}"
+        d["download_url"] = f"/api/v1/reports/{r.id}/html?token={r.refresh_token}&download=true"
+    elif r.report_file_path:
+        # 兜底：无 refresh_token 的旧记录仍提供文件路径下载
         d["download_url"] = f"/api/v1/files/download?path={r.report_file_path}"
     return d
 
