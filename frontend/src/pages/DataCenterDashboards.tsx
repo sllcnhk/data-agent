@@ -32,7 +32,6 @@ import {
 import { useAuthStore } from '@/store/useAuthStore';
 import ReportPreviewModal from '../components/chat/ReportPreviewModal';
 import DataCenterCopilot from '../components/DataCenterCopilot';
-import { useEffect } from 'react';
 
 const { Title, Text } = Typography;
 
@@ -100,7 +99,7 @@ const DataCenterDashboards: React.FC = () => {
 
   useEffect(() => {
     fetchReports(page);
-  }, [page]);
+  }, [page, fetchReports]);
 
   // 处理来自独立 HTML 标签页的 autoPilot 参数（B2 注入的按钮打开新标签后落地）
   useEffect(() => {

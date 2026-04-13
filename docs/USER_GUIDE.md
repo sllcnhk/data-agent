@@ -1,7 +1,7 @@
 # 数据智能体系统 — 核心使用手册
 
-**文档版本**: v2.8
-**适用系统版本**: P0 + P1 + P2 + P3 + 3-Tier Skill System + Semantic Skill Routing + RBAC + 角色管理页面 + 推理过程持久化 + ContinuationCard + ClickHouse 动态多区域配置 + Session 过期管理 + 对话打断（停止生成）+ 对话附件上传 + 用户技能目录隔离修复 + 对话用户隔离 + 侧边栏 Tab UI + 只读模式 + is_shared 群组框架 + 技能路由可视化 + 文件写入下载 + **Excel → ClickHouse 数据导入**（2026-04-05）+ **Skill 用户使用权限隔离 T1–T6**（2026-04-08）+ **多图表 HTML 报告生成**（2026-04-13）+ **数据管理中心 + 定时推送任务**（2026-04-13）
+**文档版本**: v2.9
+**适用系统版本**: P0 + P1 + P2 + P3 + 3-Tier Skill System + Semantic Skill Routing + RBAC + 角色管理页面 + 推理过程持久化 + ContinuationCard + ClickHouse 动态多区域配置 + Session 过期管理 + 对话打断（停止生成）+ 对话附件上传 + 用户技能目录隔离修复 + 对话用户隔离 + 侧边栏 Tab UI + 只读模式 + is_shared 群组框架 + 技能路由可视化 + 文件写入下载 + **Excel → ClickHouse 数据导入**（2026-04-05）+ **Skill 用户使用权限隔离 T1–T6**（2026-04-08）+ **多图表 HTML 报告生成**（2026-04-13）+ **数据管理中心 + 定时推送任务**（2026-04-13）+ **AI Pilot 实时助手 + 对话模型切换**（2026-04-14）
 **读者对象**: 数据工程师、数据分析师、系统管理员
 
 ---
@@ -22,7 +22,7 @@
 12. [Excel → ClickHouse 数据导入（superadmin 专属）](#12-excel--clickhouse-数据导入superadmin-专属)
 13. [SQL → Excel 数据导出（superadmin 专属）](#13-sql--excel-数据导出superadmin-专属)
 14. [多图表 HTML 报告生成](#14-多图表-html-报告生成)
-15. [数据管理中心](#15-数据管理中心)（含 15.4 推送任务 + 15.5 Co-pilot 技能）
+15. [数据管理中心](#15-数据管理中心)（含 15.4 推送任务 + 15.5 Co-pilot 技能 + 15.7 AI Pilot 实时助手）
 
 ---
 
@@ -2669,7 +2669,8 @@ _ETL_KEYWORDS = frozenset({
 
 | 操作 | 说明 |
 |------|------|
-| 预览 | 在弹窗 iframe 中全屏展示 HTML 报表，支持实时数据刷新和筛选器交互 |
+| 预览 | 在弹窗 iframe 中全屏展示 HTML 报表，支持实时数据刷新和筛选器交互；右下角悬浮 AI Pilot 按钮可打开对话侧边面板 |
+| AI 助手 | 打开 AI Pilot 对话面板，针对当前报表进行自然语言修改（支持模型切换）|
 | 下载 | 下载本地 HTML 文件 |
 | PDF/PPTX 导出 | 调用导出接口生成文档（需等待后台任务完成） |
 | 删除 | 删除 DB 记录和磁盘 HTML 文件（需 `reports:delete` 权限）|
@@ -2683,7 +2684,8 @@ _ETL_KEYWORDS = frozenset({
 | 操作 | 说明 |
 |------|------|
 | 查看详情 | 展开报告详情页，含 LLM 摘要和报告元数据 |
-| 预览 | iframe 全屏预览 HTML 内容 |
+| 预览 | iframe 全屏预览 HTML 内容；右下角悬浮 AI Pilot 按钮可打开对话侧边面板 |
+| AI | 打开 AI Pilot 对话面板，针对当前报告进行自然语言修改（支持模型切换）|
 | PDF/PPTX 导出 | 同报表清单，支持 PDF 和 PPTX 两种格式 |
 | 删除 | 同上 |
 
@@ -2741,7 +2743,7 @@ _ETL_KEYWORDS = frozenset({
 
 ### 15.5 通过 Co-pilot 管理报表和推送任务
 
-数据管理中心内嵌 Co-pilot 面板（`/data-center/schedules`「AI 助手」入口），可通过自然语言完成：
+数据管理中心每个报表/报告/推送任务卡片均有「AI 助手」按钮，点击后打开右侧 Co-pilot 抽屉面板，可通过自然语言完成：
 
 - **创建定时任务**：「帮我创建一个每周一早上 9 点发送销售报告的推送任务，发送到邮件 a@b.com」
   - 触发 `create-schedule.md` skill → AI 自动调用 `POST /scheduled-reports`
@@ -2751,6 +2753,47 @@ _ETL_KEYWORDS = frozenset({
   - 触发 `update-report.md` skill → AI 自动调用 `PUT /reports/{id}/spec`
 
 > **提示**：如果 AI 不自动触发上述 skill，可在消息中明确说「推送任务」「定时发送」「更新报表」等关键词，帮助路由到正确的 Co-pilot skill。
+
+### 15.7 AI Pilot 实时助手（v2.9）
+
+**AI Pilot** 是数据管理中心的嵌入式 AI 对话助手，支持在报表/报告/推送任务的预览或独立浏览器标签页中随时唤起。
+
+#### 入口方式
+
+| 场景 | 入口 | 触发机制 |
+|------|------|---------|
+| 列表页卡片 | 「AI 助手」按钮 | 打开右侧 `DataCenterCopilot` Drawer 面板（380px） |
+| 预览弹窗内 | 预览 Modal 右下角悬浮绿色圆形按钮 | 打开弹窗内嵌 Pilot 侧边面板（CSS 滑入，380px，与 iframe 并排）|
+| 独立浏览器标签页（报表/报告）| HTML 右下角注入的悬浮 🤖 按钮 | 检测到非 iframe 时，打开 `/data-center/dashboards?autoPilot={id}`（报告为 `/data-center/documents?autoPilot={id}`），目标页面自动唤起 Co-pilot Drawer |
+| 独立浏览器标签页（报告）| 同上 | 打开 `/data-center/documents?autoPilot={id}`，自动匹配报告并唤起 |
+| 推送任务执行历史 Drawer | 历史 Drawer 右下角悬浮按钮 | 打开对应推送任务的 Co-pilot Drawer |
+
+> HTML 报表/报告在 iframe 内时，Pilot 按钮通过 `window.parent.postMessage({type:'openPilot', reportId})` 通知外层 `ReportPreviewModal` 打开侧边面板，无需页面跳转。
+
+#### 对话模型切换
+
+Pilot 面板顶部绿色上下文栏的右侧有一个小型模型选择器（**ModelSelectorMini**），可切换 Co-pilot 使用的 LLM：
+
+- 自动从 `/api/v1/llm-configs?enabled_only=true` 加载当前系统已启用的模型配置
+- 宽度 130px，无边框（borderless）风格，不占用主要视觉空间
+- 切换后调用 `PUT /conversations/{id}` 更新 `current_model` 字段，后续消息使用新模型
+- 刷新页面后模型设置随对话 ID 一同保留（存储于 `conversations.current_model`）
+
+#### Pilot 与 Co-pilot 的区别
+
+| 维度 | Co-pilot（列表页 AI 助手）| AI Pilot（预览/独立标签页）|
+|------|--------------------------|---------------------------|
+| 位置 | 右侧 Drawer，独立于预览 | 预览弹窗内嵌侧边面板 / 独立标签页落地页 |
+| 上下文注入 | 前端从 contextSpec 构建系统提示 | 同上（同一 `DataCenterCopilotContent` 组件）|
+| 模型切换 | ✅ | ✅ |
+| 进入路径 | 卡片「AI 助手」按钮 | 预览 FAB / HTML 注入按钮 / autoPilot URL 参数 |
+
+#### RBAC
+
+AI Pilot 复用现有权限：
+- 报表/报告 Pilot：需要 `reports:read`（analyst+）
+- 推送任务 Pilot：需要 `schedules:read`（analyst+）
+- `POST /reports/{id}/copilot`、`POST /scheduled-reports/{id}/copilot` 均有 ownership 校验，用户只能对自己的报表/任务发起 Pilot 对话
 
 ### 15.6 RBAC 权限说明
 
@@ -2765,4 +2808,4 @@ _ETL_KEYWORDS = frozenset({
 
 ---
 
-*文档由 Claude Sonnet 4.6 生成 · data-agent v2.8 · 2026-04-13（新增：第 15 节 数据管理中心（DataCenter + 定时推送任务）；版本号升至 v2.8；权限列表新增 reports:*/schedules:* 共 6 条；全文权限计数更新为 18 条；目录新增第 15 节链接；DEPLOYMENT.md 新增 SMTP 通知环境变量与 migrate_datacenter_v1.py 部署步骤）*
+*文档由 Claude Sonnet 4.6 生成 · data-agent v2.9 · 2026-04-14（新增：第 15.7 节 AI Pilot 实时助手（ReportPreviewModal 侧边面板 + HTML 注入悬浮按钮 + autoPilot URL + ModelSelectorMini 模型切换 + 推送任务历史 Drawer FAB）；15.2/15.3 操作表增 AI 助手列；版本号升至 v2.9；v2.8 · 2026-04-13：数据管理中心 + 定时推送任务）*

@@ -436,25 +436,29 @@ class TestIHtmlInjectionDocType(unittest.TestCase):
         from backend.api.reports import _inject_pilot_button
         return _inject_pilot_button(html, report_id, doc_type=doc_type)
 
-    # I1: dashboard 类型注入 /data-center/dashboards URL
+    # I1: dashboard 类型注入 page='dashboards'（JS 变量）
     def test_I1_dashboard_injects_dashboards_url(self):
         html = "<html><body><h1>Dashboard</h1></body></html>"
         rid = str(uuid.uuid4())
         result = self._inject(html, rid, doc_type="dashboard")
-        self.assertIn("/data-center/dashboards", result,
-                      "dashboard 报表注入按钮应链接到 /data-center/dashboards")
-        self.assertNotIn("/data-center/documents", result,
-                         "dashboard 报表不应链接到 /data-center/documents")
+        # 注入的 JS 使用 var page = 'dashboards' 拼接 URL
+        self.assertIn("'dashboards'", result,
+                      "dashboard 报表注入 JS 应包含 page = 'dashboards'")
+        self.assertNotIn("'documents'", result,
+                         "dashboard 报表注入 JS 不应包含 'documents'")
+        self.assertIn("/data-center/", result,
+                      "注入 JS 应包含 /data-center/ URL 前缀")
 
-    # I2: document 类型注入 /data-center/documents URL（Bug2 修复）
+    # I2: document 类型注入 page='documents'（Bug2 修复）
     def test_I2_document_injects_documents_url(self):
         html = "<html><body><h1>Document</h1></body></html>"
         rid = str(uuid.uuid4())
         result = self._inject(html, rid, doc_type="document")
-        self.assertIn("/data-center/documents", result,
-                      "Bug2 修复: document 报告注入按钮应链接到 /data-center/documents")
-        self.assertNotIn("/data-center/dashboards", result,
-                         "Bug2 修复: document 报告不应链接到 /data-center/dashboards")
+        # 注入的 JS 使用 var page = 'documents' 拼接 URL
+        self.assertIn("'documents'", result,
+                      "Bug2 修复: document 报告注入 JS 应包含 page = 'documents'")
+        self.assertNotIn("'dashboards'", result,
+                         "Bug2 修复: document 报告注入 JS 不应包含 'dashboards'")
 
     # I3: 注入内容包含正确的 report_id
     def test_I3_injection_contains_correct_report_id(self):

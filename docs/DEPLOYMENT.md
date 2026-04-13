@@ -1,6 +1,6 @@
 # 部署指南
 
-> 版本：v2.6 · 2026-04-14（**对话报表手动固定 Pin**：`POST /reports/pin` 端点 + `_detect_report_type` doc_type 检测 + FileDownloadCards 固定按钮 + ReportPreviewModal 弹窗固定按钮；**无 DB 迁移**，复用已有 reports 表 + messages.extra_metadata JSONB；v2.5 · 2026-04-13：**数据管理中心**：`migrate_datacenter_v1.py` DB 迁移（3 张新表 + reports 新增 3 列）；APScheduler 定时推送；4 渠道通知；v2.4 · 2026-04-13：**多图表 HTML 报告生成**：`migrate_reports_enhancement.py` + `migrate_reports_permissions.py` DB 迁移；Playwright Chromium 依赖；ECharts/AntV 多图表 HTML；PDF/PPTX 导出；LLM 报告摘要；v2.3 · 2026-04-08：**Skill 用户使用权限隔离 T1–T6**；无 DB 迁移；v2.2 · 2026-04-07：**SQL→Excel 数据导出**：`migrate_data_export.py`；v2.1 · 2026-04-05：**Excel 数据导入**：`migrate_data_import.py`）
+> 版本：v2.9 · 2026-04-14（**AI Pilot 实时助手**：三入口 Co-pilot（HTML FAB / ReportPreviewModal 内嵌面板 / DataCenter 列表 AI 按钮）；无 DB 迁移，复用 conversations 表；v2.6 · 2026-04-14：**对话报表手动固定 Pin**：`POST /reports/pin` 端点 + `_detect_report_type` doc_type 检测 + FileDownloadCards 固定按钮 + ReportPreviewModal 弹窗固定按钮；**无 DB 迁移**，复用已有 reports 表 + messages.extra_metadata JSONB；v2.5 · 2026-04-13：**数据管理中心**：`migrate_datacenter_v1.py` DB 迁移（3 张新表 + reports 新增 3 列）；APScheduler 定时推送；4 渠道通知；v2.4 · 2026-04-13：**多图表 HTML 报告生成**：`migrate_reports_enhancement.py` + `migrate_reports_permissions.py` DB 迁移；Playwright Chromium 依赖；ECharts/AntV 多图表 HTML；PDF/PPTX 导出；LLM 报告摘要；v2.3 · 2026-04-08：**Skill 用户使用权限隔离 T1–T6**；无 DB 迁移；v2.2 · 2026-04-07：**SQL→Excel 数据导出**：`migrate_data_export.py`；v2.1 · 2026-04-05：**Excel 数据导入**：`migrate_data_import.py`）
 >
 > 本文档说明如何将数据智能分析 Agent 系统从 Windows 开发环境迁移到 Linux 服务器，供团队多人共用。
 
@@ -927,6 +927,13 @@ python backend/scripts/migrate_datacenter_v1.py
 # 新增 POST /reports/pin 端点（需 reports:create 权限，analyst+ 均已有此权限，无需权限更新）
 # 聊天中 Agent 写入 HTML 文件后，文件卡片显示「生成固定报表/报告」按钮，手动点击后入库
 # doc_type 区分：含 class="summary-section" → document（报告），否则 → dashboard（报表）
+
+# v2.9+ AI Pilot 实时助手：无 DB 迁移，纯代码层变更，重启服务即可
+# 新增 POST /api/v1/reports/{id}/copilot 端点（需 reports:read，analyst+ 已有此权限）
+# 新增 POST /api/v1/scheduled-reports/{id}/copilot 端点（需 schedules:read，analyst+ 已有此权限）
+# 三入口：HTML 报告内 FAB 悬浮按钮（postMessage → iframe）、ReportPreviewModal 内嵌侧边面板、DataCenter 列表 AI 按钮
+# autoPilot URL 参数：DataCenterDashboards/DataCenterDocuments 落地时自动打开 Co-pilot Drawer
+# 无新环境变量，无 init_rbac.py 更新需求；升级后验证：test_pilot_e2e.py 27 tests
 
 # 重启服务
 sudo systemctl restart data-agent-backend

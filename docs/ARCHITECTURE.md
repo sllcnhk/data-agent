@@ -2,7 +2,7 @@
 
 > **适用对象**：LLM 模型（Claude Code / 其他 AI）、新加入开发者
 > **目的**：快速理解系统整体架构、模块职责、数据流向和交互接口
-> **最后更新**：2026-04-13（**数据管理中心 + 定时推送任务 v2.5**：`scheduler_service.py` APScheduler + `notify_service.py` 4 渠道通知 + 9 端点 `/scheduled-reports/*` REST API + `DataCenterLayout` + 3 个前端子页面 + 3 个 Co-pilot 技能 + `schedules:read/write/admin` RBAC 权限；`reports` 表新增 `doc_type/scheduled_report_id/version_seq`；`migrate_datacenter_v1.py` DB 迁移；307 重定向 Bug 修复；**v2.4 2026-04-13**：多图表 HTML 报告生成；**2026-04-08**：Skill 用户使用权限隔离 T1–T6；**2026-04-05**：Excel → ClickHouse 数据导入 + 文件写入下载；技能路由可视化；侧边栏 Tab UI + 只读模式 + is_shared；对话用户隔离；对话附件上传；ClickHouse TCP→HTTP 自动回退；对话打断；用户技能目录隔离修复）
+> **最后更新**：2026-04-14（**v2.9 AI Pilot 实时助手**：`ReportPreviewModal` Pilot 侧边面板 + `DataCenterCopilotContent` 提取 + `ModelSelectorMini` 紧凑模型选择器 + `_inject_pilot_button(doc_type)` HTML 注入（按 doc_type 路由 dashboards/documents）+ `POST /reports/{id}/copilot` + `POST /scheduled-reports/{id}/copilot` 端点 + autoPilot URL 参数处理 + 推送任务历史 Drawer FAB；无 DB 迁移；**v2.5 2026-04-13**：数据管理中心 + 定时推送任务；**v2.4 2026-04-13**：多图表 HTML 报告生成；**2026-04-08**：Skill 用户使用权限隔离 T1–T6；**2026-04-05**：Excel → ClickHouse 数据导入 + 文件写入下载）
 
 ---
 
@@ -118,10 +118,11 @@ data-agent/
 │   ├── pages/DataImport.tsx        # ★ Excel 数据导入页面（3步骤向导：选连接/上传→配置Sheet→进度监控；data:import 权限）
 │   ├── pages/DataExport.tsx        # ★ SQL→Excel 数据导出页面（SQL编辑→预览→提交→进度轮询→下载；data:export 权限）
 │   ├── pages/DataCenterLayout.tsx  # ★ 数据管理中心公共布局（侧边导航：报表清单/报告清单/推送任务；reports:read 权限）
-│   ├── pages/DataCenterDashboards.tsx # ★ 报表清单页（dashboard 类型报告管理：预览/下载/删除）
-│   ├── pages/DataCenterDocuments.tsx  # ★ 报告清单页（document 类型报告管理：详情/PDF导出/删除）
-│   ├── pages/DataCenterSchedules.tsx  # ★ 推送任务页（定时任务 CRUD/启停/立即执行/历史/渠道测试）
-│   ├── pages/DataCenterCopilot.tsx    # ★ Co-pilot 面板（嵌入对话入口，快速创建/更新报表推送任务）
+│   ├── pages/DataCenterDashboards.tsx # ★ 报表清单页（dashboard 类型报告管理：预览/下载/删除/AI Pilot）
+│   ├── pages/DataCenterDocuments.tsx  # ★ 报告清单页（document 类型报告管理：详情/PDF导出/删除/AI Pilot）
+│   ├── pages/DataCenterSchedules.tsx  # ★ 推送任务页（定时任务 CRUD/启停/立即执行/历史/渠道测试/AI Pilot FAB）
+│   ├── components/DataCenterCopilot.tsx # ★ Co-pilot 组件（DataCenterCopilotContent + DataCenterCopilot Drawer；含模型切换）
+│   ├── components/ModelSelectorMini.tsx # ★ 紧凑型模型选择器（130px borderless；供 Pilot 面板使用）
 │   ├── services/dataImportApi.ts   # ★ 数据导入 API 客户端（9 个方法，大文件 timeout=10min）
 │   ├── services/dataExportApi.ts   # ★ 数据导出 API 客户端（8 个方法，execute/poll/download/cancel）
 │   ├── store/useChatStore.ts       # Zustand store（消息、审批、续接、isCancelling 状态）
@@ -1119,14 +1120,16 @@ add_or_update_job(sr) — 外部调用入口
   └─ 若 sr.is_active=False → remove_job(str(sr.id))（幂等：job 不存在时静默忽略）
 
 DataCenter 前端数据流
-  ├─ GET /api/v1/reports?doc_type=dashboard → DataCenterDashboards 报表清单
-  ├─ GET /api/v1/reports?doc_type=document  → DataCenterDocuments 报告清单
-  └─ GET/POST/PUT/DELETE /api/v1/scheduled-reports/* → DataCenterSchedules 推送任务
-       ├─ 创建任务 → POST "" → DB 写入 → add_or_update_job(sr) → 注册到 APScheduler
-       ├─ toggle  → PUT /{id}/toggle → DB is_active 翻转 → add/remove job
-       ├─ run-now → POST /{id}/run-now → BackgroundTasks.add_task(_execute_scheduled_report)
-       ├─ history → GET /{id}/history → 查询 schedule_run_logs
-       └─ channel-test → POST /{id}/channels/test → notify_service.send_one(is_test=True)
+  ├─ GET /api/v1/reports?doc_type=dashboard → DataCenterDashboards 报表清单（含 AI 按钮 → DataCenterCopilot Drawer）
+  ├─ GET /api/v1/reports?doc_type=document  → DataCenterDocuments 报告清单（含 AI 按钮 → DataCenterCopilot Drawer）
+  ├─ GET/POST/PUT/DELETE /api/v1/scheduled-reports/* → DataCenterSchedules 推送任务
+  │    ├─ 创建任务 → POST "" → DB 写入 → add_or_update_job(sr) → 注册到 APScheduler
+  │    ├─ toggle  → PUT /{id}/toggle → DB is_active 翻转 → add/remove job
+  │    ├─ run-now → POST /{id}/run-now → BackgroundTasks.add_task(_execute_scheduled_report)
+  │    ├─ history → GET /{id}/history → 查询 schedule_run_logs
+  │    └─ channel-test → POST /{id}/channels/test → notify_service.send_one(is_test=True)
+  ├─ POST /api/v1/reports/{id}/copilot → AI Pilot 对话（报表/报告，v2.9）
+  └─ POST /api/v1/scheduled-reports/{id}/copilot → AI Pilot 对话（推送任务，v2.9）
 ```
 
 **权限设计**：
@@ -1139,6 +1142,70 @@ DataCenter 前端数据流
 | 访问数据管理中心菜单 | `reports:read` | analyst+ |
 
 **数据管理中心菜单入口**：`AppLayout.tsx` → `{ key: '/data-center', perm: 'reports:read' }`（analyst 及以上可见）
+
+---
+
+### 4.22 AI Pilot 实时助手（v2.9，2026-04-14）
+
+**设计动机**：用户在数据管理中心查看报表/报告或推送任务时，希望向 AI 提问（如"帮我修改这张图表"、"总结一下这份报告"）而无需离开当前页面。Pilot 提供三种入口，均复用现有 `conversations` 表，无 DB 迁移。
+
+```
+入口一：HTML 报告内嵌 FAB 悬浮按钮
+  GET /reports/{id}/html?token= → _inject_pilot_button(html_content, report_id, doc_type)
+    ├─ doc_type="dashboard" → page = "dashboards"
+    ├─ doc_type="document"  → page = "documents"
+    └─ 注入 <div class="pilot-fab"> 悬浮按钮
+         ├─ 普通浏览（非 iframe）: window.open('/data-center/{page}?autoPilot={report_id}', '_blank')
+         └─ iframe 内（ReportPreviewModal）: postMessage({type:'openPilot', reportId}, '*')
+               → 父 ReportPreviewModal 监听 → setPilotOpen(true) → 展开侧边面板
+
+入口二：ReportPreviewModal 内嵌 Pilot 面板
+  ReportPreviewModal（全屏 iframe 预览弹窗）
+    ├─ 接受 pilotContext?: { contextType, contextId, contextName, contextSpec?, onSpecUpdated? }
+    ├─ 监听 window.message({type:'openPilot'}) → 自动打开 Pilot 侧边面板
+    └─ 侧边面板渲染 DataCenterCopilotContent（具名导出）
+         ├─ ModelSelectorMini（130px borderless Select）
+         │    └─ GET /llm-configs?enabled_only=true → 可用模型列表
+         │    → PUT /conversations/{id} body: { model_key: selectedModel }   ← Bug-1 修复
+         ├─ POST /reports/{id}/copilot 或 POST /scheduled-reports/{id}/copilot
+         │    → 创建绑定 spec 上下文的专属对话，返回 conversation_id
+         └─ 正常聊天流（复用 send_message / SSE 等）
+
+入口三：DataCenter 列表页 AI 按钮
+  DataCenterDashboards / DataCenterDocuments / DataCenterSchedules
+    ├─ 列表行 "AI" 按钮 → setCopilotReport(record)
+    └─ DataCenterCopilot Drawer 组件（包裹 DataCenterCopilotContent）
+
+autoPilot URL 参数（独立标签页跳转后自动打开 Pilot）
+  DataCenterDashboards.tsx / DataCenterDocuments.tsx
+    ├─ useEffect([reports]) → URLSearchParams.get('autoPilot')
+    ├─ reports.find(r => r.id === autoPilotId) → setCopilotReport(target)   ← Bug-3 修复（Documents）
+    └─ window.history.replaceState(...) 清除 URL 参数（避免刷新重复触发）
+```
+
+**核心组件**：
+
+| 文件 | 职责 |
+|------|------|
+| `frontend/src/components/DataCenterCopilot.tsx` | `DataCenterCopilot`（Drawer 包裹，列表页使用）+ `DataCenterCopilotContent`（具名导出，可嵌入任意容器）|
+| `frontend/src/components/ModelSelectorMini.tsx` | 130px borderless `<Select>`，加载 `/llm-configs?enabled_only=true`，供 Pilot 面板切换对话模型 |
+| `frontend/src/components/chat/ReportPreviewModal.tsx` | 接受 `pilotContext` prop；监听 postMessage；侧边面板包裹 `DataCenterCopilotContent` |
+| `backend/api/reports.py` | `POST /reports/{id}/copilot`：按 `reports:read` + ownership 鉴权；创建专属对话（系统提示注入报表 spec 上下文）|
+| `backend/api/scheduled_reports.py` | `POST /scheduled-reports/{id}/copilot`：按 `schedules:read` + ownership 鉴权；创建专属对话（注入推送任务 spec 上下文）|
+
+**v2.9 同包 Bug 修复**：
+
+| Bug | 现象 | 修复位置 |
+|-----|------|---------|
+| Bug-1：模型切换静默失败 | `handleModelChange` 发送 `{ model: modelKey }` 但后端期望 `{ model_key: ... }` | `DataCenterCopilot.tsx:handleModelChange` |
+| Bug-2：HTML 报告内嵌按钮路由错误 | `_inject_pilot_button` 硬编码 `'dashboards'`，document 类型报告也跳到 dashboards | `backend/api/reports.py:_inject_pilot_button(doc_type=)` |
+| Bug-3：Documents 页不响应 autoPilot 参数 | `DataCenterDocuments.tsx` 缺少 autoPilot URL 参数处理 `useEffect` | `frontend/src/pages/DataCenterDocuments.tsx` |
+
+**RBAC**：无新权限键。Pilot 端点复用现有权限：`reports:read`（analyst+）和 `schedules:read`（analyst+）。Viewer 角色无法访问两个 copilot 端点（HTTP 403）。
+
+**无 DB 迁移**：Pilot 对话复用已有 `conversations` 表；模型切换复用 `conversations.current_model` 列（`UpdateConversationRequest.model_key`）；无新表、新列或新权限记录。
+
+**测试**：`test_pilot_e2e.py`（27 tests，F/G/H/I/J 段）：17 个纯单元测试（无需 DB）+ 10 个 DB 集成测试（G/H/J 段，需 PostgreSQL）。
 
 ---
 
@@ -1314,6 +1381,8 @@ DataCenter 前端数据流
 | GET | `/reports/{id}/summary-status` | `reports:read` + ownership | 查询 LLM 总结生成状态 |
 | POST | `/reports/{id}/share` | `reports:read` + ownership | 生成公开分享链接（share_token）|
 | GET | `/reports/shared/{token}` | 无需 JWT | 通过 share_token 公开访问报告详情 |
+| GET | `/reports/{id}/html?token=` | 无需 JWT（token 鉴权）| 渲染 HTML；preview 模式自动注入 Pilot 悬浮按钮（按 `doc_type` 路由 dashboards/documents）；`?download=true` 跳过注入以附件方式下载 |
+| POST | `/reports/{id}/copilot` | `reports:read` + ownership | **★ 新增（v2.9）** 为报表创建 Co-pilot 对话（系统提示注入报表 spec 上下文），返回 `conversation_id` |
 
 ### 定时推送任务 `/scheduled-reports`
 
@@ -1330,6 +1399,7 @@ DataCenter 前端数据流
 | POST | `/scheduled-reports/{id}/run-now` | `schedules:write` + ownership | 立即触发一次执行（BackgroundTasks 异步）|
 | GET | `/scheduled-reports/{id}/history` | `schedules:read` + ownership | 执行历史日志（分页，倒序）|
 | POST | `/scheduled-reports/{id}/channels/test` | `schedules:write` + ownership | 测试指定通知渠道（is_test=True 发送测试消息）|
+| POST | `/scheduled-reports/{id}/copilot` | `schedules:read` + ownership | **★ 新增（v2.9）** 为推送任务创建 Co-pilot 对话（系统提示注入任务 spec 上下文），返回 `conversation_id` |
 
 ### 分组管理 `/groups`
 
