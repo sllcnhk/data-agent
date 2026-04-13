@@ -354,15 +354,18 @@ superadmin 专属功能：将 Excel 文件（`.xlsx`/`.xls`）直接导入到 Cl
 | PDF 导出 | ✅ | Playwright Chromium → weasyprint → HTML 备选三级回退 |
 | PPTX 导出 | ✅ | Playwright 截图 + python-pptx 16:9 幻灯片 |
 | 前端报告列表页 | ✅ | `/reports` 路由，分页表格，支持预览/导出/删除 |
-| 聊天报告卡片 | ✅ | is_report=true → 蓝色卡片 + 预览 iframe Modal |
-| RBAC 权限 | ✅ | reports:read(analyst+) / reports:create(analyst+) / reports:delete(admin+) |
+| 聊天报告卡片 | ✅ | is_report=true + doc_type → 蓝色卡片 + 预览 / 下载 / 固定按钮 |
+| doc_type 自动检测 | ✅ | `_detect_report_type(path, content, mime)` 模块级函数；含 `class="summary-section"` → document，否则 → dashboard |
+| 手动固定 Pin 报表/报告 | ✅ | `POST /reports/pin`：文件 → DB 记录（幂等）+ message_id 回写 `pinned_report_id`；`flag_modified` 确保 JSONB 变更检测 |
+| ReportPreviewModal 弹窗固定按钮 | ✅ | 预览弹窗顶部工具栏新增「生成固定报表/报告」按钮；固定后变为「已生成」状态 |
+| RBAC 权限 | ✅ | reports:read(analyst+) / reports:create(analyst+，含 pin 端点) / reports:delete(admin+) |
 | XSS 防护 | ✅ | _safe_json() `</` → `<\/`；HTML 用户内容 _esc() 转义 |
 
-**核心文件**：`backend/services/report_builder_service.py` / `backend/api/reports.py` / `backend/services/pdf_export_service.py` / `backend/services/pptx_export_service.py` / `frontend/src/pages/Reports.tsx` / `.claude/skills/project/chart-reporter.md`
+**核心文件**：`backend/services/report_builder_service.py` / `backend/api/reports.py` / `backend/agents/agentic_loop.py`（`_detect_report_type`）/ `backend/services/pdf_export_service.py` / `backend/services/pptx_export_service.py` / `frontend/src/components/chat/ChatMessages.tsx` / `frontend/src/components/chat/ReportPreviewModal.tsx` / `.claude/skills/project/chart-reporter.md`
 
-**DB 变更**：`reports` 表新增 5 字段（`username / refresh_token / report_file_path / llm_summary / summary_status`）；`permissions` 表新增 3 条（`reports:read/create/delete`）。迁移脚本：`backend/scripts/migrate_reports_enhancement.py` + `backend/scripts/migrate_reports_permissions.py`。
+**DB 变更**：`reports` 表新增 5 字段（`username / refresh_token / report_file_path / llm_summary / summary_status`）；`permissions` 表新增 3 条（`reports:read/create/delete`）。迁移脚本：`backend/scripts/migrate_reports_enhancement.py` + `backend/scripts/migrate_reports_permissions.py`。**Pin 功能无需新增迁移**（复用已有 reports 表列 + messages.extra_metadata JSONB）。
 
-**测试**：`test_report_builder.py` (42) + `test_report_api.py` (20) + `test_report_e2e.py` (46) = **108 tests**
+**测试**：`test_report_builder.py` (42) + `test_report_api.py` (20) + `test_report_e2e.py` (46) + `test_pin_report.py` (14) + `test_pin_e2e.py` (18) = **140 tests**
 
 ---
 

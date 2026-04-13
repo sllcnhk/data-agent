@@ -2151,9 +2151,11 @@ DELETE /api/v1/data-export/jobs/{job_id}
 - **多图表布局**：每份报告可包含多张图表（折线图、柱状图、饼图、散点图、热力图等），使用 ECharts CDN 渲染
 - **内嵌筛选器**：`date_range`（日期范围）、`select`（单选）、`multi_select`（多选）、`radio`（单选按钮）四种筛选控件，全部客户端运算，无需联网
 - **数据可刷新**：每份报告附带 `refresh_token`，用于调用 `GET /api/v1/reports/{id}/refresh-data` 公开接口重新查询最新数据、不需要用户 JWT
-- **预览弹窗**：在报告列表页点击「预览」可直接在 Modal 中渲染 HTML，无需下载
+- **预览弹窗**：在文件卡片或管理中心点击「预览」可直接在 Modal 中渲染 HTML，无需下载
 - **PDF / PPTX 导出**：后台 Playwright Chromium 截图 → PDF；python-pptx 图表截图 → PPTX 幻灯片（每张图表一页）
 - **AI 摘要**：点击「生成摘要」，LLM 根据图表规格和数据生成结构化分析文字，存储后可复用
+- **报表与报告区分**：HTML 文件分为两种类型——不含文字摘要模块的纯图表文件为**报表**（`doc_type=dashboard`）；含 `class="summary-section"` LLM 分析段落的综合分析文件为**报告**（`doc_type=document`）；系统通过检测 HTML 内容自动区分，按钮标签和入库分类均自动匹配
+- **手动固定机制**：对话中 Agent 写入的 HTML 文件**不自动出现**在数据管理中心列表；需在消息文件卡片或预览弹窗中点击「生成固定报表」/「生成固定报告」按钮手动固定后才会入库（幂等，重复点击不创建重复记录）
 
 ### 14.2 通过聊天触发报告生成
 
@@ -2164,9 +2166,28 @@ DELETE /api/v1/data-export/jobs/{job_id}
       包含折线图（月度趋势）和饼图（区域占比）。
 ```
 
-Agent 返回报告 ID 和预览链接后，即可在「图表报告」页面查看。
+Agent 写入 HTML 文件后，消息末尾出现文件卡片（蓝色图标），卡片上有三个操作按钮：
 
-也可以直接通过 API 提交报告规格：
+| 按钮 | 说明 |
+|------|------|
+| 预览 | 在全屏 Modal 中内嵌渲染 HTML（iframe），支持筛选器交互和 AI Pilot 侧边面板 |
+| 下载 | 将 HTML 文件下载到本地 |
+| 生成固定报表 / 生成固定报告 | 将文件注册到数据管理中心的报表/报告清单（手动触发，幂等）|
+
+点击「生成固定报表/报告」后，按钮变为「已生成固定报表/报告」（灰色，不可重复操作）。固定后可在侧边栏「数据管理中心」→「报表清单」（dashboard）或「报告清单」（document）中统一查看和管理。
+
+> **注意**：在预览弹窗（ReportPreviewModal）的顶部工具栏同样提供固定按钮，效果相同。固定操作需要 `reports:create` 权限（analyst 角色及以上）。
+
+### 14.2.1 报表与报告的区别
+
+| 类型 | `doc_type` | 识别特征 | 数据管理中心入口 |
+|------|-----------|---------|----------------|
+| 报表 | `dashboard` | 纯图表 HTML，无 LLM 文字总结区块 | 报表清单（DataCenterDashboards）|
+| 报告 | `document` | HTML 中含 `class="summary-section"` 的文字分析模块 | 报告清单（DataCenterDocuments）|
+
+系统自动检测 HTML 内容，按钮文案和入库分类均自动匹配，无需用户手动指定。如需强制指定，可在 `POST /reports/pin` 的 `doc_type` 字段传值。
+
+也可以直接通过 API 提交报告规格（将同步写入 DB，无需手动 pin）：
 
 ```bash
 POST /api/v1/reports/build
@@ -2209,9 +2230,14 @@ Content-Type: application/json
 }
 ```
 
-### 14.3 报告列表页操作
+### 14.3 数据管理中心操作
 
-进入侧边栏「图表报告」后，可见所有（自己生成的）报告列表。每行显示：报告标题、创建时间、状态标签、摘要生成状态。
+进入侧边栏「数据管理中心」后，可见两类固定记录（仅手动 pin 后才会出现）：
+
+- **报表清单**（`doc_type=dashboard`）：纯图表报表，支持预览 iframe / 下载 / 删除
+- **报告清单**（`doc_type=document`）：含 LLM 分析文字的报告，支持 PDF/PPTX 导出
+
+每行显示：报告标题、创建时间、状态标签、摘要生成状态。
 
 | 操作 | 说明 |
 |------|------|
@@ -2290,7 +2316,20 @@ GET /api/v1/reports/{id}/summary-status
 ### 14.8 API 快速参考
 
 ```bash
-# 生成报告
+# 手动固定对话中生成的 HTML 文件到报表/报告列表（幂等）
+POST /api/v1/reports/pin
+Authorization: Bearer <token>   # 需要 reports:create 权限（analyst+）
+{
+  "file_path": "{username}/reports/chart_20260414.html",
+  "doc_type": "dashboard",       # 可选，默认 "dashboard"；"document" 为报告
+  "name": "自定义名称",            # 可选，默认从文件名提取（去 .html 后缀）
+  "message_id": "...",            # 可选，回写 pinned_report_id 到消息元数据
+  "conversation_id": "..."        # 可选，配合 message_id 使用
+}
+→ 返回: {"report_id": "...", "refresh_token": "...", "doc_type": "dashboard", "is_new": true}
+# is_new=false 表示该文件已固定（幂等返回已有记录）
+
+# 生成报告（直接调用，同步写入 DB）
 POST /api/v1/reports/build
 Authorization: Bearer <token>
 {"spec": {...}}

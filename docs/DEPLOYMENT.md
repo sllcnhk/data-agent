@@ -1,6 +1,6 @@
 # 部署指南
 
-> 版本：v2.4 · 2026-04-13（**多图表 HTML 报告生成**：`migrate_reports_enhancement.py` DB 迁移（`reports` 表新增 5 列）+ `migrate_reports_permissions.py` DB 迁移（`reports:read/create/delete` 权限）；Playwright Chromium 依赖；ECharts/AntV 多图表交互 HTML；PDF/PPTX 导出；LLM 报告摘要；RBAC 权限矩阵扩展；v2.3 · 2026-04-08：**Skill 用户使用权限隔离 T1–T6**：SkillMD.owner + `_get_visible_user_skills` + `build_skill_prompt_async(user_id=)` + sub_skill 展开隔离 + Preview API effective_user_id；**无 DB 迁移**，纯代码层变更；v2.2 · 2026-04-07：**SQL→Excel 数据导出**：`migrate_data_export.py` DB 迁移（`export_jobs` 表 + `data:export` 权限）；流式写 xlsx + 多 Sheet 自动分割 + 大整数安全转换；v2.1 · 2026-04-05：**Excel 数据导入**：`migrate_data_import.py` DB 迁移（`import_jobs` 表 + `data:import` 权限）；流式上传支持 100MB 大文件）
+> 版本：v2.6 · 2026-04-14（**对话报表手动固定 Pin**：`POST /reports/pin` 端点 + `_detect_report_type` doc_type 检测 + FileDownloadCards 固定按钮 + ReportPreviewModal 弹窗固定按钮；**无 DB 迁移**，复用已有 reports 表 + messages.extra_metadata JSONB；v2.5 · 2026-04-13：**数据管理中心**：`migrate_datacenter_v1.py` DB 迁移（3 张新表 + reports 新增 3 列）；APScheduler 定时推送；4 渠道通知；v2.4 · 2026-04-13：**多图表 HTML 报告生成**：`migrate_reports_enhancement.py` + `migrate_reports_permissions.py` DB 迁移；Playwright Chromium 依赖；ECharts/AntV 多图表 HTML；PDF/PPTX 导出；LLM 报告摘要；v2.3 · 2026-04-08：**Skill 用户使用权限隔离 T1–T6**；无 DB 迁移；v2.2 · 2026-04-07：**SQL→Excel 数据导出**：`migrate_data_export.py`；v2.1 · 2026-04-05：**Excel 数据导入**：`migrate_data_import.py`）
 >
 > 本文档说明如何将数据智能分析 Agent 系统从 Windows 开发环境迁移到 Linux 服务器，供团队多人共用。
 
@@ -827,7 +827,7 @@ RATE_LIMIT_PER_MINUTE=60
 >
 > **对话附件元数据**：用户发送附件（图片/PDF/文本/CSV/JSON）时，系统将 base64 数据发送给 LLM 识别，但**仅将元数据**（文件名、MIME 类型、文件大小）存入 `messages.extra_metadata["attachments"]` JSONB 数组。单个附件元数据约 100–200 字节。历史消息中的附件以文本注解形式呈现给 LLM（如 `[附件: report.pdf (application/pdf, 12345 bytes)]`），**不会重复存储 base64 内容**。**无需数据库迁移**（复用现有 `extra_metadata` JSONB 列）。20MB 附件经 base64 编码后约 27MB，Nginx `client_max_body_size 100m` 已足够覆盖。
 >
-> **Agent 文件写入元数据**：Agent 通过 `write_file` 工具写出的文件（CSV/JSON/Excel 等），路径信息存入 `messages.extra_metadata["files_written"]`（`[{path, name, size, mime_type}]`）。文件实体存储在 `customer_data/{username}/` 目录（非数据库），用户通过 `GET /api/v1/files/download?path=...` 下载。**无需数据库迁移**（复用现有 `extra_metadata` JSONB 列）。
+> **Agent 文件写入元数据**：Agent 通过 `write_file` 工具写出的文件（CSV/JSON/Excel/HTML 等），路径信息存入 `messages.extra_metadata["files_written"]`（`[{path, name, size, mime_type}]`）。HTML 报告文件额外携带 `is_report=true`、`doc_type`（dashboard/document）字段；用户手动 pin 后写回 `pinned_report_id` 和 `refresh_token`。文件实体存储在 `customer_data/{username}/` 目录（非数据库），用户通过 `GET /api/v1/files/download?path=...` 下载。**无需数据库迁移**（复用现有 `extra_metadata` JSONB 列）。
 >
 > **Excel 数据导入任务记录**：每次导入任务以记录形式写入 `import_jobs` 表（UUID PK），包含状态、进度（已导入行数/批次）、错误信息和配置快照。上传的 Excel 临时文件存于 `customer_data/{username}/imports/`，任务完成或失败后自动删除（`os.unlink`）。**需执行 `migrate_data_import.py`**（新建 `import_jobs` 表 + 种子 `data:import` 权限）。文件大小上限 100MB，采用 1MB 分块流式写盘（不全量加载内存），支持大文件上传。
 >
@@ -922,6 +922,11 @@ playwright install chromium
 # reports 表新增 doc_type / scheduled_report_id / version_seq 列
 python backend/scripts/migrate_datacenter_v1.py
 # APScheduler 定时任务引擎在后端启动时自动初始化（无需额外步骤）
+
+# v2.6+ 对话报表手动固定（Pin）：无 DB 迁移，纯代码层变更，重启服务即可
+# 新增 POST /reports/pin 端点（需 reports:create 权限，analyst+ 均已有此权限，无需权限更新）
+# 聊天中 Agent 写入 HTML 文件后，文件卡片显示「生成固定报表/报告」按钮，手动点击后入库
+# doc_type 区分：含 class="summary-section" → document（报告），否则 → dashboard（报表）
 
 # 重启服务
 sudo systemctl restart data-agent-backend

@@ -29,6 +29,25 @@ from backend.mcp.tool_formatter import format_mcp_tools_for_claude, parse_tool_n
 logger = logging.getLogger(__name__)
 
 
+def _detect_report_type(file_path: str, content: str, mime: str) -> tuple:
+    """
+    判断写入文件是否为 HTML 报告，并检测其 doc_type。
+
+    Returns:
+        (is_report: bool, doc_type: Optional[str])
+        - is_report=True  仅当 mime==text/html 且路径含 /reports/
+        - doc_type='document'  仅当 HTML 含 class="summary-section"（LLM 总结区域）
+        - doc_type='dashboard' 纯图表报表（无 summary-section）
+        - doc_type=None         非报告文件
+    """
+    norm_path = (file_path or "").replace("\\", "/")
+    is_report = mime == "text/html" and "/reports/" in norm_path
+    if not is_report:
+        return False, None
+    doc_type = "document" if 'class="summary-section"' in (content or "") else "dashboard"
+    return True, doc_type
+
+
 class _SafeJSONEncoder(json.JSONEncoder):
     """兜底 JSON 编码器，确保 _format_result 永远不会因未知类型崩溃。
 
@@ -489,10 +508,8 @@ class AgenticLoop:
                                     else len(content_val or b"")
                                 )
                                 mime = self._infer_mime_type(file_name)
-                                # 识别 HTML 报告（路径含 /reports/ 且为 text/html）
-                                is_report = (
-                                    mime == "text/html"
-                                    and "/reports/" in file_path.replace("\\", "/")
+                                is_report, doc_type = _detect_report_type(
+                                    file_path, content_val if isinstance(content_val, str) else "", mime
                                 )
                                 file_entry: Dict[str, Any] = {
                                     "path": file_path,
@@ -502,6 +519,7 @@ class AgenticLoop:
                                 }
                                 if is_report:
                                     file_entry["is_report"] = True
+                                    file_entry["doc_type"] = doc_type
                                 written_files.append(file_entry)
                                 logger.debug(
                                     f"[AgenticLoop] 记录写入文件: path={file_path}, name={file_name}, "

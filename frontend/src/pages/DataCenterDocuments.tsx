@@ -88,6 +88,21 @@ const DataCenterDocuments: React.FC = () => {
     fetchReports(page);
   }, [page]);
 
+  // 处理来自独立 HTML 标签页的 autoPilot 参数（注入按钮打开新标签后落地）
+  useEffect(() => {
+    if (reports.length === 0) return;
+    const params = new URLSearchParams(window.location.search);
+    const autoPilotId = params.get('autoPilot');
+    if (!autoPilotId) return;
+    const target = reports.find((r) => r.id === autoPilotId);
+    if (target) {
+      setCopilotReport(target);
+      const url = new URL(window.location.href);
+      url.searchParams.delete('autoPilot');
+      window.history.replaceState({}, '', url.toString());
+    }
+  }, [reports]);
+
   const handleDelete = async (id: string) => {
     try {
       const res = await fetch(`${API_BASE}/reports/${id}`, {
@@ -381,6 +396,13 @@ const DataCenterDocuments: React.FC = () => {
           refreshToken={previewReport.refresh_token}
           filePath={previewReport.report_file_path}
           fileName={previewReport.name + '.html'}
+          pilotContext={{
+            contextType: 'document',
+            contextId: previewReport.id,
+            contextName: previewReport.name,
+            contextSpec: previewReport,
+            onSpecUpdated: () => fetchReports(page),
+          }}
         />
       )}
 

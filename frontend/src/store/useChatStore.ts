@@ -9,6 +9,14 @@ export interface FileInfo {
   name: string;
   size: number;
   mime_type: string;
+  /** 是否为 HTML 报告文件（路径含 /reports/ 且 MIME 为 text/html） */
+  is_report?: boolean;
+  /** 区分 dashboard（纯图表报表）和 document（含 LLM 总结报告） */
+  doc_type?: 'dashboard' | 'document';
+  /** 已固定为正式报表后的 Report DB id，用于恢复按钮"已固定"状态 */
+  pinned_report_id?: string;
+  /** 固定后的数据刷新令牌 */
+  refresh_token?: string;
 }
 
 export interface FilesWrittenInfo {
@@ -197,6 +205,8 @@ interface ChatState {
 
   // Actions - 文件写入（下载链接）
   setMessageFilesWritten: (messageId: string, files: FileInfo[]) => void;
+  /** 固定报表成功后，更新对应文件条目的 pinned_report_id 和 refresh_token */
+  markFilePinned: (messageId: string, filePath: string, reportId: string, refreshToken: string) => void;
 
   // Actions - 审批
   setPendingApproval: (approval: PendingApproval | null) => void;
@@ -365,6 +375,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
     messages: state.messages.map((m) =>
       m.id === messageId ? { ...m, files_written: files } : m
     ),
+  })),
+
+  // 固定报表：更新对应文件条目的 pinned_report_id
+  markFilePinned: (messageId, filePath, reportId, refreshToken) => set((state) => ({
+    messages: state.messages.map((m) => {
+      if (m.id !== messageId || !m.files_written) return m;
+      return {
+        ...m,
+        files_written: m.files_written.map((f) =>
+          f.path === filePath
+            ? { ...f, pinned_report_id: reportId, refresh_token: refreshToken }
+            : f
+        ),
+      };
+    }),
   })),
 
   // 审批

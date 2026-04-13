@@ -32,6 +32,7 @@ import {
 import { useAuthStore } from '@/store/useAuthStore';
 import ReportPreviewModal from '../components/chat/ReportPreviewModal';
 import DataCenterCopilot from '../components/DataCenterCopilot';
+import { useEffect } from 'react';
 
 const { Title, Text } = Typography;
 
@@ -100,6 +101,22 @@ const DataCenterDashboards: React.FC = () => {
   useEffect(() => {
     fetchReports(page);
   }, [page]);
+
+  // 处理来自独立 HTML 标签页的 autoPilot 参数（B2 注入的按钮打开新标签后落地）
+  useEffect(() => {
+    if (reports.length === 0) return;
+    const params = new URLSearchParams(window.location.search);
+    const autoPilotId = params.get('autoPilot');
+    if (!autoPilotId) return;
+    const target = reports.find((r) => r.id === autoPilotId);
+    if (target) {
+      setCopilotReport(target);
+      // 清理 URL 中的参数，避免刷新时再次触发
+      const url = new URL(window.location.href);
+      url.searchParams.delete('autoPilot');
+      window.history.replaceState({}, '', url.toString());
+    }
+  }, [reports]);
 
   const handleDelete = async (id: string) => {
     try {
@@ -295,6 +312,13 @@ const DataCenterDashboards: React.FC = () => {
           refreshToken={previewReport.refresh_token}
           filePath={previewReport.report_file_path}
           fileName={previewReport.name + '.html'}
+          pilotContext={{
+            contextType: 'dashboard',
+            contextId: previewReport.id,
+            contextName: previewReport.name,
+            contextSpec: previewReport,
+            onSpecUpdated: () => fetchReports(page),
+          }}
         />
       )}
 

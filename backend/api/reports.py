@@ -42,6 +42,86 @@ from backend.services.report_builder_service import (
 router = APIRouter(prefix="/reports", tags=["报告"])
 logger = logging.getLogger(__name__)
 
+# ── Pilot FAB 注入片段 ────────────────────────────────────────────────────────
+_PILOT_INJECT_TEMPLATE = """
+<style>
+  #__pilot-fab {
+    position: fixed !important;
+    bottom: 24px !important;
+    right: 24px !important;
+    width: 48px !important;
+    height: 48px !important;
+    border-radius: 50% !important;
+    background: #52c41a !important;
+    box-shadow: 0 4px 14px rgba(82,196,26,0.45) !important;
+    cursor: pointer !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    z-index: 2147483647 !important;
+    border: none !important;
+    font-size: 22px !important;
+    line-height: 1 !important;
+    transition: transform 0.2s, box-shadow 0.2s !important;
+  }
+  #__pilot-fab:hover {
+    transform: scale(1.12) !important;
+    box-shadow: 0 6px 18px rgba(82,196,26,0.6) !important;
+  }
+  #__pilot-tip {
+    position: fixed !important;
+    bottom: 80px !important;
+    right: 20px !important;
+    background: rgba(0,0,0,0.72) !important;
+    color: #fff !important;
+    padding: 4px 10px !important;
+    border-radius: 4px !important;
+    font-size: 12px !important;
+    z-index: 2147483647 !important;
+    pointer-events: none !important;
+    opacity: 0 !important;
+    transition: opacity 0.2s !important;
+    white-space: nowrap !important;
+  }
+</style>
+<button id="__pilot-fab" title="AI Pilot">🤖</button>
+<div id="__pilot-tip">AI 助手 Pilot</div>
+<script>
+(function(){
+  var fab = document.getElementById('__pilot-fab');
+  var tip = document.getElementById('__pilot-tip');
+  if (!fab) return;
+  fab.addEventListener('mouseenter', function(){ tip.style.opacity = '1'; });
+  fab.addEventListener('mouseleave', function(){ tip.style.opacity = '0'; });
+  fab.addEventListener('click', function(){
+    var rid = '__REPORT_ID_PLACEHOLDER__';
+    var page = '__PAGE_PLACEHOLDER__';
+    if (window !== window.top) {
+      try { window.parent.postMessage({ type: 'openPilot', reportId: rid }, '*'); } catch(e) {}
+    } else {
+      window.open(window.location.origin + '/data-center/' + page + '?autoPilot=' + rid, '_blank');
+    }
+  });
+})();
+</script>
+"""
+
+
+def _inject_pilot_button(html_content: str, report_id: str, doc_type: str = "dashboard") -> str:
+    """在 </body> 前注入悬浮 Pilot 按钮脚本，若无 </body> 则追加至末尾。"""
+    page = "documents" if doc_type == "document" else "dashboards"
+    snippet = (
+        _PILOT_INJECT_TEMPLATE
+        .replace("__REPORT_ID_PLACEHOLDER__", report_id)
+        .replace("__PAGE_PLACEHOLDER__", page)
+    )
+    lower = html_content.lower()
+    idx = lower.rfind("</body>")
+    if idx >= 0:
+        return html_content[:idx] + snippet + html_content[idx:]
+    return html_content + snippet
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 常量
 # ─────────────────────────────────────────────────────────────────────────────
@@ -245,6 +325,141 @@ def _slugify(s: str) -> str:
     s = re.sub(r"[^\w\u4e00-\u9fff\-]", "_", s)
     s = re.sub(r"_+", "_", s)
     return s.strip("_") or "report"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1b. 固定已生成的 HTML 文件为正式报表/报告（手动 pin）
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PinReportRequest(BaseModel):
+    file_path: str = Field(..., description="HTML 文件相对路径（相对于 customer_data/）")
+    doc_type: str = Field("dashboard", description="报告类型: dashboard | document")
+    name: Optional[str] = Field(None, description="报告名称（留空则从路径提取）")
+    conversation_id: Optional[str] = Field(None, description="来源对话 ID")
+    message_id: Optional[str] = Field(None, description="来源消息 ID（用于回写 pinned_report_id）")
+
+
+@router.post("/pin")
+async def pin_report(
+    req: PinReportRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_permission("reports", "create")),
+):
+    """
+    将对话中已生成的 HTML 文件固定为正式报表/报告，写入 reports 数据库。
+
+    - 幂等：同一 file_path 已存在则直接返回已有记录（is_new=False）
+    - 若传入 message_id，在消息 extra_metadata.files_written 中回写 pinned_report_id，
+      支持页面刷新后按钮状态恢复
+    """
+    username = getattr(current_user, "username", "default")
+    is_superadmin = getattr(current_user, "is_superadmin", False)
+
+    # 路径安全检查：file_path 必须在 customer_data 目录内
+    norm_fp = req.file_path.replace("\\", "/").lstrip("/")
+    abs_path = (_CUSTOMER_DATA_ROOT / norm_fp).resolve()
+    try:
+        abs_path.relative_to(_CUSTOMER_DATA_ROOT.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="文件路径超出允许范围")
+
+    if not abs_path.exists():
+        raise HTTPException(status_code=404, detail=f"文件不存在: {req.file_path}")
+
+    # 权限检查：非 superadmin 只能固定自己的文件
+    # file_path 格式一般为 {username}/reports/xxx.html
+    path_parts = norm_fp.split("/")
+    if not is_superadmin and path_parts[0] != username:
+        raise HTTPException(status_code=403, detail="无权固定其他用户的报告文件")
+
+    # 幂等：检查是否已存在
+    existing = db.query(Report).filter(Report.report_file_path == norm_fp).first()
+    if existing:
+        return {
+            "success": True,
+            "data": {
+                "report_id": str(existing.id),
+                "refresh_token": existing.refresh_token,
+                "doc_type": getattr(existing, "doc_type", "dashboard"),
+                "is_new": False,
+            },
+        }
+
+    # 创建新记录
+    report_id = str(uuid.uuid4())
+    refresh_token = generate_refresh_token()
+    file_name = norm_fp.split("/")[-1]
+    name = req.name or file_name.rsplit(".", 1)[0]  # 去掉 .html 扩展名
+
+    conv_id = None
+    if req.conversation_id:
+        try:
+            conv_id = uuid.UUID(req.conversation_id)
+        except ValueError:
+            pass
+
+    report = Report(
+        id=uuid.UUID(report_id),
+        conversation_id=conv_id,
+        name=name,
+        username=username,
+        refresh_token=refresh_token,
+        report_file_path=norm_fp,
+        summary_status="skipped",
+        extra_metadata={"pinned_from_chat": True, "file_name": file_name},
+    )
+    try:
+        report.doc_type = req.doc_type
+    except AttributeError:
+        pass
+
+    db.add(report)
+    db.flush()  # 获取 ID，但不提交
+
+    # T4: 回写 message.extra_metadata.files_written[i].pinned_report_id
+    if req.message_id:
+        try:
+            from backend.models.conversation import Message
+            msg_uid = uuid.UUID(req.message_id)
+            msg = db.query(Message).filter(Message.id == msg_uid).first()
+            if msg:
+                meta = dict(msg.extra_metadata or {})
+                files_list = list(meta.get("files_written", []))
+                updated = False
+                for f in files_list:
+                    if f.get("path") == norm_fp or f.get("path") == req.file_path:
+                        f["pinned_report_id"] = report_id
+                        f["refresh_token"] = refresh_token
+                        updated = True
+                        break
+                if updated:
+                    meta["files_written"] = files_list
+                    msg.extra_metadata = meta
+                    try:
+                        from sqlalchemy.orm.attributes import flag_modified
+                        flag_modified(msg, "extra_metadata")
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning("[Reports/pin] 回写 message metadata 失败（非致命）: %s", e)
+
+    db.commit()
+    db.refresh(report)
+
+    logger.info(
+        "[Reports/pin] 固定报告: id=%s, file=%s, doc_type=%s, user=%s",
+        report_id, norm_fp, req.doc_type, username,
+    )
+    return {
+        "success": True,
+        "data": {
+            "report_id": report_id,
+            "refresh_token": refresh_token,
+            "doc_type": req.doc_type,
+            "is_new": True,
+        },
+    }
 
 
 async def _async_generate_summary(report_id: str, spec: Dict, db: Session) -> None:
@@ -522,6 +737,10 @@ async def serve_report_html_by_token(
         import urllib.parse
         encoded = urllib.parse.quote(filename)
         headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{encoded}"
+    else:
+        # 非下载模式：注入悬浮 Pilot 按钮（按 doc_type 路由到正确页面）
+        doc_type_val = getattr(report.doc_type, "value", report.doc_type) or "dashboard"
+        content = _inject_pilot_button(content, report_id, doc_type=str(doc_type_val))
 
     return HTMLResponse(content=content, headers=headers)
 

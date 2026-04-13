@@ -1,10 +1,12 @@
 /**
- * ReportPreviewModal — 在聊天页内嵌预览 HTML 报告
+ * ReportPreviewModal — 在聊天页/数据管理中心内嵌预览 HTML 报告
  *
  * 功能：
  *  - 全屏 Modal + iframe 加载报告 HTML
  *  - 顶部工具栏：刷新、导出 PDF、导出 PPTX、新标签打开、关闭
- *  - 导出触发 /api/v1/reports/{id}/export 并轮询状态
+ *  - 右下角悬浮 Pilot 按钮（可选），点击展开 380px 宽 AI 对话侧边面板
+ *  - 侧边面板：DataCenterCopilotContent（含模型切换），与 iframe 并排显示
+ *  - 监听 iframe postMessage（来自 B2 注入的按钮）自动打开 Pilot
  */
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
@@ -15,35 +17,49 @@ import {
   message as antMessage,
   Space,
   Tag,
-  Progress,
 } from 'antd';
 import {
-  FullscreenOutlined,
-  ReloadOutlined,
   FilePdfOutlined,
   FileOutlined,
   GlobalOutlined,
   CloseOutlined,
   LoadingOutlined,
   CheckCircleOutlined,
+  RobotOutlined,
 } from '@ant-design/icons';
 import { useAuthStore } from '@/store/useAuthStore';
+import {
+  DataCenterCopilotContent,
+  type CopilotContextType,
+} from '../DataCenterCopilot';
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || '/api/v1') as string;
+const PILOT_WIDTH = 380;
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+export interface PilotContext {
+  contextType: CopilotContextType;
+  contextId: string;
+  contextName: string;
+  contextSpec?: Record<string, any> | null;
+  onSpecUpdated?: () => void;
+}
 
 interface ReportPreviewModalProps {
   open: boolean;
   onClose: () => void;
-  /** report_id（来自 POST /reports/build 或 GET /reports 响应） */
   reportId?: string;
-  /** refresh_token（来自 GET /reports 响应，配合 reportId 使用无需 JWT） */
   refreshToken?: string;
-  /** HTML 文件路径（customer_data/xxx/reports/xxx.html）；无 refreshToken 时用 JWT 访问 */
   filePath?: string;
   fileName: string;
+  /** 可选：传入后在右下角显示 Pilot FAB 并支持侧边 AI 对话 */
+  pilotContext?: PilotContext;
 }
 
 type ExportStatus = 'idle' | 'pending' | 'running' | 'done' | 'failed';
+
+// ── Component ─────────────────────────────────────────────────────────────────
 
 const ReportPreviewModal: React.FC<ReportPreviewModalProps> = ({
   open,
@@ -52,24 +68,17 @@ const ReportPreviewModal: React.FC<ReportPreviewModalProps> = ({
   refreshToken,
   filePath,
   fileName,
+  pilotContext,
 }) => {
   const { accessToken } = useAuthStore();
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [iframeLoading, setIframeLoading] = useState(true);
   const [exportStatus, setExportStatus] = useState<ExportStatus>('idle');
   const [exportFormat, setExportFormat] = useState<'pdf' | 'pptx'>('pdf');
-  const [exportJobId, setExportJobId] = useState<string | null>(null);
   const [exportDownloadUrl, setExportDownloadUrl] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [pilotOpen, setPilotOpen] = useState(false);
 
-  /**
-   * iframe src 构造规则：
-   * 优先：reportId + refreshToken → /reports/{id}/html?token=  （无需 JWT，适合列表页预览）
-   * 降级：filePath + accessToken  → /reports/html-serve?path=&token=  （JWT 作为 query param，适合聊天页预览）
-   *
-   * 说明：浏览器加载 iframe src 时不会附带 Authorization header，
-   *       因此两个端点都接受 query param 形式的 token。
-   */
   const iframeSrc = (() => {
     if (reportId && refreshToken) {
       return `${API_BASE}/reports/${reportId}/html?token=${encodeURIComponent(refreshToken)}`;
@@ -80,69 +89,83 @@ const ReportPreviewModal: React.FC<ReportPreviewModalProps> = ({
     return '';
   })();
 
-  // 重置状态
   useEffect(() => {
     if (open) {
       setIframeLoading(true);
       setExportStatus('idle');
-      setExportJobId(null);
       setExportDownloadUrl(null);
     }
-    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
   }, [open]);
 
-  // 导出
-  const handleExport = useCallback(async (fmt: 'pdf' | 'pptx') => {
-    if (!reportId) {
-      antMessage.warning('该报告无 ID，无法导出（仅查看模式）');
-      return;
-    }
-    setExportFormat(fmt);
-    setExportStatus('pending');
-    setExportDownloadUrl(null);
+  // 监听 iframe postMessage（B2 注入的 pilot 按钮发送的消息）
+  useEffect(() => {
+    const handler = (event: MessageEvent) => {
+      if (
+        event.data?.type === 'openPilot' &&
+        pilotContext &&
+        event.data?.reportId === pilotContext.contextId
+      ) {
+        setPilotOpen(true);
+      }
+    };
+    window.addEventListener('message', handler);
+    return () => window.removeEventListener('message', handler);
+  }, [pilotContext]);
 
-    try {
-      const res = await fetch(`${API_BASE}/reports/${reportId}/export`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
-        },
-        body: JSON.stringify({ format: fmt }),
-      });
-      const json = await res.json();
-      if (!json.success) throw new Error(json.detail || '导出请求失败');
-      const jobId = json.data?.job_id;
-      setExportJobId(jobId);
-      setExportStatus('running');
+  const handleExport = useCallback(
+    async (fmt: 'pdf' | 'pptx') => {
+      if (!reportId) {
+        antMessage.warning('该报告无 ID，无法导出（仅查看模式）');
+        return;
+      }
+      setExportFormat(fmt);
+      setExportStatus('pending');
+      setExportDownloadUrl(null);
 
-      // 轮询状态
-      pollRef.current = setInterval(async () => {
-        try {
-          const r = await fetch(
-            `${API_BASE}/reports/${reportId}/export-status?job_id=${jobId}`,
-            { headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {} },
-          );
-          const j = await r.json();
-          const st = j.data?.status;
-          if (st === 'done') {
-            clearInterval(pollRef.current!);
-            setExportStatus('done');
-            setExportDownloadUrl(j.data?.download_url || null);
-          } else if (st === 'failed') {
-            clearInterval(pollRef.current!);
-            setExportStatus('failed');
-            antMessage.error(`导出失败: ${j.data?.error || '未知错误'}`);
-          }
-        } catch { /* ignore poll error */ }
-      }, 2000);
-    } catch (e: any) {
-      setExportStatus('failed');
-      antMessage.error(`导出请求失败: ${e.message}`);
-    }
-  }, [reportId, accessToken]);
+      try {
+        const res = await fetch(`${API_BASE}/reports/${reportId}/export`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+          },
+          body: JSON.stringify({ format: fmt }),
+        });
+        const json = await res.json();
+        if (!json.success) throw new Error(json.detail || '导出请求失败');
+        const jobId = json.data?.job_id;
+        setExportStatus('running');
 
-  // 下载已导出文件
+        pollRef.current = setInterval(async () => {
+          try {
+            const r = await fetch(
+              `${API_BASE}/reports/${reportId}/export-status?job_id=${jobId}`,
+              { headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {} },
+            );
+            const j = await r.json();
+            const st = j.data?.status;
+            if (st === 'done') {
+              clearInterval(pollRef.current!);
+              setExportStatus('done');
+              setExportDownloadUrl(j.data?.download_url || null);
+            } else if (st === 'failed') {
+              clearInterval(pollRef.current!);
+              setExportStatus('failed');
+              antMessage.error(`导出失败: ${j.data?.error || '未知错误'}`);
+            }
+          } catch {/* ignore poll error */}
+        }, 2000);
+      } catch (e: any) {
+        setExportStatus('failed');
+        antMessage.error(`导出请求失败: ${e.message}`);
+      }
+    },
+    [reportId, accessToken],
+  );
+
   const handleDownloadExport = useCallback(() => {
     if (!exportDownloadUrl) return;
     const url = exportDownloadUrl.startsWith('http')
@@ -154,7 +177,6 @@ const ReportPreviewModal: React.FC<ReportPreviewModalProps> = ({
     a.click();
   }, [exportDownloadUrl, exportFormat, fileName]);
 
-  // 新标签页打开
   const openInNewTab = useCallback(() => {
     if (iframeSrc) window.open(iframeSrc, '_blank');
   }, [iframeSrc]);
@@ -192,11 +214,25 @@ const ReportPreviewModal: React.FC<ReportPreviewModalProps> = ({
       onCancel={onClose}
       width="95vw"
       style={{ top: 20, maxWidth: 1600 }}
-      styles={{ body: { padding: 0, height: 'calc(95vh - 110px)', display: 'flex', flexDirection: 'column' } }}
+      styles={{
+        body: {
+          padding: 0,
+          height: 'calc(95vh - 110px)',
+          display: 'flex',
+          flexDirection: 'column',
+        },
+      }}
       footer={null}
       closeIcon={<CloseOutlined />}
       title={
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingRight: 32 }}>
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            paddingRight: 32,
+          }}
+        >
           <span style={{ fontWeight: 600, fontSize: 15 }}>📊 {fileName}</span>
           <Space size={8}>
             {exportStatusTag()}
@@ -229,30 +265,137 @@ const ReportPreviewModal: React.FC<ReportPreviewModalProps> = ({
         </div>
       }
     >
-      {/* iframe 预览区 */}
-      <div style={{ flex: 1, position: 'relative', background: '#f4f6fa' }}>
-        {iframeLoading && (
-          <div style={{
-            position: 'absolute', inset: 0, display: 'flex',
-            alignItems: 'center', justifyContent: 'center', background: '#f4f6fa', zIndex: 10,
-          }}>
-            <Spin size="large" tip="加载报告中…" />
+      {/* ── 主体区：iframe + pilot 面板并排 ─────────────────────────────── */}
+      <div
+        style={{
+          flex: 1,
+          display: 'flex',
+          overflow: 'hidden',
+          position: 'relative',
+          background: '#f4f6fa',
+        }}
+      >
+        {/* iframe 区域 */}
+        <div style={{ flex: 1, position: 'relative', minWidth: 0 }}>
+          {iframeLoading && (
+            <div
+              style={{
+                position: 'absolute',
+                inset: 0,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                background: '#f4f6fa',
+                zIndex: 10,
+              }}
+            >
+              <Spin size="large" tip="加载报告中…" />
+            </div>
+          )}
+          {iframeSrc && (
+            <iframe
+              ref={iframeRef}
+              src={iframeSrc}
+              title={fileName}
+              onLoad={() => setIframeLoading(false)}
+              style={{
+                width: '100%',
+                height: '100%',
+                border: 'none',
+                display: iframeLoading ? 'none' : 'block',
+              }}
+              sandbox="allow-scripts allow-same-origin allow-popups"
+            />
+          )}
+        </div>
+
+        {/* ── Pilot 侧边面板（CSS slide-in） ──────────────────────────── */}
+        {pilotContext && (
+          <div
+            style={{
+              width: pilotOpen ? PILOT_WIDTH : 0,
+              minWidth: 0,
+              flexShrink: 0,
+              overflow: 'hidden',
+              transition: 'width 0.3s ease',
+              borderLeft: pilotOpen ? '1px solid #e8e8e8' : 'none',
+              background: '#fff',
+              display: 'flex',
+              flexDirection: 'column',
+            }}
+          >
+            {/* 面板头部 */}
+            <div
+              style={{
+                padding: '9px 12px',
+                borderBottom: '1px solid #f0f0f0',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                background: '#fafafa',
+                flexShrink: 0,
+              }}
+            >
+              <RobotOutlined style={{ color: '#52c41a', fontSize: 14 }} />
+              <span style={{ fontSize: 13, fontWeight: 600, flex: 1 }}>AI 助手 Pilot</span>
+              <Tooltip title="关闭面板">
+                <Button
+                  size="small"
+                  type="text"
+                  icon={<CloseOutlined style={{ fontSize: 11 }} />}
+                  onClick={() => setPilotOpen(false)}
+                />
+              </Tooltip>
+            </div>
+            {/* 内容 */}
+            <div
+              style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}
+            >
+              <DataCenterCopilotContent
+                open={pilotOpen}
+                contextType={pilotContext.contextType}
+                contextId={pilotContext.contextId}
+                contextName={pilotContext.contextName}
+                contextSpec={pilotContext.contextSpec}
+                onSpecUpdated={pilotContext.onSpecUpdated}
+              />
+            </div>
           </div>
         )}
-        {iframeSrc && (
-          <iframe
-            ref={iframeRef}
-            src={iframeSrc}
-            title={fileName}
-            onLoad={() => setIframeLoading(false)}
-            style={{
-              width: '100%',
-              height: '100%',
-              border: 'none',
-              display: iframeLoading ? 'none' : 'block',
-            }}
-            sandbox="allow-scripts allow-same-origin allow-popups"
-          />
+
+        {/* ── Pilot FAB 悬浮按钮 ─────────────────────────────────────── */}
+        {pilotContext && (
+          <Tooltip title={pilotOpen ? '关闭 AI 助手' : 'AI 助手 Pilot'} placement="left">
+            <button
+              onClick={() => setPilotOpen((v) => !v)}
+              style={{
+                position: 'absolute',
+                bottom: 20,
+                right: pilotOpen ? PILOT_WIDTH + 16 : 20,
+                width: 44,
+                height: 44,
+                borderRadius: '50%',
+                background: pilotOpen ? '#ff7875' : '#52c41a',
+                border: 'none',
+                cursor: 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                boxShadow: pilotOpen
+                  ? '0 4px 12px rgba(255,120,117,0.4)'
+                  : '0 4px 12px rgba(82,196,26,0.4)',
+                transition: 'right 0.3s ease, background 0.2s',
+                zIndex: 20,
+                color: '#fff',
+              }}
+            >
+              {pilotOpen ? (
+                <CloseOutlined style={{ fontSize: 15 }} />
+              ) : (
+                <RobotOutlined style={{ fontSize: 18 }} />
+              )}
+            </button>
+          </Tooltip>
         )}
       </div>
     </Modal>

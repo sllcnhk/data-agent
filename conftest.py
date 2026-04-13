@@ -148,6 +148,7 @@ def _cleanup_test_data(label: str = ""):
             from backend.models.report import Report
             n = db.query(Report).filter(
                 Report.username.op('~')(r'^_[a-z][a-z0-9]*_')
+                | (Report.username == 'default')
             ).delete(synchronize_session=False)
             if n:
                 tag = f"[{label}] " if label else ""
@@ -165,6 +166,7 @@ def _cleanup_test_data(label: str = ""):
                 .filter(
                     ScheduledReport.owner_username.op('~')(r'^_[a-z][a-z0-9]*_')
                     | ScheduledReport.name.op('~')(r'^_[a-z][a-z0-9]*_')
+                    | (ScheduledReport.owner_username == 'default')
                 )
                 .all()
             )

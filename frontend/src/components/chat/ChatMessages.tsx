@@ -1,13 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Avatar, Button, Empty, Spin, Tag, Tooltip, message as antMessage } from 'antd';
-import { UserOutlined, RobotOutlined, ReloadOutlined, FileOutlined, FilePdfOutlined, FileImageOutlined, DownloadOutlined, FileTextOutlined, FileExcelOutlined, FileZipOutlined, BarChartOutlined, EyeOutlined } from '@ant-design/icons';
+import { UserOutlined, RobotOutlined, ReloadOutlined, FileOutlined, FilePdfOutlined, FileImageOutlined, DownloadOutlined, FileTextOutlined, FileExcelOutlined, FileZipOutlined, BarChartOutlined, EyeOutlined, PushpinOutlined, CheckCircleOutlined } from '@ant-design/icons';
 import ReactMarkdown from 'react-markdown';
 import type { Message, AgentEvent, AgentInfo, LLMConfig, FileInfo } from '../../store/useChatStore';
 import { useChatStore } from '../../store/useChatStore';
 import ThoughtProcess from './ThoughtProcess';
 import { AgentBadge } from './AgentBadge';
 import ContinuationCard from './ContinuationCard';
-import { fileApi } from '../../services/chatApi';
+import { fileApi, reportApi } from '../../services/chatApi';
 import ReportPreviewModal from './ReportPreviewModal';
 
 interface ChatMessagesProps {
@@ -40,9 +40,17 @@ const _getFileIcon = (mimeType: string, name: string) => {
   return <FileOutlined style={{ color: '#8c8c8c' }} />;
 };
 
-const FileDownloadCards: React.FC<{ files: FileInfo[] }> = ({ files }) => {
+interface FileDownloadCardsProps {
+  files: FileInfo[];
+  messageId: string;
+  conversationId?: string;
+}
+
+const FileDownloadCards: React.FC<FileDownloadCardsProps> = ({ files, messageId, conversationId }) => {
   const [downloading, setDownloading] = useState<string | null>(null);
+  const [pinning, setPinning] = useState<string | null>(null);
   const [previewFile, setPreviewFile] = useState<FileInfo | null>(null);
+  const markFilePinned = useChatStore((s) => s.markFilePinned);
 
   const handleDownload = async (file: FileInfo) => {
     setDownloading(file.path);
@@ -55,14 +63,37 @@ const FileDownloadCards: React.FC<{ files: FileInfo[] }> = ({ files }) => {
     }
   };
 
+  const handlePin = async (file: FileInfo) => {
+    if (pinning === file.path) return;
+    setPinning(file.path);
+    try {
+      const docType = file.doc_type ?? 'dashboard';
+      const result = await reportApi.pinReport({
+        file_path: file.path,
+        doc_type: docType,
+        conversation_id: conversationId,
+        message_id: messageId,
+      });
+      markFilePinned(messageId, file.path, result.report_id, result.refresh_token);
+      const label = docType === 'document' ? '报告' : '报表';
+      antMessage.success(`已生成固定${label}，可在数据管理中心查看`);
+    } catch (e: any) {
+      antMessage.error(`固定失败: ${e?.response?.data?.detail ?? e?.message ?? '未知错误'}`);
+    } finally {
+      setPinning(null);
+    }
+  };
+
   return (
     <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 8 }}>
       <div style={{ fontSize: 12, color: '#8c8c8c', marginBottom: 2 }}>
         📎 生成的文件（点击下载）
       </div>
       {files.map((file) => {
-        const isReport = (file as any).is_report === true;
-        const reportId = (file as any).report_id;
+        const isReport = file.is_report === true;
+        const isPinned = !!file.pinned_report_id;
+        const docType = file.doc_type ?? 'dashboard';
+        const docLabel = docType === 'document' ? '报告' : '报表';
         return (
           <div
             key={file.path}
@@ -82,7 +113,7 @@ const FileDownloadCards: React.FC<{ files: FileInfo[] }> = ({ files }) => {
                 : _getFileIcon(file.mime_type, file.name)}
             </span>
             <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                 <div
                   style={{
                     fontSize: 13,
@@ -95,7 +126,12 @@ const FileDownloadCards: React.FC<{ files: FileInfo[] }> = ({ files }) => {
                   {file.name}
                 </div>
                 {isReport && (
-                  <Tag color="blue" style={{ fontSize: 11, margin: 0 }}>交互报告</Tag>
+                  <Tag color={docType === 'document' ? 'purple' : 'blue'} style={{ fontSize: 11, margin: 0 }}>
+                    {docType === 'document' ? '分析报告' : '交互报表'}
+                  </Tag>
+                )}
+                {isPinned && (
+                  <Tag color="green" style={{ fontSize: 11, margin: 0 }}>已固定</Tag>
                 )}
               </div>
               <div style={{ fontSize: 11, color: '#999' }}>
@@ -103,6 +139,7 @@ const FileDownloadCards: React.FC<{ files: FileInfo[] }> = ({ files }) => {
                 {isReport && ' · 含图表 · 可刷新数据'}
               </div>
             </div>
+            {/* 预览按钮（报告） */}
             {isReport && (
               <Button
                 size="small"
@@ -113,6 +150,7 @@ const FileDownloadCards: React.FC<{ files: FileInfo[] }> = ({ files }) => {
                 预览
               </Button>
             )}
+            {/* 下载按钮 */}
             <Button
               size="small"
               icon={<DownloadOutlined />}
@@ -121,6 +159,31 @@ const FileDownloadCards: React.FC<{ files: FileInfo[] }> = ({ files }) => {
             >
               下载
             </Button>
+            {/* 固定按钮（仅 HTML 报告） */}
+            {isReport && (
+              isPinned ? (
+                <Button
+                  size="small"
+                  icon={<CheckCircleOutlined />}
+                  disabled
+                  style={{ color: '#52c41a', borderColor: '#52c41a', background: '#f6ffed' }}
+                >
+                  已生成固定{docLabel}
+                </Button>
+              ) : (
+                <Tooltip title={`点击将此${docLabel}固定到数据管理中心`}>
+                  <Button
+                    size="small"
+                    icon={<PushpinOutlined />}
+                    loading={pinning === file.path}
+                    onClick={() => handlePin(file)}
+                    style={{ borderColor: '#1677ff', color: '#1677ff' }}
+                  >
+                    生成固定{docLabel}
+                  </Button>
+                </Tooltip>
+              )
+            )}
           </div>
         );
       })}
@@ -130,10 +193,15 @@ const FileDownloadCards: React.FC<{ files: FileInfo[] }> = ({ files }) => {
         <ReportPreviewModal
           open={!!previewFile}
           onClose={() => setPreviewFile(null)}
-          reportId={(previewFile as any).report_id}
-          refreshToken={(previewFile as any).refresh_token}
+          reportId={previewFile.pinned_report_id}
+          refreshToken={previewFile.refresh_token}
           filePath={previewFile.path}
           fileName={previewFile.name}
+          pilotContext={previewFile.pinned_report_id ? {
+            contextType: (previewFile.doc_type ?? 'dashboard') as 'dashboard' | 'document',
+            contextId: previewFile.pinned_report_id,
+            contextName: previewFile.name,
+          } : undefined}
         />
       )}
     </div>
@@ -369,7 +437,11 @@ const ChatMessages: React.FC<ChatMessagesProps> = ({
 
               {/* 文件下载卡片（仅助手消息，有文件时展示） */}
               {!isUser && message.files_written && message.files_written.length > 0 && (
-                <FileDownloadCards files={message.files_written} />
+                <FileDownloadCards
+                  files={message.files_written}
+                  messageId={message.id}
+                  conversationId={message.conversation_id}
+                />
               )}
 
               {/* 操作按钮(仅最后一条助手消息) */}

@@ -22,7 +22,10 @@ import {
   MoreOutlined,
   UserOutlined,
   BarChartOutlined,
+  LeftOutlined,
+  RightOutlined,
 } from '@ant-design/icons';
+import { useNavigate } from 'react-router-dom';
 import type { Conversation, ConversationGroup } from '../../store/useChatStore';
 import type { OtherUserConversations } from '../../services/chatApi';
 import GroupItem from './GroupItem';
@@ -42,6 +45,8 @@ interface ConversationSidebarProps {
   onToggleGroupExpand: (groupId: string) => void;
   loading?: boolean;
   otherUsersData?: OtherUserConversations[];
+  collapsed?: boolean;
+  onToggleCollapsed?: () => void;
 }
 
 const ConversationSidebar: React.FC<ConversationSidebarProps> = ({
@@ -59,7 +64,10 @@ const ConversationSidebar: React.FC<ConversationSidebarProps> = ({
   onToggleGroupExpand,
   loading = false,
   otherUsersData = [],
+  collapsed = false,
+  onToggleCollapsed,
 }) => {
+  const navigate = useNavigate();
   const [isCreatingGroup, setIsCreatingGroup] = useState(false);
   const [newGroupName, setNewGroupName] = useState('');
   const [activeTab, setActiveTab] = useState<'mine' | 'others'>('mine');
@@ -253,28 +261,41 @@ const ConversationSidebar: React.FC<ConversationSidebarProps> = ({
   const myConversationsContent = (
     <>
       {/* 顶部按钮 */}
-      <div style={{ padding: '12px 16px', display: 'flex', gap: '8px' }}>
-        <Button
-          type="primary"
-          icon={<PlusOutlined />}
-          onClick={onCreateConversation}
-          block
-          size="middle"
-        >
-          新建对话
-        </Button>
-        <Tooltip title="新建分组">
+      {collapsed ? (
+        <div style={{ padding: '12px 8px', display: 'flex', justifyContent: 'center' }}>
+          <Tooltip title="新建对话" placement="right">
+            <Button
+              type="primary"
+              icon={<PlusOutlined />}
+              onClick={onCreateConversation}
+              size="middle"
+            />
+          </Tooltip>
+        </div>
+      ) : (
+        <div style={{ padding: '12px 16px', display: 'flex', gap: '8px' }}>
           <Button
-            icon={<FolderAddOutlined />}
-            onClick={() => setIsCreatingGroup(true)}
+            type="primary"
+            icon={<PlusOutlined />}
+            onClick={onCreateConversation}
+            block
             size="middle"
-          />
-        </Tooltip>
-      </div>
+          >
+            新建对话
+          </Button>
+          <Tooltip title="新建分组">
+            <Button
+              icon={<FolderAddOutlined />}
+              onClick={() => setIsCreatingGroup(true)}
+              size="middle"
+            />
+          </Tooltip>
+        </div>
+      )}
 
       {/* 对话列表 */}
-      <div style={{ flex: 1, overflow: 'auto', padding: '0 8px' }}>
-        {loading ? (
+      <div style={{ flex: 1, overflow: 'auto', padding: collapsed ? 0 : '0 8px' }}>
+        {collapsed ? null : loading ? (
           <div style={{ textAlign: 'center', padding: '40px 0' }}>
             <Spin />
           </div>
@@ -332,7 +353,7 @@ const ConversationSidebar: React.FC<ConversationSidebarProps> = ({
       </div>
 
       {/* 底部统计 */}
-      {conversations.length > 0 && (
+      {!collapsed && conversations.length > 0 && (
         <div
           style={{
             padding: '10px 16px',
@@ -467,49 +488,87 @@ const ConversationSidebar: React.FC<ConversationSidebarProps> = ({
   ];
 
   return (
-    <div style={{ height: '100%', display: 'flex', flexDirection: 'column' }}>
-      {otherUsersData.length > 0 ? (
-        <Tabs
-          activeKey={activeTab}
-          onChange={(key) => setActiveTab(key as 'mine' | 'others')}
-          size="small"
-          style={{ flex: 1, display: 'flex', flexDirection: 'column' }}
-          tabBarStyle={{ margin: '0 8px', marginBottom: 0 }}
-          items={tabItems}
-        />
-      ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', flex: 1 }}>
-          {myConversationsContent}
-        </div>
-      )}
+    <div style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+      {/* 对话列表区域（可滚动） */}
+      <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+        {otherUsersData.length > 0 ? (
+          <Tabs
+            activeKey={activeTab}
+            onChange={(key) => setActiveTab(key as 'mine' | 'others')}
+            size="small"
+            style={{ flex: 1, display: 'flex', flexDirection: 'column' }}
+            tabBarStyle={{ margin: '0 8px', marginBottom: 0 }}
+            items={tabItems}
+          />
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', flex: 1 }}>
+            {myConversationsContent}
+          </div>
+        )}
+      </div>
 
-      {/* 数据管理中心入口 */}
-      <Tooltip title="数据管理中心" placement="right">
+      {/* 收起按钮 */}
+      <div
+        onClick={onToggleCollapsed}
+        style={{
+          height: 40,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          borderTop: '1px solid #f0f0f0',
+          cursor: 'pointer',
+          color: '#8c8c8c',
+          fontSize: 12,
+          gap: 6,
+          transition: 'all 0.2s',
+          flexShrink: 0,
+          userSelect: 'none',
+        }}
+        onMouseEnter={e => {
+          (e.currentTarget as HTMLDivElement).style.background = '#fafafa';
+          (e.currentTarget as HTMLDivElement).style.color = '#595959';
+        }}
+        onMouseLeave={e => {
+          (e.currentTarget as HTMLDivElement).style.background = 'transparent';
+          (e.currentTarget as HTMLDivElement).style.color = '#8c8c8c';
+        }}
+      >
+        {collapsed ? <RightOutlined style={{ fontSize: 12 }} /> : <><LeftOutlined style={{ fontSize: 12 }} /><span>收起</span></>}
+      </div>
+
+      {/* 数据管理中心悬浮按钮 */}
+      <Tooltip title={collapsed ? '数据管理中心' : ''} placement="right">
         <div
-          onClick={() => window.open('/data-center', '_blank')}
+          onClick={() => navigate('/data-center')}
           style={{
-            margin: '8px 12px',
-            padding: '8px 12px',
-            borderRadius: 8,
-            background: 'linear-gradient(135deg, #1677ff14, #1677ff08)',
-            border: '1px solid #1677ff30',
+            margin: collapsed ? '8px 6px' : '8px 10px',
+            padding: collapsed ? '10px 0' : '10px 14px',
+            borderRadius: 10,
+            background: 'linear-gradient(135deg, #1677ff, #4096ff)',
+            boxShadow: '0 4px 12px rgba(22,119,255,0.35)',
             display: 'flex',
             alignItems: 'center',
+            justifyContent: collapsed ? 'center' : 'flex-start',
             gap: 8,
             cursor: 'pointer',
             transition: 'all 0.2s',
+            flexShrink: 0,
           }}
           onMouseEnter={e => {
-            (e.currentTarget as HTMLDivElement).style.background = 'linear-gradient(135deg, #1677ff22, #1677ff12)';
-            (e.currentTarget as HTMLDivElement).style.borderColor = '#1677ff60';
+            (e.currentTarget as HTMLDivElement).style.boxShadow = '0 6px 16px rgba(22,119,255,0.5)';
+            (e.currentTarget as HTMLDivElement).style.transform = 'translateY(-1px)';
           }}
           onMouseLeave={e => {
-            (e.currentTarget as HTMLDivElement).style.background = 'linear-gradient(135deg, #1677ff14, #1677ff08)';
-            (e.currentTarget as HTMLDivElement).style.borderColor = '#1677ff30';
+            (e.currentTarget as HTMLDivElement).style.boxShadow = '0 4px 12px rgba(22,119,255,0.35)';
+            (e.currentTarget as HTMLDivElement).style.transform = 'translateY(0)';
           }}
         >
-          <BarChartOutlined style={{ color: '#1677ff', fontSize: 16 }} />
-          <span style={{ fontSize: 13, color: '#1677ff', fontWeight: 500 }}>数据管理</span>
+          <BarChartOutlined style={{ color: '#fff', fontSize: collapsed ? 18 : 16, flexShrink: 0 }} />
+          {!collapsed && (
+            <span style={{ fontSize: 13, color: '#fff', fontWeight: 500, whiteSpace: 'nowrap' }}>
+              数据管理中心
+            </span>
+          )}
         </div>
       </Tooltip>
 

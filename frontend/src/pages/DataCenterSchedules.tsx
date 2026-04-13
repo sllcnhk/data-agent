@@ -697,6 +697,7 @@ const DataCenterSchedules: React.FC = () => {
         onClose={() => setHistoryDrawerId(null)}
         width={600}
         destroyOnClose
+        styles={{ body: { position: 'relative', paddingBottom: 72 } }}
         extra={
           <Button
             size="small"
@@ -721,6 +722,36 @@ const DataCenterSchedules: React.FC = () => {
             locale={{ emptyText: <Empty description="暂无执行记录" /> }}
           />
         )}
+
+        {/* ── Pilot FAB（历史抽屉右下角） ──────────────────────────────── */}
+        <Tooltip title="AI 助手 Pilot" placement="left">
+          <button
+            style={{
+              position: 'absolute',
+              bottom: 20,
+              right: 20,
+              width: 44,
+              height: 44,
+              borderRadius: '50%',
+              background: '#52c41a',
+              border: 'none',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              boxShadow: '0 4px 12px rgba(82,196,26,0.4)',
+              zIndex: 10,
+              color: '#fff',
+              fontSize: 18,
+            }}
+            onClick={() => {
+              const s = schedules.find((sc) => sc.id === historyDrawerId);
+              if (s) setCopilotSchedule(s);
+            }}
+          >
+            <RobotOutlined style={{ fontSize: 18 }} />
+          </button>
+        </Tooltip>
       </Drawer>
 
       {/* ── AI 助手 Drawer ──────────────────────────────────────────────── */}

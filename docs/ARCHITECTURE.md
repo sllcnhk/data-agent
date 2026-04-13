@@ -1009,8 +1009,28 @@ AgenticLoop / 用户直接调用 POST /reports/build
   │
   ├─ 写入 customer_data/{username}/reports/{slug}_{ts}.html
   ├─ 数据库插入 Report 记录（username / refresh_token / report_file_path / summary_status）
-  ├─ is_report=true 标记注入 SSE files_written 事件 → 前端渲染"预览"按钮
+  │    ⚠ 仅 POST /reports/build 直接调用时自动入库；聊天中 Agent 直写文件不触发此步
+  ├─ is_report=true + doc_type 标记注入 SSE files_written 事件 → 前端渲染"预览+固定"按钮
   └─ 如 include_summary=true → BackgroundTask 异步调用 LLM → 更新 DB + HTML
+
+聊天生成文件手动固定（Pin Report）流程
+  agentic_loop.py 写文件（write_file 工具调用成功）
+    ↓ _detect_report_type(file_path, content, mime) 模块级函数
+    │   ├─ MIME 非 text/html → (is_report=False, doc_type=None)
+    │   ├─ 路径不含 /reports/ → (is_report=False, doc_type=None)
+    │   ├─ content 含 class="summary-section" → doc_type="document"
+    │   └─ 其余 HTML in /reports/ → doc_type="dashboard"
+    └─ files_written SSE 事件附带 {is_report, doc_type} → FileDownloadCards 渲染固定按钮
+
+  用户点击「生成固定报表/报告」→ POST /api/v1/reports/pin（需 reports:create 权限）
+    ├─ 路径安全校验（防目录穿越 + 跨用户隔离）
+    ├─ 幂等查询 report_file_path → 已存在返回 {is_new: false, report_id}
+    ├─ 新建 Report DB 记录（refresh_token / doc_type / report_file_path / username）
+    ├─ 若传入 message_id：
+    │    ├─ 查询 Message.extra_metadata.files_written[]
+    │    ├─ 匹配 file_path → 写入 pinned_report_id + refresh_token
+    │    └─ flag_modified(msg, "extra_metadata") 确保 SQLAlchemy JSONB 检测变更
+    └─ 返回 {report_id, refresh_token, doc_type, is_new}
 
 数据刷新（Report HTML 内"刷新"按钮调用）
   GET /api/v1/reports/{id}/refresh-data?token={refresh_token}
@@ -1061,8 +1081,10 @@ LLM 总结生成
 | `backend/api/reports.py` | 8 个 REST 端点 |
 | `backend/models/report.py` | Report ORM（新增 5 字段）|
 | `frontend/src/pages/Reports.tsx` | 报告列表管理页 |
-| `frontend/src/components/chat/ReportPreviewModal.tsx` | iframe 全屏预览 + 导出 |
-| `frontend/src/components/chat/ChatMessages.tsx` | 报告文件卡片（预览/下载按钮）|
+| `backend/agents/agentic_loop.py` | `_detect_report_type()` 模块级函数（doc_type 检测）|
+| `backend/api/reports.py` | `POST /reports/pin` 端点（手动固定 + message_id 回写）|
+| `frontend/src/components/chat/ReportPreviewModal.tsx` | iframe 全屏预览 + 导出 + 弹窗内固定按钮 |
+| `frontend/src/components/chat/ChatMessages.tsx` | 报告文件卡片（预览 / 下载 / 固定报表按钮）|
 | `.claude/skills/project/chart-reporter.md` | Skill 文件（触发词 + spec 文档）|
 
 ---

@@ -424,4 +424,30 @@ export const fileApi = {
   },
 };
 
+export interface PinReportParams {
+  file_path: string;
+  doc_type: string;
+  name?: string;
+  conversation_id?: string;
+  message_id?: string;
+}
+
+export interface PinReportResult {
+  report_id: string;
+  refresh_token: string;
+  doc_type: string;
+  is_new: boolean;
+}
+
+export const reportApi = {
+  /**
+   * 将对话中已生成的 HTML 文件固定为正式报表/报告，写入 reports 数据库。
+   * 幂等：同一 file_path 已固定则返回已有记录（is_new=false）。
+   */
+  pinReport: async (params: PinReportParams): Promise<PinReportResult> => {
+    const response = await apiClient.post('/reports/pin', params);
+    return response.data?.data as PinReportResult;
+  },
+};
+
 export default apiClient;

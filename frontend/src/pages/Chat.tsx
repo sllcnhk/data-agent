@@ -574,13 +574,17 @@ const Chat: React.FC = () => {
       {/* 左侧对话列表 */}
       <Sider
         width={280}
+        collapsedWidth={56}
         collapsible
         collapsed={collapsed}
         onCollapse={setCollapsed}
+        trigger={null}
         theme="light"
         style={{
           borderRight: '1px solid #f0f0f0',
-          overflow: 'auto',
+          overflow: 'hidden',
+          display: 'flex',
+          flexDirection: 'column',
         }}
       >
         <ConversationSidebar
@@ -598,6 +602,8 @@ const Chat: React.FC = () => {
           onToggleGroupExpand={handleToggleGroupExpand}
           loading={loading}
           otherUsersData={authUser?.is_superadmin ? otherUsersData : []}
+          collapsed={collapsed}
+          onToggleCollapsed={() => setCollapsed((c) => !c)}
         />
       </Sider>
 

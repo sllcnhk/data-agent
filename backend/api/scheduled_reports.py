@@ -475,3 +475,61 @@ async def test_notify_channel(
         )
 
     return {"success": True, "message": "测试发送成功"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. 创建 Co-pilot 对话
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/{schedule_id}/copilot")
+async def create_schedule_copilot(
+    schedule_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_permission("schedules", "read")),
+):
+    """
+    为指定推送任务创建一个 Co-pilot 对话，系统提示中注入任务上下文。
+    返回新建对话 ID，前端通过该 ID 与 LLM 对话。
+    """
+    from backend.services.conversation_service import ConversationService
+
+    username = getattr(current_user, "username", "default")
+    is_superadmin = getattr(current_user, "is_superadmin", False)
+
+    sr = _get_sr_or_404(schedule_id, db)
+    _check_sr_ownership(sr, username, is_superadmin)
+
+    channels = sr.notify_channels or []
+    channel_types = list({ch.get("type", "unknown") for ch in channels})
+    channel_summary = "、".join(channel_types) if channel_types else "无"
+
+    copilot_system_prompt = (
+        f"[Co-pilot 模式] 当前推送任务：{sr.name}\n"
+        f"Cron 表达式：{sr.cron_expr}（时区：{sr.timezone}）\n"
+        f"通知渠道：{channel_summary}\n"
+        f"状态：{'已启用' if sr.is_active else '已停用'}\n"
+        f"执行次数：{sr.run_count}，失败次数：{sr.fail_count}\n"
+        f"任务 ID：{sr.id}\n\n"
+        "你可以帮助用户修改推送频率、通知渠道配置、启停任务等。\n"
+        f"修改时调用 PUT /api/v1/scheduled-reports/{sr.id} 接口。\n"
+        "请用简洁中文回复，修改前向用户确认。"
+    )
+
+    user_id = getattr(current_user, "id", None)
+    if user_id is not None and str(user_id) == "default":
+        user_id = None
+
+    svc = ConversationService(db)
+    conv = svc.create_conversation(
+        title=f"推送任务助手 — {sr.name}",
+        system_prompt=copilot_system_prompt,
+        metadata={"context_type": "schedule", "context_id": str(sr.id)},
+        user_id=user_id,
+    )
+
+    logger.info(
+        "[ScheduledReports] co-pilot 对话已创建: schedule_id=%s, conv_id=%s",
+        schedule_id,
+        conv.id,
+    )
+    return {"success": True, "data": {"conversation_id": str(conv.id)}}
