@@ -364,18 +364,42 @@ if(document.readyState==='loading'){
 """
 
 
-def _inject_chart_controls(html_content: str) -> str:
+def _inject_chart_controls(
+    html_content: str,
+    report_id: Optional[str] = None,
+    refresh_token: Optional[str] = None,
+) -> str:
     """
     在 </body> 前注入图表控件 CSS+JS（⋮ kebab 菜单：Force Refresh / Enter Fullscreen / View Query / Download）。
     若已注入（含 __cc-style 标记）则幂等跳过；无 </body> 则追加到末尾。
+
+    report_id / refresh_token: 若提供，则先注入 __cc-vars 脚本覆盖 window.REPORT_ID 等全局变量，
+    解决 Agent 直接写入的 HTML 文件缺少这些全局变量导致 Force Refresh 降级的问题。
     """
     if "__cc-style" in html_content:
         return html_content
+
+    # 若 HTML 文件本身不含 REPORT_ID 变量声明（Agent 写入的文件可能在注释中提到该词），
+    # 则注入 __cc-vars 覆盖脚本。用 "var REPORT_ID=" 检测实际的 JS 变量声明，
+    # 避免将注释中提到 REPORT_ID 误判为"已声明"。
+    override_js = ""
+    if report_id and "var REPORT_ID=" not in html_content:
+        safe_rid = str(report_id).replace('"', "").replace("'", "").replace("<", "").replace(">", "")
+        safe_tok = str(refresh_token or "").replace('"', "").replace("'", "").replace("<", "").replace(">", "")
+        override_js = (
+            f'<script id="__cc-vars">'
+            f'if(!window.REPORT_ID)window.REPORT_ID="{safe_rid}";'
+            f'if(!window.REFRESH_TOKEN)window.REFRESH_TOKEN="{safe_tok}";'
+            f'if(!window.API_BASE)window.API_BASE="/api/v1";'
+            f'</script>\n'
+        )
+
+    snippet = override_js + _CHART_CONTROLS_SNIPPET
     lower = html_content.lower()
     idx = lower.rfind("</body>")
     if idx >= 0:
-        return html_content[:idx] + _CHART_CONTROLS_SNIPPET + html_content[idx:]
-    return html_content + _CHART_CONTROLS_SNIPPET
+        return html_content[:idx] + snippet + html_content[idx:]
+    return html_content + snippet
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -996,7 +1020,7 @@ async def serve_report_html_by_token(
         headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{encoded}"
     else:
         # 非下载模式：注入图表控件 + 悬浮 Pilot 按钮（按 doc_type 路由到正确页面）
-        content = _inject_chart_controls(content)
+        content = _inject_chart_controls(content, report_id=report_id, refresh_token=report.refresh_token)
         doc_type_val = getattr(report.doc_type, "value", report.doc_type) or "dashboard"
         content = _inject_pilot_button(content, report_id, doc_type=str(doc_type_val))
 
