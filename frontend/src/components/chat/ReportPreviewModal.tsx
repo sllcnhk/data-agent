@@ -177,9 +177,25 @@ const ReportPreviewModal: React.FC<ReportPreviewModalProps> = ({
     a.click();
   }, [exportDownloadUrl, exportFormat, fileName]);
 
+  // iframe 加载完成：隐藏 iframe 内 server 注入的 Pilot FAB，避免与 React FAB 重叠
+  const handleIframeLoad = useCallback(() => {
+    setIframeLoading(false);
+    iframeRef.current?.contentWindow?.postMessage({ type: 'pilotHideFab' }, '*');
+  }, []);
+
   const openInNewTab = useCallback(() => {
-    if (iframeSrc) window.open(iframeSrc, '_blank');
-  }, [iframeSrc]);
+    if (reportId && refreshToken && pilotContext) {
+      // 打开分屏查看页：左侧报表 + 右侧 Copilot，而非裸 HTML
+      const docType = pilotContext.contextType === 'document' ? 'document' : 'dashboard';
+      const name = encodeURIComponent(pilotContext.contextName || fileName);
+      window.open(
+        `/report-view?id=${encodeURIComponent(reportId)}&token=${encodeURIComponent(refreshToken)}&doc_type=${docType}&name=${name}`,
+        '_blank',
+      );
+    } else if (iframeSrc) {
+      window.open(iframeSrc, '_blank');
+    }
+  }, [reportId, refreshToken, pilotContext, iframeSrc, fileName]);
 
   const exportStatusTag = () => {
     if (exportStatus === 'idle') return null;
@@ -297,7 +313,7 @@ const ReportPreviewModal: React.FC<ReportPreviewModalProps> = ({
               ref={iframeRef}
               src={iframeSrc}
               title={fileName}
-              onLoad={() => setIframeLoading(false)}
+              onLoad={handleIframeLoad}
               style={{
                 width: '100%',
                 height: '100%',

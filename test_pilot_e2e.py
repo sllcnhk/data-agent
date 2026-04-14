@@ -478,6 +478,49 @@ class TestIHtmlInjectionDocType(unittest.TestCase):
             self.assertIn("window.top", result,
                           f"doc_type={doc_type} 的注入应检测 window.top（iframe 判断）")
 
+    # I5: 注入 JS 含 pilotHideFab postMessage 监听（父窗口可隐藏 iframe Pilot FAB）
+    def test_I5_injection_has_pilot_hide_fab_listener(self):
+        """Problem 1 修复：注入 JS 支持 {type:'pilotHideFab'} 消息隐藏 FAB"""
+        html = "<html><body></body></html>"
+        rid = str(uuid.uuid4())
+        result = self._inject(html, rid, doc_type="dashboard")
+        self.assertIn("pilotHideFab", result,
+                      "注入 JS 应含 pilotHideFab 监听（由预览 Modal 发送以隐藏重叠图标）")
+        self.assertIn("pilotShowFab", result,
+                      "注入 JS 应含 pilotShowFab 监听（可恢复显示）")
+        # 监听在 window.addEventListener('message', ...) 内
+        self.assertIn("window.addEventListener('message'", result,
+                      "pilotHideFab 应通过 window.addEventListener('message') 监听")
+
+    # I6: standalone 模式含 /report-view 路径（Problem 2 修复：不再仅跳报表清单）
+    def test_I6_standalone_navigation_uses_report_view_path(self):
+        """Problem 2 修复：独立标签页 Pilot 导航到 /report-view 分屏页"""
+        html = "<html><body></body></html>"
+        rid = str(uuid.uuid4())
+        for doc_type in ["dashboard", "document"]:
+            result = self._inject(html, rid, doc_type=doc_type)
+            self.assertIn("/report-view", result,
+                          f"doc_type={doc_type} 的 standalone 导航应指向 /report-view 分屏页")
+        # 兜底路径仍保留（REFRESH_TOKEN 不可用时）
+        self.assertIn("/data-center/", result,
+                      "兜底路径 /data-center/ 仍应存在（REFRESH_TOKEN 不可用时使用）")
+
+    # I7: standalone 导航读取 REFRESH_TOKEN 全局变量构建 URL
+    def test_I7_standalone_navigation_uses_refresh_token_global(self):
+        """Problem 2 修复：/report-view 导航 URL 含 REFRESH_TOKEN 全局变量"""
+        html = "<html><body></body></html>"
+        rid = str(uuid.uuid4())
+        result = self._inject(html, rid, doc_type="dashboard")
+        self.assertIn("REFRESH_TOKEN", result,
+                      "standalone 导航 URL 应包含 REFRESH_TOKEN（sg('REFRESH_TOKEN')）")
+        self.assertIn("sg(", result,
+                      "sg() 辅助函数应内联在 pilot 注入脚本中")
+        # /report-view URL 含 id= 和 token= 参数
+        self.assertIn("report-view?id=", result,
+                      "/report-view URL 应含 id= 参数")
+        self.assertIn("&token=", result,
+                      "/report-view URL 应含 token= 参数（REFRESH_TOKEN 值）")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # J段 — 端到端 Pilot 流程（需要 DB）

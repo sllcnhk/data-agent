@@ -91,15 +91,45 @@ _PILOT_INJECT_TEMPLATE = """
   var fab = document.getElementById('__pilot-fab');
   var tip = document.getElementById('__pilot-tip');
   if (!fab) return;
+
+  // 安全读取 window 全局变量（_inject_chart_controls 中也有 sg，这里内联一份）
+  function sg(n){try{return window[n];}catch(e){return undefined;}}
+
+  // 父窗口可通过 postMessage 控制 FAB 显隐：
+  //   {type:'pilotHideFab'} → 隐藏（预览 Modal 嵌入场景，由 React FAB 替代）
+  //   {type:'pilotShowFab'} → 恢复显示
+  window.addEventListener('message', function(e){
+    if (!e.data) return;
+    if (e.data.type === 'pilotHideFab') {
+      fab.style.setProperty('display', 'none', 'important');
+      if (tip) tip.style.setProperty('display', 'none', 'important');
+    } else if (e.data.type === 'pilotShowFab') {
+      fab.style.removeProperty('display');
+      if (tip) tip.style.removeProperty('display');
+    }
+  });
+
   fab.addEventListener('mouseenter', function(){ tip.style.opacity = '1'; });
   fab.addEventListener('mouseleave', function(){ tip.style.opacity = '0'; });
   fab.addEventListener('click', function(){
     var rid = '__REPORT_ID_PLACEHOLDER__';
     var page = '__PAGE_PLACEHOLDER__';
     if (window !== window.top) {
+      // 嵌入在 iframe 内（预览 Modal 或 ReportViewerPage）：通知父窗口打开 Pilot
       try { window.parent.postMessage({ type: 'openPilot', reportId: rid }, '*'); } catch(e) {}
     } else {
-      window.open(window.location.origin + '/data-center/' + page + '?autoPilot=' + rid, '_blank');
+      // 独立标签页：导航到 /report-view 分屏页（左报表 + 右 Copilot）
+      var tok = sg('REFRESH_TOKEN') || '';
+      var docType = '__DOC_TYPE_PLACEHOLDER__';
+      if (rid && tok) {
+        window.location.href = window.location.origin
+          + '/report-view?id=' + encodeURIComponent(rid)
+          + '&token=' + encodeURIComponent(tok)
+          + '&doc_type=' + docType;
+      } else {
+        // 兜底（无全局变量时）：沿用旧行为
+        window.open(window.location.origin + '/data-center/' + page + '?autoPilot=' + rid, '_blank');
+      }
     }
   });
 })();
@@ -110,10 +140,12 @@ _PILOT_INJECT_TEMPLATE = """
 def _inject_pilot_button(html_content: str, report_id: str, doc_type: str = "dashboard") -> str:
     """在 </body> 前注入悬浮 Pilot 按钮脚本，若无 </body> 则追加至末尾。"""
     page = "documents" if doc_type == "document" else "dashboards"
+    doc_type_value = "document" if doc_type == "document" else "dashboard"
     snippet = (
         _PILOT_INJECT_TEMPLATE
         .replace("__REPORT_ID_PLACEHOLDER__", report_id)
         .replace("__PAGE_PLACEHOLDER__", page)
+        .replace("__DOC_TYPE_PLACEHOLDER__", doc_type_value)
     )
     lower = html_content.lower()
     idx = lower.rfind("</body>")

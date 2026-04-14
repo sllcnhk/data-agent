@@ -19,6 +19,7 @@ import DataCenterLayout from './components/DataCenterLayout';
 import DataCenterDashboards from './pages/DataCenterDashboards';
 import DataCenterDocuments from './pages/DataCenterDocuments';
 import DataCenterSchedules from './pages/DataCenterSchedules';
+import ReportViewerPage from './pages/ReportViewerPage';
 import { useAuthStore } from '@/store/useAuthStore';
 
 const { Content } = Layout;
@@ -66,6 +67,9 @@ function App() {
       <Routes>
         {/* 登录页（无需认证）*/}
         <Route path="/login" element={<Login />} />
+
+        {/* 报表分屏查看页（通过 refresh_token 访问，无需 JWT 登录）*/}
+        <Route path="/report-view" element={<ReportViewerPage />} />
 
         {/* 聊天页面不使用 AppLayout（全屏布局）*/}
         <Route path="/" element={
