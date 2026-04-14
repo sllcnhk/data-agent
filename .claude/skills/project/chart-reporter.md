@@ -215,3 +215,4 @@ always_inject: false
 - 报告 HTML 文件保存在 `customer_data/{username}/reports/` 目录下
 - 生成后前端显示「预览」「下载」「生成固定报表/报告」三个按钮
 - 「生成固定报表/报告」须用户主动点击，点后才进入数据管理中心清单；`include_summary:true` 入「报告」清单，否则入「报表」清单
+- 每个 `charts[]` 条目的 `sql` 字段务必填写真实可重现图表数据的 SQL；系统会在报告预览页每个图表右上角注入「⋮」菜单，其中「View Query」功能直接读取该字段展示给用户，「Force Refresh」功能重新执行该 SQL 更新数据，`sql` 为空时两项功能降级处理

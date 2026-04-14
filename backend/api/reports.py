@@ -122,6 +122,262 @@ def _inject_pilot_button(html_content: str, report_id: str, doc_type: str = "das
     return html_content + snippet
 
 
+# ── 图表控件注入（Chart Controls：⋮ kebab 菜单）────────────────────────────────
+_CHART_CONTROLS_SNIPPET = """
+<style id="__cc-style">
+.cc-menu-btn{position:absolute!important;top:8px!important;right:8px!important;width:28px!important;height:28px!important;border:none!important;background:rgba(255,255,255,.88)!important;border-radius:50%!important;cursor:pointer!important;display:flex!important;align-items:center!important;justify-content:center!important;font-size:18px!important;font-weight:700!important;color:#595959!important;z-index:100!important;box-shadow:0 1px 4px rgba(0,0,0,.15)!important;padding:0!important;line-height:1!important;transition:background .15s!important}
+.cc-menu-btn:hover{background:#fff!important;box-shadow:0 2px 8px rgba(0,0,0,.22)!important}
+.cc-dropdown{position:absolute!important;top:40px!important;right:8px!important;background:#fff!important;border-radius:8px!important;box-shadow:0 4px 16px rgba(0,0,0,.15)!important;z-index:200!important;min-width:165px!important;padding:4px 0!important;display:none!important;border:1px solid #f0f0f0!important}
+.cc-dropdown.cc-open{display:block!important}
+.cc-menu-item{padding:8px 16px!important;font-size:13px!important;cursor:pointer!important;color:#262626!important;white-space:nowrap!important;transition:background .1s!important;user-select:none!important}
+.cc-menu-item:hover{background:#f5f5f5!important}
+.cc-menu-sep{height:1px!important;background:#f0f0f0!important;margin:4px 0!important}
+.cc-modal-overlay{display:none;position:fixed!important;top:0!important;left:0!important;right:0!important;bottom:0!important;background:rgba(0,0,0,.5)!important;z-index:10000!important;align-items:center!important;justify-content:center!important}
+.cc-modal-box{background:#fff!important;border-radius:8px!important;padding:24px!important;min-width:480px!important;max-width:720px!important;width:90vw!important;max-height:80vh!important;overflow-y:auto!important;box-shadow:0 8px 32px rgba(0,0,0,.2)!important}
+.cc-modal-header{display:flex!important;justify-content:space-between!important;align-items:center!important;margin-bottom:4px!important}
+.cc-modal-title{font-size:16px!important;font-weight:600!important;color:#262626!important}
+.cc-modal-subtitle{font-size:12px!important;color:#8c8c8c!important;margin-bottom:16px!important}
+.cc-modal-close{border:none!important;background:none!important;cursor:pointer!important;font-size:16px!important;color:#8c8c8c!important;padding:4px 8px!important;border-radius:4px!important}
+.cc-modal-close:hover{color:#262626!important;background:#f5f5f5!important}
+.cc-sql-block{background:#f6f8fa!important;border:1px solid #e8e8e8!important;border-radius:6px!important;padding:16px!important;font-family:'SFMono-Regular',Consolas,'Liberation Mono',Menlo,monospace!important;font-size:13px!important;color:#24292e!important;overflow-x:auto!important;white-space:pre-wrap!important;word-break:break-all!important;max-height:320px!important;overflow-y:auto!important;margin:0!important}
+.cc-modal-actions{margin-top:16px!important;display:flex!important;gap:8px!important}
+.cc-copy-btn{padding:6px 14px!important;border:1px solid #d9d9d9!important;background:#fff!important;border-radius:4px!important;cursor:pointer!important;font-size:13px!important;transition:all .15s!important}
+.cc-copy-btn:hover{border-color:#1677ff!important;color:#1677ff!important}
+.chart-card:fullscreen,.chart-card:-webkit-full-screen,.chart-card:-moz-full-screen{background:#fff!important;padding:24px!important;box-sizing:border-box!important}
+.chart-card:fullscreen .chart-container,.chart-card:-webkit-full-screen .chart-container,.chart-card:-moz-full-screen .chart-container{height:calc(100vh - 80px)!important}
+</style>
+<script id="__cc-script">
+(function(){
+'use strict';
+if(document.getElementById('__cc-init'))return;
+var _m=document.createElement('meta');_m.id='__cc-init';document.head.appendChild(_m);
+
+function sg(n){try{return window[n];}catch(e){return undefined;}}
+
+function _esc(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function triggerDl(blob,name){
+  var url=URL.createObjectURL(blob);
+  var a=document.createElement('a');
+  a.href=url;a.download=name;
+  document.body.appendChild(a);a.click();
+  document.body.removeChild(a);
+  setTimeout(function(){URL.revokeObjectURL(url);},1200);
+}
+
+function getChart(cid){
+  var cs=sg('_charts')||{};
+  return cs[cid]||(typeof echarts!=='undefined'&&echarts.getInstanceByDom(document.getElementById(cid)))||null;
+}
+
+function getChartSpec(cid){
+  var rs=sg('REPORT_SPEC');
+  return rs&&rs.charts&&rs.charts.find(function(c){return c.id===cid;})||null;
+}
+
+// ── T4: Force Refresh ─────────────────────────────────────────────────────────
+window.ccForceRefresh=function(cid){
+  var chart=getChart(cid);
+  if(!chart)return;
+  var rid=sg('REPORT_ID'),tok=sg('REFRESH_TOKEN'),base=sg('API_BASE');
+  if(rid&&tok&&base){
+    chart.showLoading({text:'刷新中\u2026',maskColor:'rgba(255,255,255,0.75)'});
+    fetch(base+'/reports/'+rid+'/refresh-data?token='+encodeURIComponent(tok))
+      .then(function(r){return r.json();})
+      .then(function(json){
+        chart.hideLoading();
+        if(json.success&&json.data&&json.data[cid]){
+          var nd=json.data[cid];
+          if(window._chartData)window._chartData[cid]=nd;
+          var sp=getChartSpec(cid);
+          if(sp&&typeof buildEChartsOption==='function'){
+            chart.setOption(buildEChartsOption(sp,nd),{notMerge:true});
+          }else{var o=chart.getOption();chart.clear();chart.setOption(o);}
+        }
+      })
+      .catch(function(){
+        chart.hideLoading();
+        var o=chart.getOption();chart.clear();chart.setOption(o);
+      });
+  }else{
+    var o=chart.getOption();chart.clear();chart.setOption(o);
+  }
+};
+
+// ── T5: Enter Fullscreen ──────────────────────────────────────────────────────
+window.ccFullscreen=function(cid){
+  var card=document.getElementById('card-'+cid);
+  if(!card)return;
+  var rfs=card.requestFullscreen||card.webkitRequestFullscreen||card.mozRequestFullScreen||card.msRequestFullscreen;
+  if(!rfs){alert('当前浏览器不支持全屏');return;}
+  rfs.call(card);
+  function onFs(){var c=getChart(cid);if(c)setTimeout(function(){c.resize();},50);}
+  document.addEventListener('fullscreenchange',onFs,{once:true});
+  document.addEventListener('webkitfullscreenchange',onFs,{once:true});
+  document.addEventListener('mozfullscreenchange',onFs,{once:true});
+};
+
+// ── T6: View Query ────────────────────────────────────────────────────────────
+window.ccViewQuery=function(cid){
+  var sp=getChartSpec(cid);
+  var sql=sp&&sp.sql?sp.sql:'';
+  var title=sp&&sp.title?sp.title:cid;
+  var modal=document.getElementById('__cc-qm');
+  if(!modal){
+    modal=document.createElement('div');
+    modal.id='__cc-qm';
+    modal.className='cc-modal-overlay';
+    modal.innerHTML=
+      '<div class="cc-modal-box">'+
+        '<div class="cc-modal-header">'+
+          '<span class="cc-modal-title" id="__cc-qm-t"></span>'+
+          '<button class="cc-modal-close" onclick="document.getElementById(\'__cc-qm\').style.display=\'none\'">&#10005;</button>'+
+        '</div>'+
+        '<div class="cc-modal-subtitle">View Query</div>'+
+        '<pre class="cc-sql-block" id="__cc-qm-s"></pre>'+
+        '<div class="cc-modal-actions">'+
+          '<button class="cc-copy-btn" id="__cc-qm-c" onclick="ccCopySql()">&#128203; \u590d\u5236 SQL</button>'+
+        '</div>'+
+      '</div>';
+    modal.addEventListener('click',function(e){if(e.target===modal)modal.style.display='none';});
+    document.body.appendChild(modal);
+  }
+  document.getElementById('__cc-qm-t').textContent=title;
+  var se=document.getElementById('__cc-qm-s');
+  se.textContent=sql||'\u8be5\u56fe\u8868\u6682\u65e0\u67e5\u8be2\u8bed\u53e5';
+  se.style.color=sql?'':'#999';
+  modal.style.display='flex';
+};
+
+window.ccCopySql=function(){
+  var sql=document.getElementById('__cc-qm-s').textContent;
+  if(!sql||sql==='\u8be5\u56fe\u8868\u6682\u65e0\u67e5\u8be2\u8bed\u53e5')return;
+  var btn=document.getElementById('__cc-qm-c');
+  function ok(){if(btn){btn.innerHTML='\u2713 \u5df2\u590d\u5236';setTimeout(function(){btn.innerHTML='&#128203; \u590d\u5236 SQL';},2000);}}
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(sql).then(ok).catch(fallback);
+  }else{fallback();}
+  function fallback(){
+    var ta=document.createElement('textarea');
+    ta.value=sql;ta.style.position='fixed';ta.style.opacity='0';
+    document.body.appendChild(ta);ta.select();
+    try{document.execCommand('copy');ok();}catch(e){}
+    document.body.removeChild(ta);
+  }
+};
+
+// ── T7: Download CSV / Excel ──────────────────────────────────────────────────
+window.ccDownload=function(cid,fmt){
+  var cd=sg('_chartData')||{};
+  var rows=(cd[cid]||[]).slice();
+  var sp=getChartSpec(cid);
+  var title=sp&&sp.title?sp.title:cid;
+  if(!rows.length){
+    var chart=getChart(cid);
+    if(chart){
+      try{
+        var opt=chart.getOption();
+        var labels=(opt.xAxis&&opt.xAxis[0]&&opt.xAxis[0].data)||[];
+        var series=opt.series||[];
+        if(labels.length){
+          rows=labels.map(function(lbl,i){
+            var row={'\u7c7b\u522b':lbl};
+            series.forEach(function(s){row[s.name||'value']=Array.isArray(s.data)?s.data[i]:'';});
+            return row;
+          });
+        }
+      }catch(e){}
+    }
+  }
+  if(!rows.length){alert('\u6682\u65e0\u6570\u636e\u53ef\u4e0b\u8f7d');return;}
+  var cols=Object.keys(rows[0]);
+  var date=new Date().toISOString().slice(0,10);
+  var fname=(title||cid).replace(/[^\\w\\u4e00-\\u9fff]/g,'_')+'_'+date;
+  if(fmt==='csv'){
+    var BOM='\\uFEFF';
+    var lines=[cols.join(',')].concat(rows.map(function(r){
+      return cols.map(function(c){
+        var v=r[c]==null?'':String(r[c]);
+        var needQ=v.indexOf(',')>=0||v.indexOf('"')>=0||v.indexOf('\\n')>=0;
+        return needQ?'"'+v.replace(/"/g,'""')+'"':v;
+      }).join(',');
+    }));
+    triggerDl(new Blob([BOM+lines.join('\\n')],{type:'text/csv;charset=utf-8;'}),fname+'.csv');
+  }else{
+    var th='<tr>'+cols.map(function(c){return'<th>'+_esc(c)+'</th>';}).join('')+'</tr>';
+    var tb=rows.map(function(r){
+      return'<tr>'+cols.map(function(c){return'<td>'+_esc(String(r[c]==null?'':r[c]))+'</td>';}).join('')+'</tr>';
+    }).join('');
+    triggerDl(
+      new Blob(['<table border="1">'+th+tb+'</table>'],{type:'application/vnd.ms-excel;charset=utf-8;'}),
+      fname+'.xls'
+    );
+  }
+};
+
+// ── T3: Init — attach menu to each .chart-card ────────────────────────────────
+function addMenu(card,cid){
+  if(card.querySelector('.cc-menu-btn'))return;
+  card.style.position='relative';
+  var btn=document.createElement('button');
+  btn.className='cc-menu-btn';
+  btn.innerHTML='&#8942;';
+  btn.title='\u56fe\u8868\u64cd\u4f5c';
+  var dd=document.createElement('div');
+  dd.className='cc-dropdown';
+  dd.innerHTML=
+    '<div class="cc-menu-item" onclick="ccForceRefresh(\''+cid+'\')">&#10227; Force Refresh</div>'+
+    '<div class="cc-menu-item" onclick="ccFullscreen(\''+cid+'\')">&#9645; Enter Fullscreen</div>'+
+    '<div class="cc-menu-item" onclick="ccViewQuery(\''+cid+'\')">&#9776; View Query</div>'+
+    '<div class="cc-menu-sep"></div>'+
+    '<div class="cc-menu-item" onclick="ccDownload(\''+cid+'\',\'csv\')">&#8675; Download CSV</div>'+
+    '<div class="cc-menu-item" onclick="ccDownload(\''+cid+'\',\'excel\')">&#8675; Download Excel</div>';
+  btn.addEventListener('click',function(e){
+    e.stopPropagation();
+    document.querySelectorAll('.cc-dropdown.cc-open').forEach(function(m){if(m!==dd)m.classList.remove('cc-open');});
+    dd.classList.toggle('cc-open');
+  });
+  card.appendChild(btn);
+  card.appendChild(dd);
+}
+
+function initControls(){
+  document.querySelectorAll('.chart-card').forEach(function(card){
+    var cid=card.id.replace(/^card-/,'');
+    if(cid)addMenu(card,cid);
+  });
+}
+
+document.addEventListener('click',function(){
+  document.querySelectorAll('.cc-dropdown.cc-open').forEach(function(m){m.classList.remove('cc-open');});
+});
+
+if(document.readyState==='loading'){
+  document.addEventListener('DOMContentLoaded',function(){setTimeout(initControls,250);});
+}else{
+  setTimeout(initControls,250);
+}
+})();
+</script>
+"""
+
+
+def _inject_chart_controls(html_content: str) -> str:
+    """
+    在 </body> 前注入图表控件 CSS+JS（⋮ kebab 菜单：Force Refresh / Enter Fullscreen / View Query / Download）。
+    若已注入（含 __cc-style 标记）则幂等跳过；无 </body> 则追加到末尾。
+    """
+    if "__cc-style" in html_content:
+        return html_content
+    lower = html_content.lower()
+    idx = lower.rfind("</body>")
+    if idx >= 0:
+        return html_content[:idx] + _CHART_CONTROLS_SNIPPET + html_content[idx:]
+    return html_content + _CHART_CONTROLS_SNIPPET
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 常量
 # ─────────────────────────────────────────────────────────────────────────────
@@ -679,6 +935,7 @@ async def serve_report_html_by_path(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"文件读取失败: {e}")
 
+    content = _inject_chart_controls(content)
     return HTMLResponse(content=content)
 
 
@@ -738,7 +995,8 @@ async def serve_report_html_by_token(
         encoded = urllib.parse.quote(filename)
         headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{encoded}"
     else:
-        # 非下载模式：注入悬浮 Pilot 按钮（按 doc_type 路由到正确页面）
+        # 非下载模式：注入图表控件 + 悬浮 Pilot 按钮（按 doc_type 路由到正确页面）
+        content = _inject_chart_controls(content)
         doc_type_val = getattr(report.doc_type, "value", report.doc_type) or "dashboard"
         content = _inject_pilot_button(content, report_id, doc_type=str(doc_type_val))
 
