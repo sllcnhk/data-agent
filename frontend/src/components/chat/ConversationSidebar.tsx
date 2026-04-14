@@ -259,7 +259,10 @@ const ConversationSidebar: React.FC<ConversationSidebarProps> = ({
 
   // Tab1: 我的对话内容
   const myConversationsContent = (
-    <>
+    <div
+      className="conversation-sidebar-pane"
+      style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, overflow: 'hidden' }}
+    >
       {/* 顶部按钮 */}
       {collapsed ? (
         <div style={{ padding: '12px 8px', display: 'flex', justifyContent: 'center' }}>
@@ -294,7 +297,10 @@ const ConversationSidebar: React.FC<ConversationSidebarProps> = ({
       )}
 
       {/* 对话列表 */}
-      <div style={{ flex: 1, overflow: 'auto', padding: collapsed ? 0 : '0 8px' }}>
+      <div
+        className="conversation-sidebar-scroll"
+        style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: collapsed ? 0 : '0 8px' }}
+      >
         {collapsed ? null : loading ? (
           <div style={{ textAlign: 'center', padding: '40px 0' }}>
             <Spin />
@@ -367,12 +373,19 @@ const ConversationSidebar: React.FC<ConversationSidebarProps> = ({
           {groups.length > 0 && ` · ${groups.length} 个分组`}
         </div>
       )}
-    </>
+    </div>
   );
 
   // Tab2: 其他用户内容（仅 superadmin）
   const otherUsersContent = (
-    <div style={{ flex: 1, overflow: 'auto', padding: '0 8px' }}>
+    <div
+      className="conversation-sidebar-pane"
+      style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, overflow: 'hidden' }}
+    >
+      <div
+        className="conversation-sidebar-scroll"
+        style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'hidden', padding: '0 8px' }}
+      >
       {otherUsersData.length === 0 ? (
         <Empty
           image={Empty.PRESENTED_IMAGE_SIMPLE}
@@ -435,6 +448,7 @@ const ConversationSidebar: React.FC<ConversationSidebarProps> = ({
           }))}
         />
       )}
+      </div>
     </div>
   );
 
@@ -449,7 +463,7 @@ const ConversationSidebar: React.FC<ConversationSidebarProps> = ({
       key: 'mine',
       label: '我的对话',
       children: (
-        <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+        <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, overflow: 'hidden' }}>
           {myConversationsContent}
         </div>
       ),
@@ -478,7 +492,7 @@ const ConversationSidebar: React.FC<ConversationSidebarProps> = ({
               </span>
             ),
             children: (
-              <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, overflow: 'hidden' }}>
                 {otherUsersContent}
               </div>
             ),
@@ -488,20 +502,24 @@ const ConversationSidebar: React.FC<ConversationSidebarProps> = ({
   ];
 
   return (
-    <div style={{ height: '100%', display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+    <div
+      className="conversation-sidebar-root"
+      style={{ height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden' }}
+    >
       {/* 对话列表区域（可滚动） */}
-      <div style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+      <div style={{ flex: 1, minHeight: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
         {otherUsersData.length > 0 ? (
           <Tabs
+            className="conversation-sidebar-tabs"
             activeKey={activeTab}
             onChange={(key) => setActiveTab(key as 'mine' | 'others')}
             size="small"
-            style={{ flex: 1, display: 'flex', flexDirection: 'column' }}
+            style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}
             tabBarStyle={{ margin: '0 8px', marginBottom: 0 }}
             items={tabItems}
           />
         ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', flex: 1 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0, overflow: 'hidden' }}>
             {myConversationsContent}
           </div>
         )}

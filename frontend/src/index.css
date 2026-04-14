@@ -17,6 +17,42 @@ body {
   min-height: 100vh;
 }
 
+.conversation-sidebar-tabs.ant-tabs {
+  height: 100%;
+  min-height: 0;
+}
+
+.chat-page-sider .ant-layout-sider-children,
+.conversation-sidebar-tabs.ant-tabs,
+.conversation-sidebar-tabs .ant-tabs-content-holder,
+.conversation-sidebar-tabs .ant-tabs-content,
+.conversation-sidebar-tabs .ant-tabs-tabpane {
+  display: flex;
+  flex-direction: column;
+}
+
+.chat-page-sider .ant-layout-sider-children {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.conversation-sidebar-tabs .ant-tabs-nav {
+  flex-shrink: 0;
+}
+
+.conversation-sidebar-tabs .ant-tabs-content-holder,
+.conversation-sidebar-tabs .ant-tabs-content,
+.conversation-sidebar-tabs .ant-tabs-tabpane {
+  min-height: 0;
+  height: 100%;
+}
+
+.conversation-sidebar-tabs .ant-tabs-content-holder {
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
 .code {
   font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New', monospace;
 }

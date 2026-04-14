@@ -540,7 +540,7 @@ const Chat: React.FC = () => {
   };
 
   return (
-    <Layout style={{ height: '100vh', overflow: 'hidden' }}>
+    <Layout style={{ height: '100vh', minHeight: 0, overflow: 'hidden' }}>
       {/* Human-in-the-Loop 审批弹窗 */}
       <ApprovalModal
         approval={pendingApproval}
@@ -573,6 +573,7 @@ const Chat: React.FC = () => {
       </Modal>
       {/* 左侧对话列表 */}
       <Sider
+        className="chat-page-sider"
         width={280}
         collapsedWidth={56}
         collapsible
@@ -582,6 +583,7 @@ const Chat: React.FC = () => {
         theme="light"
         style={{
           borderRight: '1px solid #f0f0f0',
+          minHeight: 0,
           overflow: 'hidden',
           display: 'flex',
           flexDirection: 'column',
@@ -608,12 +610,13 @@ const Chat: React.FC = () => {
       </Sider>
 
       {/* 右侧聊天区域 */}
-      <Layout>
+      <Layout style={{ minHeight: 0 }}>
         <Content
           style={{
             display: 'flex',
             flexDirection: 'column',
             height: '100%',
+            minHeight: 0,
             background: '#fff',
           }}
         >
@@ -644,7 +647,7 @@ const Chat: React.FC = () => {
           </div>
 
           {/* 消息区域 */}
-          <div style={{ flex: 1, overflow: 'hidden' }}>
+          <div style={{ flex: 1, minHeight: 0, overflow: 'hidden' }}>
             <ChatMessages
               messages={messages}
               loading={sending}
