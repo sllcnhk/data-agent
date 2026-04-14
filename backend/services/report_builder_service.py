@@ -201,6 +201,14 @@ const PALETTE       = REPORT_SPEC.palette;
 const _charts = {{}};          // id → ECharts instance
 const _chartData = {{}};       // id → current data array
 
+// ── 图表控件脚本通过 window['REPORT_SPEC'] 等访问，const 不挂 window，需显式暴露 ──
+window.REPORT_SPEC   = REPORT_SPEC;
+window.REPORT_ID     = REPORT_ID;
+window.REFRESH_TOKEN = REFRESH_TOKEN;
+window.API_BASE      = API_BASE;
+window._charts       = _charts;
+window._chartData    = _chartData;
+
 // ── 筛选器当前值 ──────────────────────────────────────────────────────────
 const _filterValues = {{}};
 

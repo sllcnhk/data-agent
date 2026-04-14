@@ -45,6 +45,7 @@ _PREVIEW_FILE = _FRONTEND_ROOT / "components" / "chat" / "ReportPreviewModal.tsx
 _DASHBOARDS_FILE = _FRONTEND_ROOT / "pages" / "DataCenterDashboards.tsx"
 _DOCUMENTS_FILE = _FRONTEND_ROOT / "pages" / "DataCenterDocuments.tsx"
 _SCHEDULES_FILE = _FRONTEND_ROOT / "pages" / "DataCenterSchedules.tsx"
+_VIEWER_FILE = _FRONTEND_ROOT / "pages" / "ReportViewerPage.tsx"
 
 # ── 模块级 auth 补丁 ─────────────────────────────────────────────────────────
 _auth_patcher = None
@@ -614,6 +615,191 @@ class TestJEndToEndPilot(unittest.TestCase):
         )
         self.assertIn(r.status_code, [403],
                       f"其他用户不能访问他人的 schedule copilot，实际: {r.status_code}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# K段 — spec-meta 端点测试（需要 DB）
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestKSpecMetaEndpoint(unittest.TestCase):
+    """
+    GET /api/v1/reports/{id}/spec-meta?token=... 端点测试
+
+    根本原因修复验证：
+      RC2 — 新增无 JWT 的 spec 获取通道，供 /report-view 分屏页使用
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.client = _make_client()
+        cls.user = _make_user("k_user", role_name="admin")
+        # 带有完整 spec 字段的报表
+        cls.report = _make_report(cls.user.username, doc_type="dashboard")
+        cls.doc_report = _make_report(cls.user.username, doc_type="document")
+
+    # K1: 有效 token → 200 + spec 数据
+    def test_K1_valid_token_returns_spec(self):
+        r = self.client.get(
+            f"/api/v1/reports/{self.report.id}/spec-meta",
+            params={"token": self.report.refresh_token},
+        )
+        self.assertEqual(r.status_code, 200,
+                         f"有效 refresh_token 应返回 200，实际: {r.status_code}, body: {r.text}")
+        body = r.json()
+        self.assertTrue(body.get("success"), "应返回 success=True")
+        self.assertIn("data", body, "应返回 data 字段")
+
+    # K2: 无效 token → 403
+    def test_K2_invalid_token_returns_403(self):
+        r = self.client.get(
+            f"/api/v1/reports/{self.report.id}/spec-meta",
+            params={"token": "invalid-token-xyz"},
+        )
+        self.assertEqual(r.status_code, 403,
+                         f"无效 token 应返回 403，实际: {r.status_code}")
+
+    # K3: 不存在的报表 → 404
+    def test_K3_nonexistent_report_returns_404(self):
+        fake_id = str(uuid.uuid4())
+        r = self.client.get(
+            f"/api/v1/reports/{fake_id}/spec-meta",
+            params={"token": "any-token"},
+        )
+        self.assertEqual(r.status_code, 404,
+                         f"不存在的报表应返回 404，实际: {r.status_code}")
+
+    # K4: 无效 UUID → 400
+    def test_K4_invalid_uuid_returns_400(self):
+        r = self.client.get(
+            "/api/v1/reports/not-a-uuid/spec-meta",
+            params={"token": "any-token"},
+        )
+        self.assertEqual(r.status_code, 400,
+                         f"无效 UUID 应返回 400，实际: {r.status_code}")
+
+    # K5: 返回数据包含 AI 修改所需的关键字段
+    def test_K5_spec_data_has_required_fields_for_pilot(self):
+        r = self.client.get(
+            f"/api/v1/reports/{self.report.id}/spec-meta",
+            params={"token": self.report.refresh_token},
+        )
+        self.assertEqual(r.status_code, 200)
+        data = r.json()["data"]
+        # AI Pilot system prompt 需要这些字段
+        self.assertIn("id", data, "spec-meta 应返回 id（AI 构建 PUT /spec URL 需要）")
+        self.assertIn("name", data, "spec-meta 应返回 name（AI 对话上下文需要）")
+        self.assertIn("doc_type", data, "spec-meta 应返回 doc_type（区分报表/报告）")
+        self.assertIn("charts", data, "spec-meta 应返回 charts（AI 了解图表结构需要）")
+        self.assertIn("theme", data, "spec-meta 应返回 theme（AI 可调整主题）")
+        # 报表 ID 应与路径参数一致
+        self.assertEqual(data["id"], str(self.report.id), "spec-meta 返回的 id 应与路径参数一致")
+
+    # K6: doc_type=document 报告也可通过 spec-meta 访问
+    def test_K6_document_type_report_spec_accessible(self):
+        r = self.client.get(
+            f"/api/v1/reports/{self.doc_report.id}/spec-meta",
+            params={"token": self.doc_report.refresh_token},
+        )
+        self.assertEqual(r.status_code, 200,
+                         f"doc_type=document 报告应可通过 spec-meta 访问，实际: {r.status_code}")
+        data = r.json()["data"]
+        self.assertEqual(data.get("doc_type"), "document",
+                         "doc_type 应为 'document'")
+
+    # K7: 无需 JWT（无 Authorization 头，仅凭 token 访问）
+    def test_K7_no_jwt_required(self):
+        """spec-meta 端点完全依赖 refresh_token，不需要 JWT"""
+        r = self.client.get(
+            f"/api/v1/reports/{self.report.id}/spec-meta",
+            params={"token": self.report.refresh_token},
+            # 不带 Authorization header
+        )
+        self.assertEqual(r.status_code, 200,
+                         "spec-meta 应无需 JWT 即可访问（仅凭 refresh_token）")
+
+    # K8: 缺少 token 参数 → 422（FastAPI 必填参数校验）
+    def test_K8_missing_token_param_returns_422(self):
+        r = self.client.get(
+            f"/api/v1/reports/{self.report.id}/spec-meta",
+            # 不带 token 参数
+        )
+        self.assertEqual(r.status_code, 422,
+                         f"缺少必填 token 参数应返回 422，实际: {r.status_code}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# L段 — 前端静态分析：ReportViewerPage + ReportPreviewModal（无需 DB）
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestLFrontendSpecFetchAnalysis(unittest.TestCase):
+    """
+    前端代码静态分析（无需 DB）
+
+    验证 RC1（contextSpec=null）和 RC3（onSpecUpdated=undefined）修复：
+      L1-L4: ReportViewerPage.tsx 拉取 spec + 传递 + iframeKey 刷新
+      L5-L6: ReportPreviewModal.tsx iframeKey 刷新支持
+    """
+
+    def _read(self, path: Path) -> str:
+        return path.read_text(encoding="utf-8")
+
+    # L1: ReportViewerPage 调用 spec-meta 端点
+    def test_L1_viewer_page_calls_spec_meta_endpoint(self):
+        code = self._read(_VIEWER_FILE)
+        self.assertIn("spec-meta", code,
+                      "RC2 修复: ReportViewerPage 应调用 /spec-meta 端点获取报表 spec")
+
+    # L2: ReportViewerPage 有 reportSpec state（非硬编码 null）
+    def test_L2_viewer_page_has_report_spec_state(self):
+        code = self._read(_VIEWER_FILE)
+        self.assertIn("reportSpec", code,
+                      "RC1 修复: ReportViewerPage 应有 reportSpec state 存储拉取到的 spec")
+        # 确认 contextSpec 使用 reportSpec 而非 null
+        self.assertIn("contextSpec={reportSpec}", code,
+                      "RC1 修复: DataCenterCopilotContent 应接收 contextSpec={reportSpec} 而非 null")
+        self.assertNotIn("contextSpec={null}", code,
+                         "RC1 修复: 不应再有 contextSpec={null}（硬编码 null 已移除）")
+
+    # L3: ReportViewerPage 接线 onSpecUpdated（非 undefined）
+    def test_L3_viewer_page_has_on_spec_updated_callback(self):
+        code = self._read(_VIEWER_FILE)
+        self.assertIn("handleSpecUpdated", code,
+                      "RC3 修复: ReportViewerPage 应有 handleSpecUpdated 回调")
+        self.assertIn("onSpecUpdated={handleSpecUpdated}", code,
+                      "RC3 修复: DataCenterCopilotContent 应接收 onSpecUpdated={handleSpecUpdated}")
+        self.assertNotIn("onSpecUpdated={undefined}", code,
+                         "RC3 修复: 不应再有 onSpecUpdated={undefined}（已接线回调）")
+
+    # L4: ReportViewerPage 有 iframeKey 且 iframe 使用 key prop
+    def test_L4_viewer_page_has_iframe_key_for_reload(self):
+        code = self._read(_VIEWER_FILE)
+        self.assertIn("iframeKey", code,
+                      "RC3 修复: ReportViewerPage 应有 iframeKey state（AI 改 spec 后强制刷新 iframe）")
+        # iframe 元素应有 key={iframeKey} 以便 React 强制重载
+        self.assertIn("key={iframeKey}", code,
+                      "RC3 修复: iframe 元素应有 key={iframeKey}")
+        # handleSpecUpdated 应触发 iframeKey +1
+        self.assertIn("setIframeKey", code,
+                      "handleSpecUpdated 应调用 setIframeKey 递增 iframeKey")
+
+    # L5: ReportPreviewModal 有 iframeKey state（弹窗路径同步修复）
+    def test_L5_preview_modal_has_iframe_key_for_reload(self):
+        code = self._read(_PREVIEW_FILE)
+        self.assertIn("iframeKey", code,
+                      "F3 修复: ReportPreviewModal 应有 iframeKey state（AI 改 spec 后刷新 iframe）")
+        self.assertIn("key={iframeKey}", code,
+                      "F3 修复: 弹窗内 iframe 应有 key={iframeKey}")
+        self.assertIn("setIframeKey", code,
+                      "F3 修复: handleSpecUpdatedInModal 应调用 setIframeKey")
+
+    # L6: ReportPreviewModal 有 handleSpecUpdatedInModal 包装回调
+    def test_L6_preview_modal_has_spec_updated_modal_callback(self):
+        code = self._read(_PREVIEW_FILE)
+        self.assertIn("handleSpecUpdatedInModal", code,
+                      "F3 修复: ReportPreviewModal 应有 handleSpecUpdatedInModal 回调（重载 iframe 后转发外部 onSpecUpdated）")
+        # 包装回调应仍调用外部 onSpecUpdated
+        self.assertIn("pilotContext?.onSpecUpdated?.()", code,
+                      "handleSpecUpdatedInModal 应转发调用 pilotContext.onSpecUpdated（如刷新报表列表）")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

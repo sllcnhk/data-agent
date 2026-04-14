@@ -37,6 +37,11 @@ const ReportViewerPage: React.FC = () => {
   const [iframeLoading, setIframeLoading] = useState(true);
   const [pilotOpen, setPilotOpen] = useState(false);
 
+  // ── 报表 spec（通过 refresh_token 获取，无需 JWT） ────────────────────────
+  const [reportSpec, setReportSpec] = useState<Record<string, any> | null>(null);
+  // iframe key：每次 spec 更新后递增，强制 iframe 重新加载最新 HTML
+  const [iframeKey, setIframeKey] = useState(0);
+
   const iframeSrc = reportId && token
     ? `${API_BASE}/reports/${encodeURIComponent(reportId)}/html?token=${encodeURIComponent(token)}`
     : '';
@@ -57,6 +62,35 @@ const ReportViewerPage: React.FC = () => {
     window.addEventListener('message', handler);
     return () => window.removeEventListener('message', handler);
   }, [reportId]);
+
+  // ── 拉取报表 spec（给 Pilot 提供上下文，使 AI 能理解并修改报表） ──────────
+  useEffect(() => {
+    if (!reportId || !token) return;
+    fetch(`${API_BASE}/reports/${encodeURIComponent(reportId)}/spec-meta?token=${encodeURIComponent(token)}`)
+      .then((r) => r.json())
+      .then((json) => {
+        if (json.success && json.data) setReportSpec(json.data);
+      })
+      .catch(() => {
+        // 网络错误：Pilot 会显示"(暂无配置)"，功能降级但不崩溃
+      });
+  }, [reportId, token]);
+
+  // ── Pilot 通知：AI 更新 spec 后刷新 iframe + 重新拉取最新 spec ───────────
+  const handleSpecUpdated = useCallback(async () => {
+    setIframeLoading(true);
+    setIframeKey((k) => k + 1);
+    if (!reportId || !token) return;
+    try {
+      const res = await fetch(
+        `${API_BASE}/reports/${encodeURIComponent(reportId)}/spec-meta?token=${encodeURIComponent(token)}`,
+      );
+      const json = await res.json();
+      if (json.success && json.data) setReportSpec(json.data);
+    } catch {
+      /* 忽略，旧 spec 仍在内存 */
+    }
+  }, [reportId, token]);
 
   // 更新页面标题
   useEffect(() => {
@@ -108,6 +142,7 @@ const ReportViewerPage: React.FC = () => {
           </div>
         )}
         <iframe
+          key={iframeKey}
           ref={iframeRef}
           src={iframeSrc}
           title={decodeURIComponent(name)}
@@ -166,8 +201,8 @@ const ReportViewerPage: React.FC = () => {
             contextType={contextType}
             contextId={reportId}
             contextName={decodeURIComponent(name)}
-            contextSpec={null}
-            onSpecUpdated={undefined}
+            contextSpec={reportSpec}
+            onSpecUpdated={handleSpecUpdated}
           />
         </div>
       </div>

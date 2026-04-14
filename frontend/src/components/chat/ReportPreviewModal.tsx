@@ -73,6 +73,8 @@ const ReportPreviewModal: React.FC<ReportPreviewModalProps> = ({
   const { accessToken } = useAuthStore();
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [iframeLoading, setIframeLoading] = useState(true);
+  // iframeKey：AI 更新 spec 后递增，强制 iframe 重载最新生成的 HTML
+  const [iframeKey, setIframeKey] = useState(0);
   const [exportStatus, setExportStatus] = useState<ExportStatus>('idle');
   const [exportFormat, setExportFormat] = useState<'pdf' | 'pptx'>('pdf');
   const [exportDownloadUrl, setExportDownloadUrl] = useState<string | null>(null);
@@ -99,6 +101,14 @@ const ReportPreviewModal: React.FC<ReportPreviewModalProps> = ({
       if (pollRef.current) clearInterval(pollRef.current);
     };
   }, [open]);
+
+  // AI 修改 spec 并重新生成 HTML 后，重载 iframe 显示最新内容
+  const handleSpecUpdatedInModal = useCallback(() => {
+    setIframeLoading(true);
+    setIframeKey((k) => k + 1);
+    // 调用外部 onSpecUpdated（刷新报表列表等）
+    pilotContext?.onSpecUpdated?.();
+  }, [pilotContext]);
 
   // 监听 iframe postMessage（B2 注入的 pilot 按钮发送的消息）
   useEffect(() => {
@@ -310,6 +320,7 @@ const ReportPreviewModal: React.FC<ReportPreviewModalProps> = ({
           )}
           {iframeSrc && (
             <iframe
+              key={iframeKey}
               ref={iframeRef}
               src={iframeSrc}
               title={fileName}
@@ -373,7 +384,7 @@ const ReportPreviewModal: React.FC<ReportPreviewModalProps> = ({
                 contextId={pilotContext.contextId}
                 contextName={pilotContext.contextName}
                 contextSpec={pilotContext.contextSpec}
-                onSpecUpdated={pilotContext.onSpecUpdated}
+                onSpecUpdated={handleSpecUpdatedInModal}
               />
             </div>
           </div>

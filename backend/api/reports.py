@@ -376,10 +376,25 @@ function addMenu(card,cid){
 }
 
 function initControls(){
+  var seen={};
+  // 优先：标准 .chart-card 结构（build_report_html 生成的报表）
   document.querySelectorAll('.chart-card').forEach(function(card){
     var cid=card.id.replace(/^card-/,'');
-    if(cid)addMenu(card,cid);
+    if(cid){seen[cid]=true;addMenu(card,cid);}
   });
+  // 兜底：老式手工 HTML，没有 .chart-card，改为查找带 ECharts 实例的容器
+  if(typeof echarts!=='undefined'){
+    document.querySelectorAll('[id]').forEach(function(el){
+      var id=el.id;
+      if(!id||seen[id])return;
+      var inst=echarts.getInstanceByDom(el);
+      if(!inst)return;
+      // 优先使用父容器作为卡片包装层；若父容器没有 id，则直接用 echarts 容器本身
+      var card=el.parentElement&&el.parentElement.id?el.parentElement:el;
+      var cid=id;
+      if(!seen[cid]){seen[cid]=true;addMenu(card,cid);}
+    });
+  }
 }
 
 document.addEventListener('click',function(){
@@ -411,11 +426,11 @@ def _inject_chart_controls(
     if "__cc-style" in html_content:
         return html_content
 
-    # 若 HTML 文件本身不含 REPORT_ID 变量声明（Agent 写入的文件可能在注释中提到该词），
-    # 则注入 __cc-vars 覆盖脚本。用 "var REPORT_ID=" 检测实际的 JS 变量声明，
-    # 避免将注释中提到 REPORT_ID 误判为"已声明"。
+    # 若 HTML 没有通过 window.REPORT_ID 或 var REPORT_ID 暴露变量（纯 Agent 写入的老式文件），
+    # 注入 __cc-vars 覆盖脚本。build_report_html 生成的文件现在已显式设置 window.REPORT_ID，
+    # __cc-vars 里的 if(!window.REPORT_ID) 守卫确保不会覆盖已有值，注入幂等安全。
     override_js = ""
-    if report_id and "var REPORT_ID=" not in html_content:
+    if report_id and "window.REPORT_ID" not in html_content and "var REPORT_ID=" not in html_content:
         safe_rid = str(report_id).replace('"', "").replace("'", "").replace("<", "").replace(">", "")
         safe_tok = str(refresh_token or "").replace('"', "").replace("'", "").replace("<", "").replace(">", "")
         override_js = (
@@ -1179,6 +1194,34 @@ async def create_report_copilot(
         "success": True,
         "data": {"conversation_id": str(conv.id)},
     }
+
+
+@router.get("/{report_id}/spec-meta")
+async def get_report_spec_meta(
+    report_id: str,
+    token: str = Query(..., description="Report.refresh_token（无需 JWT）"),
+    db: Session = Depends(get_db),
+):
+    """
+    通过 refresh_token 获取报告的 spec 元数据（无需 JWT）。
+
+    适用场景：
+    - /report-view 分屏页需要在 AI Pilot 侧边面板中注入报表 spec，
+      使 AI 能理解报表结构并调用 PUT /spec 接口进行修改。
+    """
+    try:
+        uid = uuid.UUID(report_id)
+    except ValueError:
+        raise HTTPException(400, "无效的报告 ID")
+
+    report = db.query(Report).filter(Report.id == uid).first()
+    if not report:
+        raise HTTPException(404, "报告不存在")
+
+    if not secrets.compare_digest(report.refresh_token or "", token):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无效的刷新令牌")
+
+    return {"success": True, "data": _report_to_dict(report)}
 
 
 @router.get("/{report_id}")
