@@ -23,7 +23,7 @@ from unittest.mock import patch, MagicMock
 
 # ── 路径 & 环境初始化 ────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "backend"))
-os.environ.setdefault("POSTGRES_PASSWORD", "postgres")
+os.environ.setdefault("POSTGRES_PASSWORD", "Sgp013013")
 os.environ.setdefault("POSTGRES_HOST", "localhost")
 os.environ.setdefault("ENABLE_AUTH", "False")
 

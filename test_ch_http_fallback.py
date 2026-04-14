@@ -32,7 +32,7 @@ _PROJECT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _PROJECT)
 sys.path.insert(0, os.path.join(_PROJECT, "backend"))
 
-os.environ.setdefault("POSTGRES_PASSWORD", "postgres")
+os.environ.setdefault("POSTGRES_PASSWORD", "Sgp013013")
 os.environ.setdefault("POSTGRES_HOST", "localhost")
 os.environ.setdefault("ENABLE_AUTH", "False")
 

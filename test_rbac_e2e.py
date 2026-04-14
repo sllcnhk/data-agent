@@ -874,20 +874,24 @@ class TestPermissionMatrixCompleteness(unittest.TestCase):
                          f"viewer 应仅有 chat:use，实际: {perms}")
 
     def test_O2_analyst_role_permissions(self):
-        """analyst 角色权限符合设计：chat + skills + settings:read（MCPStatus 所需）"""
+        """analyst 角色权限符合设计：chat + skills + settings:read + reports + schedules"""
         perms = self._perms(self.analyst_user)
         expected = {
             "chat:use",
             "skills.user:read", "skills.user:write",
             "skills.project:read",
             "skills.system:read",
-            "settings:read",   # MCPStatus 组件可见
+            "settings:read",       # MCPStatus 组件可见
+            "reports:read",        # 报表查看
+            "reports:create",      # 报表创建
+            "schedules:read",      # 推送任务查看
+            "schedules:write",     # 推送任务管理
         }
         self.assertEqual(perms, expected,
                          f"analyst 权限不符合设计\n期望: {expected}\n实际: {perms}")
 
     def test_O3_admin_role_permissions(self):
-        """admin 角色包含 analyst 全部权限 + project:write + models:r/w + settings:r/w"""
+        """admin 角色包含 analyst 全部权限 + project:write + models:r/w + settings:r/w + reports:delete + schedules:admin"""
         perms = self._perms(self.admin_user)
         expected = {
             "chat:use",
@@ -896,6 +900,8 @@ class TestPermissionMatrixCompleteness(unittest.TestCase):
             "skills.system:read",
             "models:read", "models:write",
             "settings:read", "settings:write",
+            "reports:read", "reports:create", "reports:delete",  # 报表全部权限
+            "schedules:read", "schedules:write", "schedules:admin",  # 推送任务全部权限
         }
         self.assertEqual(perms, expected,
                          f"admin 权限不符合设计\n期望: {expected}\n实际: {perms}")

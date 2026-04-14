@@ -439,6 +439,16 @@ export interface PinReportResult {
   is_new: boolean;
 }
 
+/** 单条文件的固定状态检测结果 */
+export interface PinStatusResult {
+  file_path: string;
+  pinned: boolean;
+  report_id?: string;
+  refresh_token?: string;
+  doc_type?: string;
+  name?: string;
+}
+
 export const reportApi = {
   /**
    * 将对话中已生成的 HTML 文件固定为正式报表/报告，写入 reports 数据库。
@@ -447,6 +457,18 @@ export const reportApi = {
   pinReport: async (params: PinReportParams): Promise<PinReportResult> => {
     const response = await apiClient.post('/reports/pin', params);
     return response.data?.data as PinReportResult;
+  },
+
+  /**
+   * 批量检查多个文件是否已固定（只读，不创建记录）。
+   * 用于文件卡片渲染时的初始固定状态检测，避免 N 次独立请求。
+   */
+  checkPinStatusBatch: async (filePaths: string[]): Promise<PinStatusResult[]> => {
+    if (!filePaths.length) return [];
+    const response = await apiClient.post('/reports/check-pin-status-batch', {
+      file_paths: filePaths,
+    });
+    return response.data?.data?.results ?? [];
   },
 };
 

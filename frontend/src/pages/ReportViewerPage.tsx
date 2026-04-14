@@ -14,7 +14,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { Button, Spin, Tooltip } from 'antd';
-import { CloseOutlined, RobotOutlined } from '@ant-design/icons';
+import { CloseOutlined, ReloadOutlined, RobotOutlined } from '@ant-design/icons';
 import {
   DataCenterCopilotContent,
   type CopilotContextType,
@@ -22,6 +22,9 @@ import {
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || '/api/v1') as string;
 const PILOT_WIDTH = 380;
+
+/** localStorage key 用于持久化 Pilot 开关状态 */
+const pilotOpenKey = (reportId: string) => `pilot_open_${reportId}`;
 
 const ReportViewerPage: React.FC = () => {
   const [searchParams] = useSearchParams();
@@ -35,11 +38,30 @@ const ReportViewerPage: React.FC = () => {
 
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [iframeLoading, setIframeLoading] = useState(true);
-  const [pilotOpen, setPilotOpen] = useState(false);
+
+  // ── pilotOpen 从 localStorage 恢复，刷新页面后保持上次开关状态 ─────────────
+  const [pilotOpen, setPilotOpen] = useState<boolean>(() => {
+    if (!reportId) return false;
+    try {
+      return localStorage.getItem(pilotOpenKey(reportId)) === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  // pilotOpen 变化时同步写入 localStorage
+  useEffect(() => {
+    if (!reportId) return;
+    try {
+      localStorage.setItem(pilotOpenKey(reportId), String(pilotOpen));
+    } catch {
+      // ignore storage errors
+    }
+  }, [pilotOpen, reportId]);
 
   // ── 报表 spec（通过 refresh_token 获取，无需 JWT） ────────────────────────
   const [reportSpec, setReportSpec] = useState<Record<string, any> | null>(null);
-  // iframe key：每次 spec 更新后递增，强制 iframe 重新加载最新 HTML
+  // iframe key：每次 spec 更新或手动刷新后递增，强制 iframe 重新加载最新 HTML
   const [iframeKey, setIframeKey] = useState(0);
 
   const iframeSrc = reportId && token
@@ -92,6 +114,12 @@ const ReportViewerPage: React.FC = () => {
     }
   }, [reportId, token]);
 
+  // ── 手动刷新报表 iframe ───────────────────────────────────────────────────
+  const handleRefreshIframe = useCallback(() => {
+    setIframeLoading(true);
+    setIframeKey((k) => k + 1);
+  }, []);
+
   // 更新页面标题
   useEffect(() => {
     document.title = name ? `${decodeURIComponent(name)} — Pilot 查看` : '报表查看';
@@ -125,36 +153,76 @@ const ReportViewerPage: React.FC = () => {
       }}
     >
       {/* ── 左侧：报表 iframe ─────────────────────────────────────────────── */}
-      <div style={{ flex: 1, position: 'relative', minWidth: 0 }}>
-        {iframeLoading && (
-          <div
+      <div style={{ flex: 1, position: 'relative', minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+        {/* iframe 区域工具栏：刷新按钮 */}
+        <div
+          style={{
+            height: 36,
+            flexShrink: 0,
+            display: 'flex',
+            alignItems: 'center',
+            padding: '0 10px',
+            gap: 8,
+            background: '#f4f6fa',
+            borderBottom: '1px solid #e8e8e8',
+          }}
+        >
+          <span
             style={{
-              position: 'absolute',
-              inset: 0,
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              background: '#f4f6fa',
-              zIndex: 10,
+              fontSize: 12,
+              color: '#888',
+              flex: 1,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
             }}
           >
-            <Spin size="large" tip="加载报表中…" />
-          </div>
-        )}
-        <iframe
-          key={iframeKey}
-          ref={iframeRef}
-          src={iframeSrc}
-          title={decodeURIComponent(name)}
-          onLoad={handleIframeLoad}
-          style={{
-            width: '100%',
-            height: '100%',
-            border: 'none',
-            display: iframeLoading ? 'none' : 'block',
-          }}
-          sandbox="allow-scripts allow-same-origin allow-popups"
-        />
+            {decodeURIComponent(name)}
+          </span>
+          <Tooltip title="重新加载报表">
+            <Button
+              size="small"
+              type="text"
+              icon={<ReloadOutlined />}
+              onClick={handleRefreshIframe}
+              loading={iframeLoading}
+              style={{ color: '#595959' }}
+            />
+          </Tooltip>
+        </div>
+
+        {/* iframe 区域 */}
+        <div style={{ flex: 1, position: 'relative' }}>
+          {iframeLoading && (
+            <div
+              style={{
+                position: 'absolute',
+                inset: 0,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                background: '#f4f6fa',
+                zIndex: 10,
+              }}
+            >
+              <Spin size="large" tip="加载报表中…" />
+            </div>
+          )}
+          <iframe
+            key={iframeKey}
+            ref={iframeRef}
+            src={iframeSrc}
+            title={decodeURIComponent(name)}
+            onLoad={handleIframeLoad}
+            style={{
+              width: '100%',
+              height: '100%',
+              border: 'none',
+              display: iframeLoading ? 'none' : 'block',
+            }}
+            sandbox="allow-scripts allow-same-origin allow-popups"
+          />
+        </div>
       </div>
 
       {/* ── 右侧：Pilot Copilot 侧边面板 ─────────────────────────────────── */}
@@ -203,6 +271,7 @@ const ReportViewerPage: React.FC = () => {
             contextName={decodeURIComponent(name)}
             contextSpec={reportSpec}
             onSpecUpdated={handleSpecUpdated}
+            contextRefreshToken={token}
           />
         </div>
       </div>

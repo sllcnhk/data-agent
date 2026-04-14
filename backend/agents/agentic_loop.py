@@ -462,6 +462,28 @@ class AgenticLoop:
                             },
                         )
 
+                        # 检测 report tool 调用：收集报表更新记录，供 files_written 事件使用
+                        if (
+                            tool_name in ("report__update_spec", "report__update_single_chart")
+                            and raw_result.get("success", False)
+                        ):
+                            result_data = raw_result if isinstance(raw_result, dict) else {}
+                            report_id_val = result_data.get("report_id", tool_input.get("report_id", ""))
+                            report_name_val = result_data.get("name", "报表")
+                            written_files.append({
+                                "path": f"reports/{report_id_val}",
+                                "name": report_name_val,
+                                "size": 0,
+                                "mime_type": "text/html",
+                                "is_report": True,
+                                "doc_type": "dashboard",
+                                "report_id": report_id_val,
+                            })
+                            logger.debug(
+                                "[AgenticLoop] 记录报表更新: tool=%s report_id=%s",
+                                tool_name, report_id_val,
+                            )
+
                         # 检测文件写入：收集 write_file 成功调用的路径
                         if "write_file" in tool_name and raw_result.get("success", False):
                             file_path = tool_input.get("path", "")

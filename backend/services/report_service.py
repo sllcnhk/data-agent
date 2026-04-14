@@ -567,3 +567,233 @@ class ReportService:
                 Report.description.ilike(f"%{keyword}%")
             )
         ).order_by(desc(Report.created_at)).limit(limit).all()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Token 鉴权操作（供 MCP Tool Server 调用，无需 JWT）
+# ─────────────────────────────────────────────────────────────────────────────
+
+import os
+import secrets as _secrets
+from pathlib import Path as _Path
+from uuid import UUID as _UUID
+
+
+def _api_base_url() -> str:
+    """推断后端 API 前缀（与 reports.py 保持一致）。"""
+    host = os.environ.get("PUBLIC_HOST", "")
+    port = os.environ.get("PORT", "8000")
+    if host:
+        return f"{host}/api/v1"
+    return f"http://localhost:{port}/api/v1"
+
+
+def _get_customer_data_root() -> _Path:
+    from backend.config.settings import settings
+    return (
+        _Path(settings.allowed_directories[0])
+        if settings.allowed_directories
+        else _Path("customer_data")
+    )
+
+
+def _verify_refresh_token(report: Report, refresh_token: str) -> None:
+    """验证 refresh_token，不匹配时抛出 PermissionError。"""
+    if not _secrets.compare_digest(report.refresh_token or "", refresh_token or ""):
+        raise PermissionError("无效的访问令牌")
+
+
+def get_spec_by_token(report_id: str, refresh_token: str) -> Dict[str, Any]:
+    """
+    通过 refresh_token 获取报表 spec（无需 JWT）。
+
+    Returns:
+        报表 spec 字典（含 id, name, charts, filters, theme,
+        doc_type, data_sources, refresh_token, report_file_path, username）
+
+    Raises:
+        ValueError:      report_id 格式错误或报表不存在
+        PermissionError: refresh_token 不匹配
+    """
+    from backend.config.database import get_db_context
+
+    try:
+        uid = _UUID(report_id)
+    except (ValueError, AttributeError):
+        raise ValueError(f"无效的报表 ID: {report_id!r}")
+
+    with get_db_context() as db:
+        report = db.query(Report).filter(Report.id == uid).first()
+        if not report:
+            raise ValueError(f"报表不存在: {report_id}")
+        _verify_refresh_token(report, refresh_token)
+        return {
+            "id": str(report.id),
+            "name": report.name,
+            "description": report.description or "",
+            "doc_type": report.doc_type or "dashboard",
+            "theme": report.theme or "light",
+            "charts": list(report.charts or []),
+            "filters": list(report.filters or []),
+            "data_sources": list(report.data_sources or []),
+            "refresh_token": report.refresh_token,
+            "report_file_path": report.report_file_path,
+            "username": report.username,
+        }
+
+
+def update_spec_by_token(
+    report_id: str,
+    spec: Dict[str, Any],
+    refresh_token: str,
+) -> Dict[str, Any]:
+    """
+    通过 refresh_token 更新报表全量 spec 并重新生成 HTML（无需 JWT）。
+
+    Args:
+        report_id:     报表 UUID 字符串
+        spec:          完整报表 spec（含 charts / filters / theme / title 等）
+        refresh_token: 报表访问令牌
+
+    Returns:
+        {"report_id": str, "name": str, "updated_at": str}
+
+    Raises:
+        ValueError:      report_id 无效或报表不存在或缺少 HTML 路径
+        PermissionError: refresh_token 不匹配
+        RuntimeError:    HTML 生成失败
+    """
+    from backend.config.database import get_db_context
+    from backend.services.report_builder_service import build_report_html
+
+    try:
+        uid = _UUID(report_id)
+    except (ValueError, AttributeError):
+        raise ValueError(f"无效的报表 ID: {report_id!r}")
+
+    with get_db_context() as db:
+        report = db.query(Report).filter(Report.id == uid).first()
+        if not report:
+            raise ValueError(f"报表不存在: {report_id}")
+        _verify_refresh_token(report, refresh_token)
+
+        if not report.report_file_path:
+            raise ValueError("报表尚无 HTML 文件路径，无法覆写")
+
+        try:
+            html_content = build_report_html(
+                spec=spec,
+                report_id=str(report.id),
+                refresh_token=report.refresh_token,
+                api_base_url=_api_base_url(),
+            )
+        except Exception as e:
+            raise RuntimeError(f"HTML 生成失败: {e}") from e
+
+        customer_root = _get_customer_data_root()
+        html_path = customer_root / report.report_file_path
+        html_path.parent.mkdir(parents=True, exist_ok=True)
+        html_path.write_text(html_content, encoding="utf-8")
+
+        report.charts = spec.get("charts", report.charts)
+        report.data_sources = spec.get("data_sources", report.data_sources)
+        report.filters = spec.get("filters", report.filters)
+        report.theme = spec.get("theme", report.theme)
+        if spec.get("title"):
+            report.name = spec["title"]
+        report.updated_at = datetime.utcnow()
+
+        return {
+            "report_id": str(report.id),
+            "name": report.name,
+            "updated_at": report.updated_at.isoformat(),
+        }
+
+
+def update_single_chart_by_token(
+    report_id: str,
+    chart_id: str,
+    chart_patch: Dict[str, Any],
+    refresh_token: str,
+) -> Dict[str, Any]:
+    """
+    通过 refresh_token 对单个图表做 merge 更新，不影响其他图表（无需 JWT）。
+
+    Args:
+        report_id:    报表 UUID 字符串
+        chart_id:     要更新的图表 ID（如 "c1"）
+        chart_patch:  只含需要变更字段的图表配置字典
+        refresh_token: 报表访问令牌
+
+    Returns:
+        {"report_id": str, "chart_id": str, "found": bool,
+         "total_charts": int, "updated_at": str}
+    """
+    from backend.config.database import get_db_context
+    from backend.services.report_builder_service import build_report_html
+
+    try:
+        uid = _UUID(report_id)
+    except (ValueError, AttributeError):
+        raise ValueError(f"无效的报表 ID: {report_id!r}")
+
+    with get_db_context() as db:
+        report = db.query(Report).filter(Report.id == uid).first()
+        if not report:
+            raise ValueError(f"报表不存在: {report_id}")
+        _verify_refresh_token(report, refresh_token)
+
+        if not report.report_file_path:
+            raise ValueError("报表尚无 HTML 文件路径，无法覆写")
+
+        existing_charts: List[Dict[str, Any]] = list(report.charts or [])
+        incoming = dict(chart_patch)
+        incoming["id"] = chart_id  # chart_id 优先
+
+        found = False
+        merged_charts: List[Dict[str, Any]] = []
+        for c in existing_charts:
+            if c.get("id") == chart_id:
+                merged_charts.append({**c, **incoming})
+                found = True
+            else:
+                merged_charts.append(c)
+        if not found:
+            merged_charts.append(incoming)
+
+        merged_spec: Dict[str, Any] = {
+            "title": report.name,
+            "subtitle": report.description or "",
+            "theme": report.theme or "light",
+            "filters": report.filters or [],
+            "data_sources": report.data_sources or [],
+            "charts": merged_charts,
+            "include_summary": False,
+            "data": {},
+        }
+
+        try:
+            html_content = build_report_html(
+                spec=merged_spec,
+                report_id=str(report.id),
+                refresh_token=report.refresh_token,
+                api_base_url=_api_base_url(),
+            )
+        except Exception as e:
+            raise RuntimeError(f"HTML 生成失败: {e}") from e
+
+        customer_root = _get_customer_data_root()
+        html_path = customer_root / report.report_file_path
+        html_path.parent.mkdir(parents=True, exist_ok=True)
+        html_path.write_text(html_content, encoding="utf-8")
+
+        report.charts = merged_charts
+        report.updated_at = datetime.utcnow()
+
+        return {
+            "report_id": str(report.id),
+            "chart_id": chart_id,
+            "found": found,
+            "total_charts": len(merged_charts),
+            "updated_at": report.updated_at.isoformat(),
+        }

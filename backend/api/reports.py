@@ -481,6 +481,13 @@ class UpdateSpecRequest(BaseModel):
     spec: Dict[str, Any] = Field(..., description="完整报告规格 JSON")
 
 
+class UpdateChartRequest(BaseModel):
+    chart: Dict[str, Any] = Field(
+        ...,
+        description="单个图表的配置（按 chart.id 合并到现有 spec，不影响其他图表）",
+    )
+
+
 class UpdateShareRequest(BaseModel):
     share_scope: str = Field("private", description="共享范围: public | team | private")
     allowed_users: List[str] = Field(default_factory=list, description="允许访问的用户名列表")
@@ -787,6 +794,83 @@ async def pin_report(
             "is_new": True,
         },
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1c. 批量检查文件是否已固定（只读，不创建记录）
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CheckPinStatusBatchRequest(BaseModel):
+    file_paths: List[str] = Field(..., description="需要检查的 HTML 文件路径列表（相对于 customer_data/）")
+
+
+@router.post("/check-pin-status-batch")
+async def check_pin_status_batch(
+    req: CheckPinStatusBatchRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_permission("reports", "read")),
+):
+    """
+    批量检查多个文件是否已固定为报表/报告（只读，不创建记录）。
+
+    - 非 superadmin 只能查询自己目录下的文件；对其他用户的文件静默返回 pinned=false
+    - 路径越界的条目同样静默返回 pinned=false，不抛 4xx
+    - 用于前端渲染文件卡片时的初始固定状态检测
+    """
+    username = getattr(current_user, "username", "default")
+    is_superadmin = getattr(current_user, "is_superadmin", False)
+    customer_data_root = _CUSTOMER_DATA_ROOT.resolve()
+
+    # 归一化 + 安全/权限过滤
+    safe_norm_paths: List[str] = []          # 通过检查的归一化路径
+    skipped_originals: set = set()           # 原始路径 → 静默返回 pinned=false
+
+    for fp in req.file_paths:
+        norm_fp = fp.replace("\\", "/").lstrip("/")
+        try:
+            abs_path = (_CUSTOMER_DATA_ROOT / norm_fp).resolve()
+            abs_path.relative_to(customer_data_root)
+        except Exception:
+            skipped_originals.add(fp)
+            continue
+        # 非 superadmin 只能查自己的文件（file_path 首段应为用户名）
+        path_parts = norm_fp.split("/")
+        if not is_superadmin and path_parts[0] != username:
+            skipped_originals.add(fp)
+            continue
+        safe_norm_paths.append(norm_fp)
+
+    # 批量查询 DB（一次 IN 查询）
+    existing_map: Dict[str, Report] = {}
+    if safe_norm_paths:
+        rows = db.query(Report).filter(
+            Report.report_file_path.in_(safe_norm_paths)
+        ).all()
+        for row in rows:
+            if row.report_file_path:
+                existing_map[row.report_file_path] = row
+
+    # 构建结果列表
+    results = []
+    for fp in req.file_paths:
+        if fp in skipped_originals:
+            results.append({"file_path": fp, "pinned": False})
+            continue
+        norm_fp = fp.replace("\\", "/").lstrip("/")
+        row = existing_map.get(norm_fp)
+        if row:
+            results.append({
+                "file_path": fp,
+                "pinned": True,
+                "report_id": str(row.id),
+                "refresh_token": row.refresh_token,
+                "doc_type": getattr(row, "doc_type", "dashboard"),
+                "name": row.name,
+            })
+        else:
+            results.append({"file_path": fp, "pinned": False})
+
+    return {"success": True, "data": {"results": results}}
 
 
 async def _async_generate_summary(report_id: str, spec: Dict, db: Session) -> None:
@@ -1121,6 +1205,99 @@ async def update_report_spec(
         "data": {
             "report_id": str(report.id),
             "updated_at": datetime.utcnow().isoformat(),
+            "spec_updated": True,
+        },
+    }
+
+
+@router.put("/{report_id}/charts/{chart_id}")
+async def update_single_chart(
+    report_id: str,
+    chart_id: str,
+    req: UpdateChartRequest,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_permission("reports", "create")),
+):
+    """
+    局部更新报告中单个图表的配置。
+
+    按 chart_id（路径参数 或 req.chart["id"]）将传入的字段 merge 到现有图表，
+    不影响报告中其他图表。适用于 AI Pilot 单图修改场景，避免全量替换 spec 导致
+    其他图表被意外删除（RC2 修复）。
+
+    匹配规则：
+    - 优先用路径参数 chart_id 匹配；
+    - 若 req.chart["id"] 存在且与路径参数不同，以路径参数为准。
+    - 若 chart_id 在现有图表中不存在，则追加为新图表。
+    """
+    username = getattr(current_user, "username", "default")
+    report = _get_report_or_404(report_id, db)
+    _check_ownership(report, username, getattr(current_user, "is_superadmin", False))
+
+    existing_charts: List[Dict[str, Any]] = list(report.charts or [])
+
+    # 确保传入 chart 的 id 与路径参数一致
+    incoming = dict(req.chart)
+    incoming["id"] = chart_id  # 路径参数优先
+
+    found = False
+    merged_charts: List[Dict[str, Any]] = []
+    for c in existing_charts:
+        if c.get("id") == chart_id:
+            # Merge：以原图表为基础，用传入字段覆盖（浅合并）
+            merged_charts.append({**c, **incoming})
+            found = True
+        else:
+            merged_charts.append(c)
+
+    if not found:
+        # chart_id 不存在于现有图表：作为新图表追加
+        merged_charts.append(incoming)
+
+    # 从 DB 已有字段重建完整 spec（保留 title/theme/filters/data_sources）
+    merged_spec: Dict[str, Any] = {
+        "title": report.name,
+        "subtitle": report.description or "",
+        "theme": report.theme or "light",
+        "filters": report.filters or [],
+        "data_sources": report.data_sources or [],
+        "charts": merged_charts,
+        "include_summary": False,
+        "data": {},
+    }
+
+    try:
+        html_content = build_report_html(
+            spec=merged_spec,
+            report_id=str(report.id),
+            refresh_token=report.refresh_token,
+            api_base_url=_api_base_url(),
+        )
+    except Exception as e:
+        logger.error("[Reports] 单图更新 HTML 生成失败: report_id=%s chart_id=%s err=%s",
+                     report_id, chart_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"HTML 生成失败: {e}")
+
+    if not report.report_file_path:
+        raise HTTPException(status_code=400, detail="报告尚无 HTML 文件路径，无法覆写")
+
+    html_path = _CUSTOMER_DATA_ROOT / report.report_file_path
+    html_path.parent.mkdir(parents=True, exist_ok=True)
+    html_path.write_text(html_content, encoding="utf-8")
+
+    report.charts = merged_charts
+    db.commit()
+
+    logger.info("[Reports] 单图更新完成: report_id=%s chart_id=%s found=%s", report_id, chart_id, found)
+    return {
+        "success": True,
+        "data": {
+            "report_id": str(report.id),
+            "chart_id": chart_id,
+            "found": found,
+            "total_charts": len(merged_charts),
+            "updated_at": datetime.utcnow().isoformat(),
+            "spec_updated": True,
         },
     }
 
@@ -1158,8 +1335,10 @@ async def create_report_copilot(
     current_user=Depends(require_permission("reports", "read")),
 ):
     """
-    为指定报告创建一个 Co-pilot 对话，系统提示中注入报告上下文。
-    返回新建对话 ID，前端跳转到对话页面。
+    为指定报告获取或创建 Co-pilot 对话（upsert）。
+
+    同一用户对同一报表只使用一个 Pilot 对话，不会重复创建。
+    返回 conversation_id 以及 created 标识（true=新建, false=复用已有）。
     """
     from backend.services.conversation_service import ConversationService
 
@@ -1167,32 +1346,72 @@ async def create_report_copilot(
     report = _get_report_or_404(report_id, db)
     _check_ownership(report, username, getattr(current_user, "is_superadmin", False))
 
-    copilot_system_prompt = (
-        f"[Co-pilot 模式] 当前报表：{report.name}\n"
-        f"图表数量：{len(report.charts or [])}\n"
-        f"图表配置：{json.dumps(report.charts or [], ensure_ascii=False)[:2000]}\n"
-        f"过滤器：{json.dumps(report.filters or [], ensure_ascii=False)[:500]}\n"
-        f"主题：{report.theme}\n\n"
-        "请基于以上报表信息协助用户修改报表。"
-    )
-
     user_id = getattr(current_user, "id", None)
     if user_id is not None and str(user_id) == "default":
         user_id = None
 
     svc = ConversationService(db)
+
+    # ── Upsert：先查已有对话，避免重复创建 ──────────────────────────────────
+    existing = svc.find_pilot_conversation(
+        context_type="report",
+        context_id=str(report.id),
+        user_id=user_id,
+    )
+    if existing:
+        logger.info(
+            "[Reports] co-pilot 对话已存在，复用: report_id=%s, conv_id=%s",
+            report_id, existing.id,
+        )
+        return {
+            "success": True,
+            "data": {"conversation_id": str(existing.id), "created": False},
+        }
+
+    charts_list = report.charts or []
+    chart_summary = "\n".join(
+        f'  [{i+1}] id="{c.get("id","?")}" title="{c.get("title","?")}" type="{c.get("chart_type","?")}"'
+        for i, c in enumerate(charts_list)
+    )
+    copilot_system_prompt = (
+        f"[Co-pilot 模式] 当前报表：{report.name}\n"
+        f"report_id：{report.id}\n"
+        f"refresh_token：{report.refresh_token}\n"
+        f"图表数量：{len(charts_list)}\n"
+        f"图表列表：\n{chart_summary or '  （无图表）'}\n"
+        f"图表配置（详细）：{json.dumps(charts_list, ensure_ascii=False)[:4000]}\n"
+        f"过滤器：{json.dumps(report.filters or [], ensure_ascii=False)[:500]}\n"
+        f"主题：{report.theme}\n\n"
+        "## 修改报表的 MCP 工具（直接调用，无需 JWT）\n\n"
+        "### 工具 1：report__get_spec\n"
+        "读取报表当前完整 spec，修改前先调用确认所有图表。\n"
+        "参数：report_id（见上方）、token（即 refresh_token）\n\n"
+        "### 工具 2：report__update_single_chart（优先使用）\n"
+        "局部更新单个图表，merge 操作，不影响其他图表。\n"
+        "参数：report_id、token、chart_id、chart_patch（只含需修改字段）\n\n"
+        "### 工具 3：report__update_spec（全量更新）\n"
+        "更新整个报表 spec，适用于添加/删除图表或批量修改。\n"
+        "⚠️ spec.charts 必须包含所有图表，缺少的图表将永久删除！\n"
+        "参数：report_id、token、spec（完整 spec JSON 含所有图表）\n\n"
+        "请基于以上报表信息协助用户修改报表。修改完成后告知用户「报表已更新，请查看预览」。"
+    )
+
     conv_title = req.title or f"报表助手 — {report.name}"
     conv = svc.create_conversation(
         title=conv_title,
         system_prompt=copilot_system_prompt,
-        metadata={"context_type": "report", "context_id": str(report.id)},
+        metadata={
+            "context_type": "report",
+            "context_id": str(report.id),
+            "refresh_token": report.refresh_token,
+        },
         user_id=user_id,
     )
 
     logger.info("[Reports] co-pilot 对话已创建: report_id=%s, conv_id=%s", report_id, conv.id)
     return {
         "success": True,
-        "data": {"conversation_id": str(conv.id)},
+        "data": {"conversation_id": str(conv.id), "created": True},
     }
 
 

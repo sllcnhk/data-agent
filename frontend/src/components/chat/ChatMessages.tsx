@@ -46,11 +46,43 @@ interface FileDownloadCardsProps {
   conversationId?: string;
 }
 
+/** 本地 pin 状态覆盖（跨对话/跨 session 的已固定检测结果） */
+interface PinOverride {
+  report_id: string;
+  refresh_token: string;
+}
+
 const FileDownloadCards: React.FC<FileDownloadCardsProps> = ({ files, messageId, conversationId }) => {
   const [downloading, setDownloading] = useState<string | null>(null);
   const [pinning, setPinning] = useState<string | null>(null);
   const [previewFile, setPreviewFile] = useState<FileInfo | null>(null);
+  /**
+   * 通过批量检查接口发现的已固定文件（path → 固定信息）。
+   * 解决跨对话场景：同一文件在对话 A 固定后，对话 B 的文件卡片能正确显示"已生成固定报表"。
+   */
+  const [pinnedOverrides, setPinnedOverrides] = useState<Record<string, PinOverride>>({});
   const markFilePinned = useChatStore((s) => s.markFilePinned);
+
+  // 挂载时批量检测：对无 pinned_report_id 的报告文件发一次批量查询
+  useEffect(() => {
+    const unpinnedPaths = files
+      .filter((f) => f.is_report && !f.pinned_report_id && f.path)
+      .map((f) => f.path);
+    if (!unpinnedPaths.length) return;
+
+    reportApi.checkPinStatusBatch(unpinnedPaths).then((results) => {
+      const overrides: Record<string, PinOverride> = {};
+      for (const r of results) {
+        if (r.pinned && r.report_id && r.refresh_token) {
+          overrides[r.file_path] = { report_id: r.report_id, refresh_token: r.refresh_token };
+        }
+      }
+      if (Object.keys(overrides).length > 0) {
+        setPinnedOverrides((prev) => ({ ...prev, ...overrides }));
+      }
+    }).catch(() => { /* 非关键，静默失败，不影响主流程 */ });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [files]);
 
   const handleDownload = async (file: FileInfo) => {
     setDownloading(file.path);
@@ -75,6 +107,11 @@ const FileDownloadCards: React.FC<FileDownloadCardsProps> = ({ files, messageId,
         message_id: messageId,
       });
       markFilePinned(messageId, file.path, result.report_id, result.refresh_token);
+      // 同步更新本地覆盖，确保当前渲染立即切换为"已生成固定"状态
+      setPinnedOverrides((prev) => ({
+        ...prev,
+        [file.path]: { report_id: result.report_id, refresh_token: result.refresh_token },
+      }));
       const label = docType === 'document' ? '报告' : '报表';
       antMessage.success(`已生成固定${label}，可在数据管理中心查看`);
     } catch (e: any) {
@@ -91,9 +128,18 @@ const FileDownloadCards: React.FC<FileDownloadCardsProps> = ({ files, messageId,
       </div>
       {files.map((file) => {
         const isReport = file.is_report === true;
-        const isPinned = !!file.pinned_report_id;
         const docType = file.doc_type ?? 'dashboard';
         const docLabel = docType === 'document' ? '报告' : '报表';
+        // 优先使用 store 中的 pinned_report_id，回退到批量检查结果
+        const effectivePinnedId = file.pinned_report_id ?? pinnedOverrides[file.path]?.report_id;
+        const effectiveRefreshToken = file.refresh_token ?? pinnedOverrides[file.path]?.refresh_token;
+        const isPinned = !!effectivePinnedId;
+        // 合并有效的文件信息（用于预览弹窗）
+        const effectiveFile: FileInfo = {
+          ...file,
+          pinned_report_id: effectivePinnedId,
+          refresh_token: effectiveRefreshToken,
+        };
         return (
           <div
             key={file.path}
@@ -145,7 +191,7 @@ const FileDownloadCards: React.FC<FileDownloadCardsProps> = ({ files, messageId,
                 size="small"
                 type="primary"
                 icon={<EyeOutlined />}
-                onClick={() => setPreviewFile(file)}
+                onClick={() => setPreviewFile(effectiveFile)}
               >
                 预览
               </Button>

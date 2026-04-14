@@ -106,6 +106,37 @@ class ConversationService:
         except (ValueError, SQLAlchemyError):
             return None
 
+    def find_pilot_conversation(
+        self,
+        context_type: str,
+        context_id: str,
+        user_id=None,
+    ) -> Optional[Conversation]:
+        """
+        查找指定上下文（报表/文档）的已有 Pilot 对话。
+
+        认证模式下同时按 user_id 过滤，确保用户隔离；
+        匿名模式（user_id=None）仅按 context_id 查找。
+
+        Args:
+            context_type: 上下文类型，如 "report"
+            context_id:   上下文 ID（报表 UUID 字符串）
+            user_id:      当前用户 ID（认证关闭时为 None）
+
+        Returns:
+            最新一条匹配对话，或 None
+        """
+        try:
+            query = self.db.query(Conversation).filter(
+                Conversation.extra_metadata["context_type"].astext == context_type,
+                Conversation.extra_metadata["context_id"].astext == context_id,
+            )
+            if user_id is not None:
+                query = query.filter(Conversation.user_id == user_id)
+            return query.order_by(desc(Conversation.created_at)).first()
+        except Exception:
+            return None
+
     def list_conversations(
         self,
         limit: int = 20,

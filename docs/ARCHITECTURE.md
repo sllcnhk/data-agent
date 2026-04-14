@@ -2,7 +2,7 @@
 
 > **适用对象**：LLM 模型（Claude Code / 其他 AI）、新加入开发者
 > **目的**：快速理解系统整体架构、模块职责、数据流向和交互接口
-> **最后更新**：2026-04-14（**v2.9 AI Pilot 实时助手**：`ReportPreviewModal` Pilot 侧边面板 + `DataCenterCopilotContent` 提取 + `ModelSelectorMini` 紧凑模型选择器 + `_inject_pilot_button(doc_type)` HTML 注入（按 doc_type 路由 dashboards/documents）+ `POST /reports/{id}/copilot` + `POST /scheduled-reports/{id}/copilot` 端点 + autoPilot URL 参数处理 + 推送任务历史 Drawer FAB；无 DB 迁移；**v2.5 2026-04-13**：数据管理中心 + 定时推送任务；**v2.4 2026-04-13**：多图表 HTML 报告生成；**2026-04-08**：Skill 用户使用权限隔离 T1–T6；**2026-04-05**：Excel → ClickHouse 数据导入 + 文件写入下载）
+> **最后更新**：2026-04-15（**v2.10 报表增强**：图表控件 ⋮ 菜单（Force Refresh / Fullscreen / View Query / Download）+ `GET /reports/{id}/spec-meta`（refresh_token 鉴权，无 JWT）+ `PUT /reports/{id}/charts/{chart_id}`（单图表 merge 更新）+ `ReportToolMCPServer`（3 MCP 工具）+ `ReportViewerPage`（`/report-view` 分屏页）+ Pilot 一对一绑定（upsert）；无 DB 迁移；**v2.9 2026-04-14**：AI Pilot 实时助手；**v2.5 2026-04-13**：数据管理中心 + 定时推送任务；**v2.4 2026-04-13**：多图表 HTML 报告生成）
 
 ---
 
@@ -1201,11 +1201,61 @@ autoPilot URL 参数（独立标签页跳转后自动打开 Pilot）
 | Bug-2：HTML 报告内嵌按钮路由错误 | `_inject_pilot_button` 硬编码 `'dashboards'`，document 类型报告也跳到 dashboards | `backend/api/reports.py:_inject_pilot_button(doc_type=)` |
 | Bug-3：Documents 页不响应 autoPilot 参数 | `DataCenterDocuments.tsx` 缺少 autoPilot URL 参数处理 `useEffect` | `frontend/src/pages/DataCenterDocuments.tsx` |
 
-**RBAC**：无新权限键。Pilot 端点复用现有权限：`reports:read`（analyst+）和 `schedules:read`（analyst+）。Viewer 角色无法访问两个 copilot 端点（HTTP 403）。
+**RBAC**：无新权限键。Pilot 端点复用现有权限：`reports:read`（analyst+）和 `schedules:read`（analyst+）。Viewer 角色无法访问两个 copilot 端点（HTTP 403）。ownership 校验确保只有报表创建者（或 superadmin）可建立 Pilot 对话。
 
-**无 DB 迁移**：Pilot 对话复用已有 `conversations` 表；模型切换复用 `conversations.current_model` 列（`UpdateConversationRequest.model_key`）；无新表、新列或新权限记录。
+**无 DB 迁移**：Pilot 对话复用已有 `conversations` 表；模型切换复用 `conversations.current_model` 列；无新表、新列或新权限记录。
 
-**测试**：`test_pilot_e2e.py`（27 tests，F/G/H/I/J 段）：17 个纯单元测试（无需 DB）+ 10 个 DB 集成测试（G/H/J 段，需 PostgreSQL）。
+**Pilot 一对一绑定（upsert）**：`POST /reports/{id}/copilot` 调用 `ConversationService.find_pilot_conversation(context_type="report", context_id=report_id, user_id=user_id)` 先查已有对话，找到则返回 `created: False`（复用），未找到才新建并注入 spec 上下文。**同一用户对同一报表始终复用同一 Pilot 对话**，可查看完整修改历史。
+
+**测试**：`test_pilot_e2e.py`（71 tests，含 N1-N6 MCP 化验证）+ `test_report_mcp_tool.py`（47 tests，A-G 段）+ `test_report_pilot_e2e.py`（47 tests，P-U 段）。
+
+---
+
+### 4.23 报表增强：图表控件、MCP 工具、分屏查看（v2.10，2026-04-15）
+
+```
+图表控件 ⋮ 菜单（每个图表右上角，注入到 HTML <body>）
+  _inject_chart_controls(html, report_id, refresh_token)
+    ├─ Force Refresh → GET /reports/{id}/refresh-data?token=  （重查 SQL 数据）
+    ├─ Fullscreen    → 图表 canvas 全屏展示（requestFullscreen）
+    ├─ View Query    → 弹窗展示图表 SQL
+    └─ Download      → CSV / Excel 导出当前图表数据
+
+GET /reports/{id}/spec-meta?token=<refresh_token>
+  ├─ 无需 JWT，refresh_token 鉴权（secrets.compare_digest）
+  └─ 返回报表完整 dict（charts / filters / theme / name 等）
+       └─ 供 ReportViewerPage 给 Pilot 注入上下文（无需用户登录）
+
+PUT /reports/{id}/charts/{chart_id}
+  ├─ JWT + reports:create + ownership 鉴权
+  ├─ 读取 report.charts（JSONB 列）
+  ├─ 按 chart_id 找到目标图表 → merge: {**旧图表, **传入字段}
+  ├─ 重建 HTML（build_report_html）并写入磁盘（pathlib.Path.write_text）
+  └─ 递增 version_seq，返回 updated_at + total_charts
+
+ReportToolMCPServer（backend/mcp/report_tool/server.py）
+  ├─ 注册名称 "report"，工具前缀 "report__"
+  ├─ report__get_spec(report_id, token)        → 调 get_spec_by_token()
+  ├─ report__update_spec(report_id, token, spec) → 调 update_spec_by_token()
+  └─ report__update_single_chart(report_id, token, chart_id, chart_patch)
+                                                → 调 update_single_chart_by_token()
+  所有工具均用 refresh_token 鉴权，无需 JWT，适合 Pilot 对话场景
+
+ReportViewerPage（frontend/src/pages/ReportViewerPage.tsx）
+  路由：/report-view?id=&token=&doc_type=&name=
+  ├─ 左侧：iframe 渲染 GET /reports/{id}/html?token=（含图表控件注入）
+  ├─ 右侧：DataCenterCopilotContent（380px Pilot 侧边面板，CSS 滑入）
+  ├─ Pilot FAB：右下角绿色圆形按钮，切换侧边面板开/关
+  ├─ localStorage 持久化 pilot_open_{reportId}（刷新页面保留状态）
+  ├─ handleSpecUpdated()：AI 更新 spec 后 iframeKey++ + 重拉 GET /spec-meta
+  └─ iframe onLoad：postMessage({type:'pilotHideFab'}) 隐藏 HTML 注入的 Pilot 按钮
+```
+
+**核心文件**：`backend/api/reports.py`（`_inject_chart_controls` + GET spec-meta + PUT charts）/ `backend/services/report_service.py`（`get_spec_by_token` + `update_spec_by_token` + `update_single_chart_by_token`）/ `backend/mcp/report_tool/server.py` / `frontend/src/pages/ReportViewerPage.tsx`
+
+**RBAC**：GET /spec-meta 无需 JWT；PUT /charts 需 `reports:create`（analyst+）；MCP 工具无需 JWT；无新权限键。
+
+**无 DB 迁移**：复用 `reports.charts`（JSONB）+ `reports.version_seq`（整数）；无新列。
 
 ---
 
@@ -1381,8 +1431,10 @@ autoPilot URL 参数（独立标签页跳转后自动打开 Pilot）
 | GET | `/reports/{id}/summary-status` | `reports:read` + ownership | 查询 LLM 总结生成状态 |
 | POST | `/reports/{id}/share` | `reports:read` + ownership | 生成公开分享链接（share_token）|
 | GET | `/reports/shared/{token}` | 无需 JWT | 通过 share_token 公开访问报告详情 |
-| GET | `/reports/{id}/html?token=` | 无需 JWT（token 鉴权）| 渲染 HTML；preview 模式自动注入 Pilot 悬浮按钮（按 `doc_type` 路由 dashboards/documents）；`?download=true` 跳过注入以附件方式下载 |
-| POST | `/reports/{id}/copilot` | `reports:read` + ownership | **★ 新增（v2.9）** 为报表创建 Co-pilot 对话（系统提示注入报表 spec 上下文），返回 `conversation_id` |
+| GET | `/reports/{id}/html?token=` | 无需 JWT（token 鉴权）| 渲染 HTML；preview 模式自动注入图表控件 ⋮ 菜单 + Pilot 悬浮按钮（按 `doc_type` 路由 dashboards/documents）；`?download=true` 跳过注入以附件方式下载 |
+| GET | `/reports/{id}/spec-meta?token=` | 无需 JWT（token 鉴权）| **★ v2.10** 返回报表完整 spec（charts/filters/theme）；供 ReportViewerPage 给 Pilot 注入上下文 |
+| PUT | `/reports/{id}/charts/{chart_id}` | `reports:create` + ownership | **★ v2.10** 局部更新单个图表（merge 操作），重建 HTML，递增 version_seq |
+| POST | `/reports/{id}/copilot` | `reports:read` + ownership | **★ v2.9** 为报表创建/复用 Co-pilot 对话（upsert，同用户同报表复用同一对话），系统提示注入报表 spec，返回 `conversation_id` + `created` |
 
 ### 定时推送任务 `/scheduled-reports`
 

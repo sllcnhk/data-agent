@@ -25,6 +25,7 @@ import {
   CloseOutlined,
   LoadingOutlined,
   CheckCircleOutlined,
+  ReloadOutlined,
   RobotOutlined,
 } from '@ant-design/icons';
 import { useAuthStore } from '@/store/useAuthStore';
@@ -44,6 +45,8 @@ export interface PilotContext {
   contextName: string;
   contextSpec?: Record<string, any> | null;
   onSpecUpdated?: () => void;
+  /** 报表刷新令牌——contextSpec 缺失时的预览 token 回退，透传给 DataCenterCopilotContent */
+  contextRefreshToken?: string;
 }
 
 interface ReportPreviewModalProps {
@@ -262,6 +265,19 @@ const ReportPreviewModal: React.FC<ReportPreviewModalProps> = ({
           <span style={{ fontWeight: 600, fontSize: 15 }}>📊 {fileName}</span>
           <Space size={8}>
             {exportStatusTag()}
+            <Tooltip title="重新加载报表">
+              <Button
+                size="small"
+                icon={<ReloadOutlined />}
+                loading={iframeLoading}
+                onClick={() => {
+                  setIframeLoading(true);
+                  setIframeKey((k) => k + 1);
+                }}
+              >
+                刷新
+              </Button>
+            </Tooltip>
             <Tooltip title="新标签页打开">
               <Button size="small" icon={<GlobalOutlined />} onClick={openInNewTab}>
                 新窗口
@@ -385,6 +401,7 @@ const ReportPreviewModal: React.FC<ReportPreviewModalProps> = ({
                 contextName={pilotContext.contextName}
                 contextSpec={pilotContext.contextSpec}
                 onSpecUpdated={handleSpecUpdatedInModal}
+                contextRefreshToken={pilotContext.contextRefreshToken ?? refreshToken}
               />
             </div>
           </div>

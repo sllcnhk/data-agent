@@ -23,7 +23,7 @@ from unittest.mock import patch, MagicMock
 
 # ── 路径 & 环境初始化 ────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "backend"))
-os.environ.setdefault("POSTGRES_PASSWORD", "postgres")
+os.environ.setdefault("POSTGRES_PASSWORD", "Sgp013013")
 os.environ.setdefault("POSTGRES_HOST", "localhost")
 os.environ.setdefault("ENABLE_AUTH", "False")
 
@@ -493,12 +493,13 @@ class TestDModelKeyInConversation(unittest.TestCase):
         self.assertTrue(data["success"])
         conv_id = data["data"]["id"]
 
-        # 验证 current_model
+        # 验证 current_model — GET /conversations/{id} 返回 {"conversation": {...}, "messages": [...]}
         get_res = self.client.get(
             f"/api/v1/conversations/{conv_id}",
             headers=_auth(self.owner),
         )
-        conv_data = get_res.json()["data"]
+        raw = get_res.json()
+        conv_data = raw.get("conversation", raw.get("data", {}))
         self.assertEqual(conv_data.get("current_model", conv_data.get("model")), "claude")
 
     def test_D2_create_conversation_without_model_key_gets_default(self):
@@ -517,7 +518,8 @@ class TestDModelKeyInConversation(unittest.TestCase):
             f"/api/v1/conversations/{conv_id}",
             headers=_auth(self.owner),
         )
-        conv_data = get_res.json()["data"]
+        raw = get_res.json()
+        conv_data = raw.get("conversation", raw.get("data", {}))
         model_val = conv_data.get("current_model", conv_data.get("model", ""))
         # Should not be empty (default model is set)
         self.assertIsNotNone(model_val)
@@ -537,7 +539,8 @@ class TestDModelKeyInConversation(unittest.TestCase):
             headers=_auth(self.owner),
         )
         self.assertEqual(get_res.status_code, 200)
-        conv_data = get_res.json()["data"]
+        raw = get_res.json()
+        conv_data = raw.get("conversation", raw.get("data", {}))
         self.assertIn(sr.name, conv_data.get("title", ""))
 
     def test_D4_schedule_copilot_system_prompt_has_channels(self):
@@ -582,13 +585,13 @@ class TestEModelSwitch(unittest.TestCase):
         return res.json()["data"]["id"]
 
     def test_E1_put_conversation_model_updates_current_model(self):
-        """PUT /conversations/{id} 带 model 字段应更新 current_model。"""
+        """PUT /conversations/{id} 带 model_key 字段应更新 current_model。"""
         cid = self._create_conv("claude")
 
         put_res = self.client.put(
             f"/api/v1/conversations/{cid}",
             headers=_auth(self.owner),
-            json={"model": "qianwen"},
+            json={"model_key": "qianwen"},
         )
         self.assertIn(put_res.status_code, [200, 201])
 
@@ -596,7 +599,8 @@ class TestEModelSwitch(unittest.TestCase):
             f"/api/v1/conversations/{cid}",
             headers=_auth(self.owner),
         )
-        conv_data = get_res.json()["data"]
+        raw = get_res.json()
+        conv_data = raw.get("conversation", raw.get("data", {}))
         updated_model = conv_data.get("current_model", conv_data.get("model", ""))
         self.assertEqual(updated_model, "qianwen")
 
@@ -605,7 +609,7 @@ class TestEModelSwitch(unittest.TestCase):
         res = self.client.put(
             f"/api/v1/conversations/{uuid.uuid4()}",
             headers=_auth(self.owner),
-            json={"model": "claude"},
+            json={"model_key": "claude"},
         )
         self.assertEqual(res.status_code, 404)
 
@@ -617,7 +621,7 @@ class TestEModelSwitch(unittest.TestCase):
         self.client.put(
             f"/api/v1/conversations/{cid}",
             headers=_auth(self.owner),
-            json={"model": "qianwen"},
+            json={"model_key": "qianwen"},
         )
 
         # 验证对话仍然存在
@@ -627,7 +631,8 @@ class TestEModelSwitch(unittest.TestCase):
         )
         self.assertEqual(get_res.status_code, 200)
         # 消息列表（可能为空，但对话本身应存在）
-        conv_data = get_res.json()["data"]
+        raw = get_res.json()
+        conv_data = raw.get("conversation", raw.get("data", {}))
         self.assertIsNotNone(conv_data.get("id"))
 
 

@@ -11,6 +11,7 @@ from backend.mcp.clickhouse import ClickHouseMCPServer
 from backend.mcp.mysql import MySQLMCPServer
 from backend.mcp.filesystem import FilesystemMCPServer
 from backend.mcp.lark import LarkMCPServer
+from backend.mcp.report_tool import ReportToolMCPServer
 from backend.config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,12 @@ class MCPServerManager:
                 await self.create_lark_server()
             except Exception as e:
                 logger.warning("[MCPManager] Failed to register lark: %s", e)
+
+        # Report Tool Server（报表读写工具，供 Pilot 对话使用，始终注册）
+        try:
+            await self.create_report_tool_server()
+        except Exception as e:
+            logger.warning("[MCPManager] Failed to register report tool: %s", e)
 
         # 启动汇总：帮助快速确认哪些服务器注册成功
         registered = sorted(self.servers.keys())
@@ -163,6 +170,24 @@ class MCPServerManager:
             "type": "lark"
         }
 
+        return server
+
+    async def create_report_tool_server(self) -> ReportToolMCPServer:
+        """创建 Report Tool 服务器（报表读写，供 Pilot 对话使用）"""
+        server_name = "report"
+
+        if server_name in self.servers:
+            return self.servers[server_name]
+
+        server = ReportToolMCPServer()
+        await server.initialize()
+
+        self.servers[server_name] = server
+        self.server_configs[server_name] = {
+            "type": "report_tool"
+        }
+
+        logger.info("[MCPManager] Registered report tool server")
         return server
 
     def get_server(self, name: str) -> Optional[BaseMCPServer]:

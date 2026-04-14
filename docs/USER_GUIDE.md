@@ -1,7 +1,7 @@
 # 数据智能体系统 — 核心使用手册
 
 **文档版本**: v2.9
-**适用系统版本**: P0 + P1 + P2 + P3 + 3-Tier Skill System + Semantic Skill Routing + RBAC + 角色管理页面 + 推理过程持久化 + ContinuationCard + ClickHouse 动态多区域配置 + Session 过期管理 + 对话打断（停止生成）+ 对话附件上传 + 用户技能目录隔离修复 + 对话用户隔离 + 侧边栏 Tab UI + 只读模式 + is_shared 群组框架 + 技能路由可视化 + 文件写入下载 + **Excel → ClickHouse 数据导入**（2026-04-05）+ **Skill 用户使用权限隔离 T1–T6**（2026-04-08）+ **多图表 HTML 报告生成**（2026-04-13）+ **数据管理中心 + 定时推送任务**（2026-04-13）+ **AI Pilot 实时助手 + 对话模型切换**（2026-04-14）
+**适用系统版本**: P0 + P1 + P2 + P3 + 3-Tier Skill System + Semantic Skill Routing + RBAC + 角色管理页面 + 推理过程持久化 + ContinuationCard + ClickHouse 动态多区域配置 + Session 过期管理 + 对话打断（停止生成）+ 对话附件上传 + 用户技能目录隔离修复 + 对话用户隔离 + 侧边栏 Tab UI + 只读模式 + is_shared 群组框架 + 技能路由可视化 + 文件写入下载 + **Excel → ClickHouse 数据导入**（2026-04-05）+ **Skill 用户使用权限隔离 T1–T6**（2026-04-08）+ **多图表 HTML 报告生成**（2026-04-13）+ **数据管理中心 + 定时推送任务**（2026-04-13）+ **AI Pilot 实时助手 + 对话模型切换**（2026-04-14）+ **报表增强：图表控件 / MCP 工具 / 分屏查看 / Pilot 一对一绑定**（2026-04-15）
 **读者对象**: 数据工程师、数据分析师、系统管理员
 
 ---
@@ -22,7 +22,9 @@
 12. [Excel → ClickHouse 数据导入（superadmin 专属）](#12-excel--clickhouse-数据导入superadmin-专属)
 13. [SQL → Excel 数据导出（superadmin 专属）](#13-sql--excel-数据导出superadmin-专属)
 14. [多图表 HTML 报告生成](#14-多图表-html-报告生成)
-15. [数据管理中心](#15-数据管理中心)（含 15.4 推送任务 + 15.5 Co-pilot 技能 + 15.7 AI Pilot 实时助手）
+15. [数据管理中心](#15-数据管理中心)（含 15.4 推送任务 + 15.5 Co-pilot 技能 + 15.7 AI Pilot 实时助手 + Pilot 一对一绑定）
+    - 14.9 图表控件 ⋮ 菜单（Force Refresh / Fullscreen / View Query / Download）
+    - 14.10 分屏查看页（ReportViewerPage）
 
 ---
 
@@ -2366,7 +2368,57 @@ Authorization: Bearer <token>
 
 # 公开刷新数据（无需 JWT）
 GET /api/v1/reports/{id}/refresh-data?token=<refresh_token>
+
+# ★ v2.10 获取报表 spec 元数据（无需 JWT）
+GET /api/v1/reports/{id}/spec-meta?token=<refresh_token>
+→ 返回: {"success": true, "data": {报表完整 dict（含 charts/filters/theme）}}
+
+# ★ v2.10 局部更新单个图表（需 JWT + reports:create）
+PUT /api/v1/reports/{id}/charts/{chart_id}
+Authorization: Bearer <token>
+{
+  "chart_patch": {
+    "chart_type": "area",
+    "sql": "SELECT ...",
+    "echarts_override": { "series": [{"smooth": false}] }
+  }
+}
+→ 返回: {"success": true, "data": {"report_id": "...", "updated_at": "...", "total_charts": 3}}
+
+# ★ v2.10 为报表建立/复用 Pilot 对话（需 JWT + reports:read + ownership）
+POST /api/v1/reports/{id}/copilot
+Authorization: Bearer <token>
+→ 返回: {"success": true, "data": {"conversation_id": "...", "created": true}}
+# created=false 表示复用已有 Pilot 对话
 ```
+
+### 14.9 图表控件 ⋮ 菜单
+
+每个图表右上角会自动出现一个 **⋮（三点）** 菜单按钮（后端在渲染 HTML 时注入），提供以下快捷操作：
+
+| 菜单项 | 说明 |
+|--------|------|
+| **Force Refresh** | 使用 `refresh_token` 重新查询数据库，更新当前图表数据（无需刷新整个页面）|
+| **Fullscreen** | 当前图表全屏展示，按 Esc 退出 |
+| **View Query** | 弹窗展示该图表的 SQL 查询语句，方便调试和审查 |
+| **Download CSV / Excel** | 将当前图表数据导出为 CSV 或 Excel 文件 |
+
+> **注意**：图表控件按钮在 HTML 渲染时自动注入（无需手动添加）。通过聊天生成的旧式报表文件在预览时也会自动获得此菜单。
+
+### 14.10 分屏查看页（ReportViewerPage）
+
+点击「新标签页 Pilot 查看」或从 HTML 内嵌 🤖 按钮跳转时，会在**独立浏览器标签页**打开 `/report-view` 分屏页：
+
+- **左侧**：全高 iframe 渲染报表 HTML（含图表控件 ⋮ 菜单）
+- **右侧**：AI Pilot 对话侧边面板（380px，CSS 动画滑入/出）
+- **右下角**：绿色圆形 🤖 FAB 按钮，点击切换 Pilot 面板开关
+
+分屏页通过 URL 参数传递上下文：
+```
+/report-view?id=<report_id>&token=<refresh_token>&doc_type=dashboard&name=<report_name>
+```
+
+Pilot 开关状态存入 `localStorage`（`pilot_open_{reportId}`），刷新页面后自动恢复上次状态。AI 修改报表后，分屏页会自动刷新 iframe 加载最新 HTML，并重新拉取 spec 更新 Pilot 上下文。
 
 ---
 
@@ -2750,7 +2802,7 @@ _ETL_KEYWORDS = frozenset({
 - **更新推送任务**：「把刚才那个任务改成每天发一次」
   - 触发 `update-schedule.md` skill → AI 自动调用 `PUT /scheduled-reports/{id}`
 - **更新报表**：「帮我把这个报表的时间范围改成最近 30 天」
-  - 触发 `update-report.md` skill → AI 自动调用 `PUT /reports/{id}/spec`
+  - 触发 `update-report.md` skill → AI 优先调用 `report__update_single_chart` MCP 工具（单图表局部 merge）；需要添加/删除图表时改用 `report__update_spec`（全量更新）；均通过 `refresh_token` 鉴权，无需 JWT
 
 > **提示**：如果 AI 不自动触发上述 skill，可在消息中明确说「推送任务」「定时发送」「更新报表」等关键词，帮助路由到正确的 Co-pilot skill。
 
@@ -2788,12 +2840,25 @@ Pilot 面板顶部绿色上下文栏的右侧有一个小型模型选择器（**
 | 模型切换 | ✅ | ✅ |
 | 进入路径 | 卡片「AI 助手」按钮 | 预览 FAB / HTML 注入按钮 / autoPilot URL 参数 |
 
+#### Pilot 对话一对一绑定
+
+每个报表在每个用户下**只绑定一个 Pilot 对话**。首次点击「AI 助手」时系统自动创建对话（将报表 spec 注入系统提示）；之后再次点击同一报表的「AI 助手」，**自动复用已有对话**，可查看完整的历史修改记录。
+
+| 行为 | 说明 |
+|------|------|
+| 同用户 + 同报表 | 始终返回同一 `conversation_id`（upsert，`created: false`）|
+| 同用户 + 不同报表 | 每个报表有独立的 Pilot 对话，互不干扰 |
+| 不同用户 + 同报表 | 每位用户有各自的 Pilot 对话，互相隔离 |
+| 非报表创建者 | `POST /reports/{id}/copilot` 返回 403，无法为他人报表建立 Pilot |
+
+> **权限规则**：只有报表**创建者**（或 superadmin）才能通过 Pilot 修改报表。Pilot 修改通过 MCP 工具（`report__update_spec` / `report__update_single_chart`）使用 `refresh_token` 鉴权，直接更新原始报表文件。
+
 #### RBAC
 
 AI Pilot 复用现有权限：
 - 报表/报告 Pilot：需要 `reports:read`（analyst+）
 - 推送任务 Pilot：需要 `schedules:read`（analyst+）
-- `POST /reports/{id}/copilot`、`POST /scheduled-reports/{id}/copilot` 均有 ownership 校验，用户只能对自己的报表/任务发起 Pilot 对话
+- `POST /reports/{id}/copilot`、`POST /scheduled-reports/{id}/copilot` 均有 ownership 校验，**只有创建者（或 superadmin）才能建立 Pilot 对话**；viewer 角色因缺少 `reports:read` 权限，访问以上端点返回 403
 
 ### 15.6 RBAC 权限说明
 
@@ -2808,4 +2873,4 @@ AI Pilot 复用现有权限：
 
 ---
 
-*文档由 Claude Sonnet 4.6 生成 · data-agent v2.9 · 2026-04-14（新增：第 15.7 节 AI Pilot 实时助手（ReportPreviewModal 侧边面板 + HTML 注入悬浮按钮 + autoPilot URL + ModelSelectorMini 模型切换 + 推送任务历史 Drawer FAB）；15.2/15.3 操作表增 AI 助手列；版本号升至 v2.9；v2.8 · 2026-04-13：数据管理中心 + 定时推送任务）*
+*文档由 Claude Sonnet 4.6 生成 · data-agent v2.10 · 2026-04-15（新增：14.9 图表控件 ⋮ 菜单 + 14.10 分屏查看页 ReportViewerPage + 14.8 API 补充 GET /spec-meta / PUT /charts / POST /copilot；15.5 修正 update-report.md 使用 MCP 工具；15.7 补充 Pilot 一对一绑定说明 + ownership 规则；v2.9 · 2026-04-14：AI Pilot 实时助手）*

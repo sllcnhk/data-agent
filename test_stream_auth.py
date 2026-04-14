@@ -44,7 +44,7 @@ from datetime import timedelta
 # ── 路径设置 ──────────────────────────────────────────────────────────────────
 os.environ.setdefault("ENABLE_AUTH", "False")
 os.environ.setdefault("POSTGRES_USER", "postgres")
-os.environ.setdefault("POSTGRES_PASSWORD", "postgres")
+os.environ.setdefault("POSTGRES_PASSWORD", "Sgp013013")
 os.environ.setdefault("POSTGRES_HOST", "localhost")
 os.environ.setdefault("POSTGRES_PORT", "5432")
 os.environ.setdefault("POSTGRES_DB", "data_agent")
@@ -128,7 +128,22 @@ def _token(user, roles=None, expires_minutes=None):
     )
 
 
+_auth_patcher = None
+
+
+def setup_module(_=None):
+    """Disable auth globally for tests that rely on anonymous access."""
+    global _auth_patcher
+    from backend.config.settings import settings
+    _auth_patcher = patch.object(settings, "enable_auth", False)
+    _auth_patcher.start()
+
+
 def teardown_module(_=None):
+    global _auth_patcher
+    if _auth_patcher is not None:
+        _auth_patcher.stop()
+        _auth_patcher = None
     if not _DB_AVAILABLE or _g_db is None:
         return
     from backend.models.user import User
@@ -399,7 +414,12 @@ class TestEnableAuthFalseCompat(unittest.TestCase):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestConvEndpointsNoAuth(unittest.TestCase):
-    """D1-D5: 对话 CRUD 端点不含 get_current_user，修复不影响这些端点"""
+    """D1-D5: ENABLE_AUTH=false 时对话 CRUD 端点可匿名访问（向后兼容）
+
+    注意：对话用户隔离功能上线后，所有 CRUD 端点均添加了 get_current_user。
+    但当 ENABLE_AUTH=false 时 get_current_user 返回 AnonymousUser(is_superadmin=True)，
+    因此无需 token 即可访问。这些测试验证该向后兼容行为。
+    """
 
     FAKE_UUID = "00000000-0000-0000-0000-000000000097"
 
@@ -408,33 +428,31 @@ class TestConvEndpointsNoAuth(unittest.TestCase):
         cls.client = _make_client()
 
     def test_D1_list_conversations_no_token_not_401(self):
-        """GET /conversations 无 token → 非 401（端点无 auth 要求；DB 可用时为 200）"""
-        with patch("backend.config.settings.settings.enable_auth", True):
-            resp = self.client.get("/api/v1/conversations")
+        """ENABLE_AUTH=false 时 GET /conversations 无 token → 非 401（AnonymousUser 通过）"""
+        # setup_module 已将 enable_auth 置为 False，无需额外 patch
+        resp = self.client.get("/api/v1/conversations")
         self.assertNotEqual(resp.status_code, 401,
-                            f"GET /conversations 无 auth 要求，不应返回 401，实际: {resp.status_code}")
+                            f"ENABLE_AUTH=false 时 GET /conversations 不应返回 401，实际: {resp.status_code}")
         # DB 可用时必须是 200
         if _DB_AVAILABLE:
             self.assertEqual(resp.status_code, 200,
                              f"DB 可用时 GET /conversations 应返回 200")
 
     def test_D2_get_conversation_no_token_404_not_401(self):
-        """GET /conversations/{id} 无 token → 404（不存在），非 401"""
-        with patch("backend.config.settings.settings.enable_auth", True):
-            resp = self.client.get(f"/api/v1/conversations/{self.FAKE_UUID}")
+        """ENABLE_AUTH=false 时 GET /conversations/{id} 无 token → 404（不存在），非 401"""
+        resp = self.client.get(f"/api/v1/conversations/{self.FAKE_UUID}")
         self.assertNotEqual(resp.status_code, 401,
-                            "GET /conversations/{id} 无 auth 要求，不应返回 401")
+                            "ENABLE_AUTH=false 时 GET /conversations/{id} 不应返回 401")
         self.assertIn(resp.status_code, [200, 404])
 
     def test_D3_create_conversation_no_token_200(self):
-        """POST /conversations 无 token → 200（创建对话无 auth 要求）"""
-        with patch("backend.config.settings.settings.enable_auth", True):
-            resp = self.client.post(
-                "/api/v1/conversations",
-                json={"title": "test_stream_auth_conv", "model_key": "claude"},
-            )
+        """ENABLE_AUTH=false 时 POST /conversations 无 token → 200（匿名创建）"""
+        resp = self.client.post(
+            "/api/v1/conversations",
+            json={"title": "test_stream_auth_conv", "model_key": "claude"},
+        )
         self.assertNotEqual(resp.status_code, 401,
-                            f"POST /conversations 无 auth 要求，不应返回 401，实际: {resp.status_code}")
+                            f"ENABLE_AUTH=false 时 POST /conversations 不应返回 401，实际: {resp.status_code}")
         # 清理：若创建成功则删除
         if resp.status_code == 200:
             try:
@@ -445,20 +463,18 @@ class TestConvEndpointsNoAuth(unittest.TestCase):
                 pass
 
     def test_D4_cancel_endpoint_no_token_200(self):
-        """POST /conversations/{id}/cancel 无 token → 200（取消端点无 auth）"""
-        with patch("backend.config.settings.settings.enable_auth", True):
-            resp = self.client.post(f"/api/v1/conversations/{self.FAKE_UUID}/cancel")
+        """POST /conversations/{id}/cancel 无 token → 200（取消端点无 get_current_user）"""
+        resp = self.client.post(f"/api/v1/conversations/{self.FAKE_UUID}/cancel")
         self.assertNotEqual(resp.status_code, 401,
                             "/cancel 端点无 auth 要求，不应返回 401")
         # cancel 是幂等操作，即使无活跃流也返回 200
         self.assertEqual(resp.status_code, 200)
 
     def test_D5_get_messages_no_token_200_or_404(self):
-        """GET /conversations/{id}/messages 无 token → 200 或 404，非 401"""
-        with patch("backend.config.settings.settings.enable_auth", True):
-            resp = self.client.get(f"/api/v1/conversations/{self.FAKE_UUID}/messages")
+        """ENABLE_AUTH=false 时 GET /conversations/{id}/messages 无 token → 非 401"""
+        resp = self.client.get(f"/api/v1/conversations/{self.FAKE_UUID}/messages")
         self.assertNotEqual(resp.status_code, 401,
-                            "GET /messages 无 auth 要求，不应返回 401")
+                            "ENABLE_AUTH=false 时 GET /messages 不应返回 401")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -603,21 +619,27 @@ class TestConversationsPyRegression(unittest.TestCase):
         self.assertIn("get_current_user", func_sig,
                       "send_message 端点应保留 Depends(get_current_user)")
 
-    def test_G2_other_endpoints_no_get_current_user(self):
-        """list/get/create/delete/cancel 等端点不含 get_current_user（保持向后兼容）"""
-        no_auth_patterns = [
+    def test_G2_crud_endpoints_have_get_current_user_except_cancel(self):
+        """对话隔离上线后 list/get/create/delete 均含 get_current_user；cancel 仍无需 auth"""
+        # 这些端点在对话用户隔离功能上线后均已添加 get_current_user
+        auth_patterns = [
             (r"async def list_conversations\(.*?\):", "list_conversations"),
             (r"async def get_conversation\(.*?\):", "get_conversation"),
             (r"async def create_conversation\(.*?\):", "create_conversation"),
             (r"async def delete_conversation\(.*?\):", "delete_conversation"),
-            (r"async def cancel_conversation_stream\(.*?\):", "cancel_conversation_stream"),
         ]
-        for pattern, name in no_auth_patterns:
+        for pattern, name in auth_patterns:
             m = re.search(pattern, self.src, re.DOTALL)
             if m:
                 func_sig = m.group(0)
-                self.assertNotIn("get_current_user", func_sig,
-                                 f"{name} 不应含 get_current_user（向后兼容）")
+                self.assertIn("get_current_user", func_sig,
+                              f"{name} 应含 get_current_user（对话用户隔离）")
+
+        # cancel 端点无需鉴权（幂等操作）
+        m_cancel = re.search(r"async def cancel_conversation_stream\(.*?\):", self.src, re.DOTALL)
+        if m_cancel:
+            self.assertNotIn("get_current_user", m_cancel.group(0),
+                             "cancel_conversation_stream 不需要 get_current_user")
 
     def test_G3_username_extracted_from_current_user(self):
         """send_message 中从 current_user 提取 username（技能目录隔离）"""
