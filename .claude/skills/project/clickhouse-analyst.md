@@ -341,8 +341,12 @@ const REPORT_SPEC = {
       "id": "chart-bar-1",
       "chart_type": "bar",
       "title": "图表显示名称",
-      "sql": "SELECT date, count() AS cnt FROM crm.realtime_dwd_crm_call_record WHERE call_start_time >= '{{ date_start }}' AND call_start_time < '{{ date_end }}' GROUP BY date ORDER BY date",
-      "connection_env": "sg"
+      "sql": "SELECT date, env, count() AS cnt FROM crm.realtime_dwd_crm_call_record WHERE call_start_time >= '{{ date_start }}' AND call_start_time < '{{ date_end }}' GROUP BY date, env ORDER BY date",
+      "connection_env": "sg",
+      "connection_type": "clickhouse",
+      "x_field": "date",
+      "y_fields": ["cnt"],
+      "series_field": "env"
     }
   ],
   "filters": [
@@ -364,10 +368,16 @@ window.REPORT_SPEC = REPORT_SPEC;
 - `id` 必须与对应 `echarts.init(document.getElementById('chart-bar-1'))` 的 DOM id 完全一致
 - `chart_type` 取值：`bar` / `line` / `pie` / `scatter` / `area` / `gauge` / `radar`
 - `sql` **必须使用 Jinja2 参数变量** `{{ date_start }}` / `{{ date_end }}` 等，**禁止硬编码日期**
-- `connection_env` 填写 ClickHouse 环境标识（`sg` / `idn` / `br` 等）
+- `connection_env` 填写 ClickHouse 环境标识（`sg` / `idn` / `br` 等）；`connection_type` 默认 `"clickhouse"`
 - 每个 ECharts 图表必须对应 `charts` 数组中的一个元素
 - `filters` **必须包含** `binds` 字段，定义 filter 值 → SQL 变量的映射关系
 - 该标记使 Pilot 能够定位并修改每个图表的数据和样式
+
+**⚠️ 图表字段映射（bar / line / area / scatter 必填）**：
+- `x_field`：SQL 结果中作为 X 轴的列名（如 `"day"`、`"dt"`）
+- `y_fields`：SQL 结果中作为 Y 轴的列名数组（如 `["cnt"]`、`["connected_calls", "am_calls"]`）
+- `series_field`：SQL 结果中作为分组维度的列名（如 `"connection_env"`），有多环境/多维度分组时必填，单系列留空或省略
+- **缺少这三个字段将导致图表在动态数据加载后无法正确渲染（X 轴显示 undefined）**
 
 ---
 

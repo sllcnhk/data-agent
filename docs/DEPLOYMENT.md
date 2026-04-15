@@ -1,6 +1,6 @@
 # 部署指南
 
-> 版本：v2.10 · 2026-04-15（**报表增强**：图表控件 ⋮ 菜单 + `GET /spec-meta` + `PUT /charts/{chart_id}` + `ReportToolMCPServer` + `ReportViewerPage` + Pilot 一对一绑定；**无 DB 迁移**，复用已有 `reports.charts` JSONB + `reports.version_seq`；v2.9 · 2026-04-14：**AI Pilot 实时助手**：三入口 Co-pilot；无 DB 迁移；v2.6 · 2026-04-14：**对话报表手动固定 Pin**：`POST /reports/pin`；无 DB 迁移；v2.5 · 2026-04-13：**数据管理中心**：`migrate_datacenter_v1.py` DB 迁移；v2.4 · 2026-04-13：**多图表 HTML 报告生成**：`migrate_reports_enhancement.py` + `migrate_reports_permissions.py`）
+> 版本：v2.11 · 2026-04-15（**参数化动态报表 + 渲染修复**：`GET /reports/{id}/data`（Jinja2 SQL 引擎 + ClickHouse 动态查询）+ `_autoDetectFields` 字段自动检测 + `echarts_override.series` 系列模板修复；**无 DB 迁移**，无新环境变量，复用已有 `reports.charts`/`reports.filters` JSONB 字段；v2.10 · 2026-04-15：**报表增强**：图表控件 ⋮ 菜单 + `GET /spec-meta` + `PUT /charts/{chart_id}` + `ReportToolMCPServer` + `ReportViewerPage` + Pilot 一对一绑定；**无 DB 迁移**，复用已有 `reports.charts` JSONB + `reports.version_seq`；v2.9 · 2026-04-14：**AI Pilot 实时助手**：三入口 Co-pilot；无 DB 迁移；v2.6 · 2026-04-14：**对话报表手动固定 Pin**：`POST /reports/pin`；无 DB 迁移；v2.5 · 2026-04-13：**数据管理中心**：`migrate_datacenter_v1.py` DB 迁移；v2.4 · 2026-04-13：**多图表 HTML 报告生成**：`migrate_reports_enhancement.py` + `migrate_reports_permissions.py`）
 >
 > 本文档说明如何将数据智能分析 Agent 系统从 Windows 开发环境迁移到 Linux 服务器，供团队多人共用。
 

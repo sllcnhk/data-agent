@@ -2,7 +2,7 @@
 
 > **适用对象**：LLM 模型（Claude Code / 其他 AI）、新加入开发者
 > **目的**：快速理解系统整体架构、模块职责、数据流向和交互接口
-> **最后更新**：2026-04-15（**v2.10 报表增强**：图表控件 ⋮ 菜单（Force Refresh / Fullscreen / View Query / Download）+ `GET /reports/{id}/spec-meta`（refresh_token 鉴权，无 JWT）+ `PUT /reports/{id}/charts/{chart_id}`（单图表 merge 更新）+ `ReportToolMCPServer`（3 MCP 工具）+ `ReportViewerPage`（`/report-view` 分屏页）+ Pilot 一对一绑定（upsert）；无 DB 迁移；**v2.9 2026-04-14**：AI Pilot 实时助手；**v2.5 2026-04-13**：数据管理中心 + 定时推送任务；**v2.4 2026-04-13**：多图表 HTML 报告生成）
+> **最后更新**：2026-04-15（**v2.11 参数化动态报表 + 渲染修复**：`GET /reports/{id}/data`（refresh_token 鉴权，Jinja2 SQL 引擎，动态 ClickHouse 查询）+ `report_params_service.py`（render_sql / extract_default_params / compute_params_from_binds）+ `_autoDetectFields` JS 函数（缺字段时自动推断 x_field/y_fields/series_field）+ `echarts_override.series` 系列模板 merge 修复（防止样式模板覆盖数据数组）；无 DB 迁移；**v2.10 报表增强**：图表控件 ⋮ 菜单（Force Refresh / Fullscreen / View Query / Download）+ `GET /reports/{id}/spec-meta`（refresh_token 鉴权，无 JWT）+ `PUT /reports/{id}/charts/{chart_id}`（单图表 merge 更新）+ `ReportToolMCPServer`（3 MCP 工具）+ `ReportViewerPage`（`/report-view` 分屏页）+ Pilot 一对一绑定（upsert）；无 DB 迁移；**v2.9 2026-04-14**：AI Pilot 实时助手；**v2.5 2026-04-13**：数据管理中心 + 定时推送任务；**v2.4 2026-04-13**：多图表 HTML 报告生成）
 
 ---
 
@@ -1256,6 +1256,61 @@ ReportViewerPage（frontend/src/pages/ReportViewerPage.tsx）
 **RBAC**：GET /spec-meta 无需 JWT；PUT /charts 需 `reports:create`（analyst+）；MCP 工具无需 JWT；无新权限键。
 
 **无 DB 迁移**：复用 `reports.charts`（JSONB）+ `reports.version_seq`（整数）；无新列。
+
+### 4.24 参数化动态报表与渲染修复（v2.11）
+
+#### GET /reports/{id}/data 端点
+
+新增公开端点（无需 JWT，使用 `refresh_token` 鉴权），支持参数化动态报表的实时 SQL 查询：
+
+```
+GET /api/v1/reports/{id}/data?token=<refresh_token>
+
+流程：
+  1. reports.py 验证 refresh_token → 加载报表 charts + filters
+  2. report_params_service.flatten_query_params(filters) → 提取所有筛选器默认值
+  3. 对每个 chart：render_sql(chart.sql, params) → Jinja2 渲染 → 查询对应 ClickHouse 环境
+  4. 返回 {data: {chart_id: rows[]}, errors: {chart_id: msg}, params_used, refreshed_at}
+```
+
+#### report_params_service.py（Jinja2 SQL 引擎）
+
+`backend/services/report_params_service.py` 职责：
+
+| 函数 | 说明 |
+|------|------|
+| `render_sql(template, params)` | Jinja2 Environment 渲染，填充 `{{ variable }}` 占位符 |
+| `extract_default_params(filters)` | 从 `default_days` 计算默认 start/end 日期 |
+| `compute_params_from_binds(filter_values, filters)` | UI 筛选器值通过 `binds` 字段映射到 SQL 变量 dict |
+| `flatten_query_params(filters)` | 全部筛选器默认值展平为 `variable_name → value` |
+
+筛选器 `binds` 字段示例：`{"start": "date_start", "end": "date_end"}` → SQL 中 `{{ date_start }}`/`{{ date_end }}`。
+
+#### _autoDetectFields（report_builder_service.py 内嵌 JS）
+
+当图表 spec 缺少 `x_field`/`y_fields`/`series_field` 时，`extractXYSeries()` 起始处调用 `_autoDetectFields(spec, data)` 自动推断：
+- 第一个字符串列 → `x_field`
+- 全部数值列 → `y_fields`
+- 第二个字符串列（唯一值 ≤ 10）→ `series_field`
+
+修复"X 轴显示 undefined"问题，为 LLM 遗漏必填字段时提供兼容回退。
+
+#### echarts_override.series 系列模板 merge 修复
+
+`buildEChartsOption` 中修复 `deepMerge` 将 `echarts_override.series`（样式模板数组）覆盖 `option.series`（数据数组）的 bug：
+
+```
+旧行为：deepMerge({series: [{name,data,...}]}, {series: [{smooth:true}]}) → series 被替换 → 数据丢失
+新行为：取 override.series[0] 作为样式模板 → forEach data-series 合并 name+data → 删除 override.series → deepMerge 其余字段
+```
+
+修复 Pilot 修改图表类型后图表变空白的问题（如堆叠柱状图 → 面积图）。
+
+**核心文件**：`backend/api/reports.py`（GET /data 端点）/ `backend/services/report_params_service.py` / `backend/services/report_builder_service.py`（`_autoDetectFields` + series merge fix）/ `.claude/skills/project/clickhouse-analyst.md`（x_field/y_fields 必填规范）/ `.claude/skills/project/update-report.md`（echarts_override.series 规范）
+
+**RBAC**：GET /data 无需 JWT（refresh_token 鉴权）；无新权限键。
+
+**无 DB 迁移**：使用已有 `reports.charts` JSONB（含 SQL 模板 + x_field/y_fields 等字段）和 `reports.filters` JSONB（含 binds 字段）；无新列。
 
 ---
 

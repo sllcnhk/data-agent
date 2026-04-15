@@ -561,8 +561,23 @@ function buildEChartsOption(spec, data) {
     default:               option = buildLine(spec, data);
   }
   // 合并用户自定义 override
+  // ⚠️ echarts_override.series 语义：样式模板（不含 data），应用到每个数据驱动的 series
+  //    直接 deepMerge 会因数组替换导致数据丢失，需特殊处理
   if (spec.echarts_override && typeof spec.echarts_override === 'object') {
-    deepMerge(option, spec.echarts_override);
+    const override = Object.assign({}, spec.echarts_override);
+    if (Array.isArray(override.series) && override.series.length > 0
+        && option.series && option.series.length > 0) {
+      // 取第一个元素作为样式模板，保留数据驱动 series 的 name 和 data
+      const tmpl = override.series[0] || {};
+      const KEEP = new Set(['name', 'data']);
+      option.series = option.series.map(s => {
+        const out = Object.assign({}, s);
+        Object.keys(tmpl).forEach(k => { if (!KEEP.has(k)) out[k] = tmpl[k]; });
+        return out;
+      });
+      delete override.series;  // 已处理，避免 deepMerge 再次覆盖
+    }
+    deepMerge(option, override);
   }
   return option;
 }
@@ -861,9 +876,55 @@ function renderKpi(spec, data, el) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 辅助：当 spec 缺少 x_field/y_fields/series_field 时自动从数据列推断
+// ═══════════════════════════════════════════════════════════════════════════
+function _autoDetectFields(spec, data) {
+  if (!data || data.length === 0) return spec;
+  // 已配置则直接返回
+  if (spec.x_field && (spec.y_fields || []).length > 0) return spec;
+
+  const sample = data[0];
+  const keys = Object.keys(sample);
+  const strKeys = [];
+  const numKeys = [];
+  keys.forEach(k => {
+    const v = sample[k];
+    if (v === null || v === undefined) return;
+    if (typeof v === 'number') { numKeys.push(k); }
+    else { strKeys.push(k); }
+  });
+
+  // x_field: 第一个字符串/日期列（通常是时间轴）
+  const xF = spec.x_field || strKeys[0] || keys[0];
+  // y_fields: 所有数字列；若全为字符串则取第二列
+  const yFs = (spec.y_fields && spec.y_fields.length > 0)
+    ? spec.y_fields
+    : (numKeys.length > 0 ? numKeys : (strKeys.length > 1 ? [strKeys[1]] : []));
+  // series_field: 第二个字符串列（有多唯一值时作分组）
+  let sF = spec.series_field;
+  if (!sF && strKeys.length >= 2) {
+    const candidate = strKeys.find(k => k !== xF);
+    if (candidate) {
+      const uniq = new Set(data.map(r => r[candidate]));
+      // 多于 1 个唯一值但少于行数的一半 → 合理分组字段
+      if (uniq.size > 1 && uniq.size <= Math.max(2, data.length / 2)) sF = candidate;
+    }
+  }
+
+  return Object.assign({}, spec, {
+    x_field: xF,
+    y_fields: yFs,
+    series_field: sF || spec.series_field || null,
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 辅助：提取 X 轴和 Series 数据（支持 series_field 分组）
 // ═══════════════════════════════════════════════════════════════════════════
 function extractXYSeries(spec, data, type) {
+  // 字段缺失时自动推断，保证兼容旧格式 spec
+  spec = _autoDetectFields(spec, data);
+
   const xF = spec.x_field;
   const yFields = spec.y_fields || [];
   const sField = spec.series_field;

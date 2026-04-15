@@ -105,14 +105,36 @@ always_inject: false
 
 ---
 
+## `echarts_override.series` 正确使用规范
+
+> ⚠️ **关键约束**：`echarts_override.series` 是**样式模板**，不是数据数组。  
+> 系统会把 `series[0]` 的样式属性应用到每一个数据驱动的 series 上，保留其 `name` 和 `data`。  
+> **禁止**在模板 series 中设置 `data` 字段 — 设置了也会被忽略，且会令人困惑。
+
+**正确写法**（只含样式属性）：
+```json
+"echarts_override": {
+  "series": [{ "smooth": false, "stack": "total", "areaStyle": { "opacity": 0.75 }, "lineStyle": { "width": 1.5 }, "symbol": "none" }]
+}
+```
+
+**错误写法**（含 data，会被丢弃）：
+```json
+"echarts_override": {
+  "series": [{ "type": "line", "data": [1, 2, 3] }]  ← data 无效，不要写
+}
+```
+
+---
+
 ## 常见修改示例（模式 A）
 
 | 用户说 | 你做什么 |
 |---|---|
-| "把 X 图表改为面积堆积不平滑" | 模式 A：`chart_type: "area"`，`echarts_override.series[].smooth: false, stack: "total", areaStyle: {}` |
-| "X 图的折线改为不圆滑" | 模式 A：`echarts_override.series[].smooth: false` |
+| "把 X 图表改为面积堆积不平滑" | 模式 A：`chart_type: "area"`，`echarts_override.series[0]: {smooth: false, stack: "total", areaStyle: {opacity: 0.75}}` |
+| "X 图的折线改为不圆滑" | 模式 A：`echarts_override.series[0]: {smooth: false}` |
 | "时间范围改为近30天" | 模式 A：只修改该图表 `sql` 字段的 WHERE 条件 |
-| "X 图改为深色" | 模式 A：`color: "#xxx"` 或 `echarts_override.color: [...]` |
+| "X 图改为深色" | 模式 A：`echarts_override.color: [...]`（不要动 series） |
 
 ## 常见修改示例（模式 B）
 
@@ -131,6 +153,7 @@ always_inject: false
 - 如果 system prompt 中没有 `report_id` 或 `refresh_token`，说明 Co-pilot 未绑定报表，提示用户"请先在报表清单中打开一个报表，再使用 AI 助手"
 - 修改前**必须**向用户确认图表 title 和 id，避免改错图表
 - MCP 工具调用失败时，将工具返回的 `error` 字段内容告知用户，不要假装成功
+- `echarts_override.series` 只能包含**样式属性**（smooth/areaStyle/lineStyle/stack/symbol/type 等），**禁止设置 data**——数据由后端 SQL 动态加载，写 data 无效且会引起误解
 
 ---
 

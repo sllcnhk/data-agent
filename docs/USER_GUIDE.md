@@ -1,7 +1,7 @@
 # 数据智能体系统 — 核心使用手册
 
-**文档版本**: v2.9
-**适用系统版本**: P0 + P1 + P2 + P3 + 3-Tier Skill System + Semantic Skill Routing + RBAC + 角色管理页面 + 推理过程持久化 + ContinuationCard + ClickHouse 动态多区域配置 + Session 过期管理 + 对话打断（停止生成）+ 对话附件上传 + 用户技能目录隔离修复 + 对话用户隔离 + 侧边栏 Tab UI + 只读模式 + is_shared 群组框架 + 技能路由可视化 + 文件写入下载 + **Excel → ClickHouse 数据导入**（2026-04-05）+ **Skill 用户使用权限隔离 T1–T6**（2026-04-08）+ **多图表 HTML 报告生成**（2026-04-13）+ **数据管理中心 + 定时推送任务**（2026-04-13）+ **AI Pilot 实时助手 + 对话模型切换**（2026-04-14）+ **报表增强：图表控件 / MCP 工具 / 分屏查看 / Pilot 一对一绑定**（2026-04-15）
+**文档版本**: v2.11
+**适用系统版本**: P0 + P1 + P2 + P3 + 3-Tier Skill System + Semantic Skill Routing + RBAC + 角色管理页面 + 推理过程持久化 + ContinuationCard + ClickHouse 动态多区域配置 + Session 过期管理 + 对话打断（停止生成）+ 对话附件上传 + 用户技能目录隔离修复 + 对话用户隔离 + 侧边栏 Tab UI + 只读模式 + is_shared 群组框架 + 技能路由可视化 + 文件写入下载 + **Excel → ClickHouse 数据导入**（2026-04-05）+ **Skill 用户使用权限隔离 T1–T6**（2026-04-08）+ **多图表 HTML 报告生成**（2026-04-13）+ **数据管理中心 + 定时推送任务**（2026-04-13）+ **AI Pilot 实时助手 + 对话模型切换**（2026-04-14）+ **报表增强：图表控件 / MCP 工具 / 分屏查看 / Pilot 一对一绑定**（2026-04-15）+ **参数化动态报表 + 图表字段自动检测 + echarts_override 系列模板修复**（2026-04-15）
 **读者对象**: 数据工程师、数据分析师、系统管理员
 
 ---
@@ -2151,7 +2151,7 @@ DELETE /api/v1/data-export/jobs/{job_id}
 核心能力：
 
 - **多图表布局**：每份报告可包含多张图表（折线图、柱状图、饼图、散点图、热力图等），使用 ECharts CDN 渲染
-- **内嵌筛选器**：`date_range`（日期范围）、`select`（单选）、`multi_select`（多选）、`radio`（单选按钮）四种筛选控件，全部客户端运算，无需联网
+- **内嵌筛选器**：`date_range`（日期范围）、`select`（单选）、`multi_select`（多选）、`radio`（单选按钮）四种筛选控件。**静态模式**（旧式 HTML 报表）：全部客户端运算，无需联网；**参数化动态模式**（v2.11 新增）：筛选器通过 `binds` 字段绑定 Jinja2 SQL 变量，查询时调用 `GET /reports/{id}/data` 端点动态查询 ClickHouse
 - **数据可刷新**：每份报告附带 `refresh_token`，用于调用 `GET /api/v1/reports/{id}/refresh-data` 公开接口重新查询最新数据、不需要用户 JWT
 - **预览弹窗**：在文件卡片或管理中心点击「预览」可直接在 Modal 中渲染 HTML，无需下载
 - **PDF / PPTX 导出**：后台 Playwright Chromium 截图 → PDF；python-pptx 图表截图 → PPTX 幻灯片（每张图表一页）
@@ -2262,6 +2262,61 @@ HTML 报告内嵌四种客户端筛选控件，无需服务器参与：
 | 单选按钮组 | `radio` | 互斥选项，切换时立即更新图表 |
 
 筛选器通过 `target_charts` 字段指定作用范围，可以跨图表联动（一个筛选器控制多张图表）。
+
+#### 14.4.1 参数化报表筛选器（动态 SQL 模式）
+
+v2.11 新增**参数化动态报表**：筛选器的 `binds` 字段将筛选器值映射为 SQL Jinja2 模板变量，查询时后端动态渲染 SQL 并查询 ClickHouse，无需在生成报表时预埋静态数据。
+
+**`binds` 字段格式**：
+
+```json
+{
+  "id": "date_range",
+  "type": "date_range",
+  "label": "日期范围",
+  "default_days": 30,
+  "binds": {
+    "start": "date_start",
+    "end": "date_end"
+  }
+}
+```
+
+- `binds.start` → SQL 模板中的 `{{ date_start }}`
+- `binds.end` → SQL 模板中的 `{{ date_end }}`
+- `default_days: 30` → 默认日期范围为过去 30 天（`extract_default_params` 自动计算）
+
+**图表 SQL 示例**：
+
+```sql
+SELECT date, revenue
+FROM sales
+WHERE date BETWEEN '{{ date_start }}' AND '{{ date_end }}'
+```
+
+**动态数据查询端点**（无需 JWT）：
+
+```bash
+GET /api/v1/reports/{id}/data?token=<refresh_token>
+→ 返回: {
+    "success": true,
+    "data": {
+      "<chart_id_1>": [{...}, ...],
+      "<chart_id_2>": [{...}, ...]
+    },
+    "errors": {"<chart_id_3>": "SQL error message"},
+    "params_used": {"date_start": "2026-03-16", "date_end": "2026-04-15"},
+    "refreshed_at": "2026-04-15T08:00:00Z"
+  }
+```
+
+每个 `chart_id` 对应一个图表的查询结果数组；`errors` 仅包含查询失败的图表。`params_used` 为实际传入 SQL 的变量值（可用于调试）。
+
+**核心服务**：`backend/services/report_params_service.py`
+- `render_sql(template, params)` — Jinja2 渲染，填充 `{{ variable }}` 占位符
+- `extract_default_params(filters)` — 从 `default_days` 计算默认日期范围
+- `compute_params_from_binds(filter_values, filters)` — UI 筛选器值 → SQL 变量 dict
+- `flatten_query_params(filters)` — 所有筛选器默认值展平为 `variable_name → value`
 
 ### 14.5 数据刷新机制
 
@@ -2390,6 +2445,17 @@ POST /api/v1/reports/{id}/copilot
 Authorization: Bearer <token>
 → 返回: {"success": true, "data": {"conversation_id": "...", "created": true}}
 # created=false 表示复用已有 Pilot 对话
+
+# ★ v2.11 参数化动态报表数据查询（无需 JWT）
+GET /api/v1/reports/{id}/data?token=<refresh_token>
+→ 返回: {
+    "success": true,
+    "data": {"<chart_id>": [{...}, ...]},
+    "errors": {"<failed_chart_id>": "error message"},
+    "params_used": {"date_start": "2026-03-16", "date_end": "2026-04-15"},
+    "refreshed_at": "2026-04-15T08:00:00Z"
+  }
+# 使用图表 SQL 中的 Jinja2 模板变量与筛选器 binds 字段动态渲染 SQL 并查询 ClickHouse
 ```
 
 ### 14.9 图表控件 ⋮ 菜单
@@ -2419,6 +2485,48 @@ Authorization: Bearer <token>
 ```
 
 Pilot 开关状态存入 `localStorage`（`pilot_open_{reportId}`），刷新页面后自动恢复上次状态。AI 修改报表后，分屏页会自动刷新 iframe 加载最新 HTML，并重新拉取 spec 更新 Pilot 上下文。
+
+### 14.11 参数化报表图表字段规范
+
+#### 必填字段（折线图 / 柱状图 / 面积图 / 散点图）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `x_field` | string | X 轴列名（通常为日期或类别字符串列）|
+| `y_fields` | string[] | Y 轴列名列表（数值列，可多个）|
+| `series_field` | string（可选）| 分组/系列列名（字符串列，唯一值较少时自动检测）|
+| `connection_env` | string | ClickHouse 环境名（如 `sg`、`idn`、`mx`）|
+| `connection_type` | string | `"admin"` 或 `"readonly"`（默认 `"readonly"`）|
+
+> **警告**：缺少 `x_field`/`y_fields` 时图表 X 轴将显示 `undefined`。LLM 生成 spec 时必须包含这些字段。
+
+#### `_autoDetectFields` 自动检测回退（v2.11）
+
+当图表 spec 缺少 `x_field`/`y_fields`/`series_field` 时，`report_builder_service.py` 中内嵌的 JS 函数 `_autoDetectFields(spec, data)` 会自动从查询结果列类型推断：
+
+- **字符串列** → `x_field`（取第一个字符串列）
+- **数值列** → `y_fields`（取全部数值列）
+- **第二个字符串列且唯一值 ≤ 10** → `series_field`
+
+此机制仅作**兼容回退**——LLM 生成 spec 时仍应明确指定这些字段，避免自动检测结果与预期不符。
+
+#### `echarts_override.series` 正确使用规范（v2.11 修复）
+
+`echarts_override.series` 是**样式模板**，只应包含样式属性（`smooth`、`stack`、`areaStyle` 等），**不能包含 `data` 字段**：
+
+```json
+// ✅ 正确：仅样式属性
+"echarts_override": {
+  "series": [{"smooth": true, "areaStyle": {}}]
+}
+
+// ❌ 错误：包含 data 字段会导致图表空白
+"echarts_override": {
+  "series": [{"data": [], "smooth": true}]
+}
+```
+
+后端会将 `echarts_override.series[0]` 作为模板应用到每条数据驱动的系列上，保留各系列的 `name` 和 `data`，然后删除 `override.series` 再执行 `deepMerge`。此修复解决了 Pilot 修改图表类型（如堆叠柱状图 → 面积图）后图表变空白的问题。
 
 ---
 

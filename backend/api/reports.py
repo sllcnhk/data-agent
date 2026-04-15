@@ -1042,11 +1042,28 @@ async def refresh_report_data(
     )
 
 
+# 模块级 ClickHouse 客户端缓存（env → client 实例，避免重复 TCP/HTTP 初始化）
+_ch_client_cache: Dict[str, Any] = {}
+
+
+async def _get_or_init_ch_client(env: str) -> Any:
+    """
+    获取或初始化指定 env 的 ClickHouse 客户端（带模块级缓存）。
+
+    优先使用 TCP（native）连接，失败自动回退 HTTP，逻辑与 ClickHouseMCPServer.initialize() 一致。
+    """
+    if env not in _ch_client_cache:
+        from backend.mcp.clickhouse.server import ClickHouseMCPServer
+        srv = ClickHouseMCPServer(env=env)
+        await srv.initialize()
+        _ch_client_cache[env] = srv.client
+    return _ch_client_cache[env]
+
+
 async def _run_query(sql: str, env: str, conn_type: str = "clickhouse") -> List[Dict]:
     """执行查询并返回行列表（dict 格式）。"""
     if conn_type == "clickhouse":
-        from backend.mcp.clickhouse.server import _get_or_init_client
-        client = await _get_or_init_client(env)
+        client = await _get_or_init_ch_client(env)
         if hasattr(client, "execute"):
             rows, cols = client.execute(sql, with_column_types=True)
             col_names = [c[0] for c in cols]
@@ -1579,7 +1596,13 @@ async def create_report_copilot(
             },
         }
 
-    conv_title = req.title or f"报表助手 — {report.name}"
+    # 优先用 HTML 文件名（无扩展名）作为标题，让 Chat 首页能识别"这是哪个报表的 Pilot"
+    _title_stem = ""
+    if report.report_file_path:
+        from pathlib import Path as _TitlePath
+        _title_stem = _TitlePath(report.report_file_path).stem
+    _title_display = _title_stem or report.name
+    conv_title = req.title or f"{_title_display} · Pilot"
     conv = svc.create_conversation(
         title=conv_title,
         system_prompt=copilot_system_prompt,
