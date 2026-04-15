@@ -21,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -935,20 +935,33 @@ async def _async_generate_summary(report_id: str, spec: Dict, db: Session) -> No
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. 数据刷新（HTML 内 JS 调用）
+# 2. 动态数据查询（参数化 SQL 渲染 + 执行）
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.get("/{report_id}/refresh-data")
-async def refresh_report_data(
+@router.get("/{report_id}/data")
+async def get_report_data(
     report_id: str,
     token: str = Query(..., description="Report.refresh_token"),
+    request: Request = None,
     db: Session = Depends(get_db),
 ):
     """
-    重新执行报告中每个图表的 SQL 查询，返回最新数据。
+    执行报告中每个图表的参数化 SQL 查询，返回最新数据。
 
-    认证方式：refresh_token（无需登录，适合已生成的 HTML 文件内调用）。
+    认证方式：refresh_token（无需 JWT，适合 HTML 文件内直接调用）。
+
+    SQL 参数通过 Query 字符串传递，例如：
+        ?token=xxx&date_start=2025-01-01&date_end=2025-12-31&enterprise_id=123
+
+    参数名需与图表 SQL 模板中的 {{ variable }} 名称一致。
+    若不传参数，自动使用 spec.filters 中 default_days / default_value 计算默认值。
     """
+    from backend.services.report_params_service import (
+        render_sql,
+        extract_default_params,
+        flatten_query_params,
+    )
+
     try:
         uid = uuid.UUID(report_id)
     except ValueError:
@@ -960,25 +973,42 @@ async def refresh_report_data(
     if not secrets.compare_digest(report.refresh_token or "", token):
         raise HTTPException(403, "无效的刷新令牌")
 
-    # 重新执行每个图表的 SQL
+    # 提取 SQL 参数（除 token 外所有 query 参数）
+    raw_params: Dict[str, Any] = {}
+    if request is not None:
+        raw_params = {
+            k: (v if len(v) > 1 else v[0])
+            for k, v in request.query_params.multi_items()
+            if k != "token"
+        }
+
+    # 若无运行时参数，使用 spec 默认值
+    spec_for_defaults = {
+        "filters": report.filters or [],
+        "charts": report.charts or [],
+    }
+    if not raw_params:
+        raw_params = extract_default_params(spec_for_defaults)
+
+    # 逐图表渲染 SQL 并执行
     new_data: Dict[str, Any] = {}
     errors: Dict[str, str] = {}
     charts = report.charts or []
-    data_sources = {ds["id"]: ds for ds in (report.data_sources or [])}
 
     for chart in charts:
         cid = chart.get("id")
-        sql = chart.get("sql", "")
+        sql_template = chart.get("sql", "")
         env = chart.get("connection_env", "")
         conn_type = chart.get("connection_type", "clickhouse")
-        if not sql or not env:
+        if not sql_template or not env:
             continue
         try:
-            rows = await _run_query(sql, env, conn_type)
+            rendered_sql = render_sql(sql_template, raw_params)
+            rows = await _run_query(rendered_sql, env, conn_type)
             new_data[cid] = rows
-        except Exception as e:
-            errors[cid] = str(e)
-            logger.warning("[Reports] 刷新查询失败 chart=%s: %s", cid, e)
+        except Exception as exc:
+            errors[cid] = str(exc)
+            logger.warning("[Reports/data] 查询失败 chart=%s: %s", cid, exc)
 
     # 更新 view_count
     report.increment_view_count()
@@ -988,9 +1018,28 @@ async def refresh_report_data(
         "success": True,
         "data": new_data,
         "errors": errors,
+        "params_used": raw_params,
         "llm_summary": report.llm_summary,
         "refreshed_at": datetime.utcnow().isoformat(),
     }
+
+
+@router.get("/{report_id}/refresh-data")
+async def refresh_report_data(
+    report_id: str,
+    token: str = Query(..., description="Report.refresh_token"),
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    """
+    兼容旧版刷新接口，委托给 /data 端点（已有 HTML 文件的向后兼容）。
+    """
+    return await get_report_data(
+        report_id=report_id,
+        token=token,
+        request=request,
+        db=db,
+    )
 
 
 async def _run_query(sql: str, env: str, conn_type: str = "clickhouse") -> List[Dict]:
@@ -1416,21 +1465,63 @@ async def create_report_copilot(
         except Exception:
             pass
 
-    chart_summary = "\n".join(
-        f'  [{i+1}] id="{c.get("id","?")}" title="{c.get("title","?")}" type="{c.get("chart_type","?")}"'
-        for i, c in enumerate(charts_list)
+    # chart_summary 在 _build_copilot_prompt 内部动态生成（含 ★参数化 标注）
+
+    # 计算报表当前默认参数（供 Pilot 了解实际查询范围）
+    _default_params_str = ""
+    try:
+        from backend.services.report_params_service import extract_default_params
+        _dp = extract_default_params({"filters": report.filters or []})
+        if _dp:
+            _default_params_str = json.dumps(_dp, ensure_ascii=False)
+    except Exception:
+        pass
+
+    # 检测是否有参数化 SQL（含 {{ }} 模板变量）
+    _has_param_sql = any(
+        "{{" in (c.get("sql") or "")
+        for c in (charts_list or [])
     )
 
     def _build_copilot_prompt(cl: list, note: str) -> str:
+        # 为参数化图表在列表中加 ★ 标注
+        _chart_summary_lines = []
+        for i, c in enumerate(cl):
+            sql_tag = " ★参数化" if "{{" in (c.get("sql") or "") else ""
+            _chart_summary_lines.append(
+                f'  [{i+1}] id="{c.get("id","?")}" '
+                f'title="{c.get("title","?")}" '
+                f'type="{c.get("chart_type","?")}"'
+                f'{sql_tag}'
+            )
+        _chart_summary_with_tags = "\n".join(_chart_summary_lines) or "  （无图表）"
+
+        param_sql_section = ""
+        if _has_param_sql and _default_params_str:
+            param_sql_section = (
+                f"\n## 参数化查询说明\n"
+                f"当前默认参数（由筛选器 default_days/default_value 推导）：\n"
+                f"  {_default_params_str}\n\n"
+                "SQL 模板语法（Jinja2）：\n"
+                "  图表 SQL 中使用 `{{ param_name }}` 引用筛选器绑定的参数变量。\n"
+                "  例：`WHERE call_start_time >= '{{ date_start }}' AND call_start_time < '{{ date_end }}'`\n"
+                "  筛选器 binds 字段定义映射：date_range → {\"start\": \"date_start\", \"end\": \"date_end\"}\n\n"
+                "⚠️ 修改注意事项：\n"
+                "  - 修改时间范围默认值 → 改 filter 的 `default_days` 或 `default_value`，不要在 SQL 中硬编码日期\n"
+                "  - 新增筛选维度 → 在 filter spec 中添加 binds，并在 SQL 中添加对应 `{{ variable }}` 条件\n"
+                "  - 禁止把参数化 SQL 改回硬编码日期（会导致报表刷新时查询范围无法变化）\n"
+            )
+
         return (
             f"[Co-pilot 模式] 当前报表：{report.name}\n"
             f"report_id：{report.id}\n"
             f"refresh_token：{report.refresh_token}\n"
             f"图表数量：{len(cl)}\n"
-            f"图表列表：\n{chart_summary or '  （无图表）'}\n"
+            f"图表列表：\n{_chart_summary_with_tags}\n"
             f"图表配置（详细）：{json.dumps(cl, ensure_ascii=False)[:4000]}\n"
-            f"过滤器：{json.dumps(report.filters or [], ensure_ascii=False)[:500]}\n"
-            f"主题：{report.theme}\n\n"
+            f"过滤器配置（含参数绑定）：{json.dumps(report.filters or [], ensure_ascii=False)[:600]}\n"
+            f"主题：{report.theme}\n"
+            f"{param_sql_section}\n"
             "## 修改报表的 MCP 工具（直接调用，无需 JWT）\n\n"
             "### 工具 1：report__get_spec\n"
             "读取报表当前完整 spec，修改前先调用确认所有图表。\n"
@@ -1439,9 +1530,9 @@ async def create_report_copilot(
             "局部更新单个图表，merge 操作，不影响其他图表。\n"
             "参数：report_id、token、chart_id、chart_patch（只含需修改字段）\n\n"
             "### 工具 3：report__update_spec（全量更新）\n"
-            "更新整个报表 spec，适用于添加/删除图表或批量修改。\n"
+            "更新整个报表 spec，适用于添加/删除图表、修改筛选器或批量修改。\n"
             "⚠️ spec.charts 必须包含所有图表，缺少的图表将永久删除！\n"
-            "参数：report_id、token、spec（完整 spec JSON 含所有图表）\n\n"
+            "参数：report_id、token、spec（完整 spec JSON 含所有图表和 filters）\n\n"
             f"{note}"
             "请基于以上报表信息协助用户修改报表。修改完成后告知用户「报表已更新，请查看预览」。"
         )

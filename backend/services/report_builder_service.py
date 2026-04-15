@@ -42,12 +42,22 @@ ReportBuilderService — 多图表 HTML 报告生成引擎
         "id": "date_range",
         "type": "date_range|select|multi_select|radio",
         "label": "时间范围",
-        "default_days": 30,
-        "options": [...],              // select/multi_select/radio
+        "default_days": 30,             // date_range: 默认往前推 N 天
+        "default_value": null,          // select/radio: 默认选中值
+        "options": [...],               // select/multi_select/radio
         "placeholder": "选择...",
-        "target_charts": ["c1","c2"]   // null = 所有图表
+        "target_charts": ["c1","c2"],   // null = 所有图表
+        "binds": {                      // SQL 参数绑定（关键字段！）
+          "start": "date_start",        //   date_range: start → SQL 变量名
+          "end":   "date_end",          //   date_range: end   → SQL 变量名
+          "value": "enterprise_id",     //   select/radio: value → SQL 变量名
+          "values": "tag_list"          //   multi_select: values → SQL 变量名
+        },
+        "client_side": false            // true = 仅客户端过滤，不触发后端重查
       }
     ],
+    // 注意：有 binds 字段时，filter 变化会触发后端重查（服务端参数化）
+    //       无 binds 字段（旧格式）时，filter 仍走客户端内存过滤（向后兼容）
     "data": {
       "c1": [{"date": "2026-03-01", "value": 0.85}, ...]
     },
@@ -145,7 +155,21 @@ def build_report_html(
         "charts": charts,
         "filters": filters,
     })
-    data_json = _safe_json(data)
+
+    # 动态加载模式：保存模式不 bake-in 数据（页面加载时调 /data API）
+    # 预览模式（report_id = "preview"）：仍注入数据，避免 API 调用失败
+    is_preview = report_id == "preview"
+    data_json = _safe_json(data) if is_preview else _safe_json({})
+
+    # 计算默认参数（从 filter.default_days / default_value / binds 推导）
+    default_params: Dict[str, Any] = {}
+    if not is_preview:
+        try:
+            from backend.services.report_params_service import extract_default_params
+            default_params = extract_default_params({"filters": filters})
+        except Exception as _pe:
+            logger.warning("[ReportBuilder] extract_default_params 失败: %s", _pe)
+    default_params_json = _safe_json(default_params)
 
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -190,24 +214,26 @@ def build_report_html(
 <!-- ── 数据注入 + 初始化脚本 ── -->
 <script>
 // ── 报告配置（由 Python 注入）──────────────────────────────────────────────
-const REPORT_SPEC   = {spec_json};
-const REPORT_DATA   = {data_json};
-const REPORT_ID     = "{report_id}";
-const REFRESH_TOKEN = "{refresh_token}";
-const API_BASE      = "{api_base_url.rstrip('/')}";
-const PALETTE       = REPORT_SPEC.palette;
+const REPORT_SPEC      = {spec_json};
+const REPORT_DATA      = {data_json};        // 预览模式有数据；保存模式为 {{}}
+const REPORT_ID        = "{report_id}";
+const REFRESH_TOKEN    = "{refresh_token}";
+const API_BASE         = "{api_base_url.rstrip('/')}";
+const PALETTE          = REPORT_SPEC.palette;
+const _DEFAULT_PARAMS  = {default_params_json};  // 从 filter 默认值计算的 SQL 参数
 
 // ── 图表实例注册表 ──────────────────────────────────────────────────────────
-const _charts = {{}};          // id → ECharts instance
-const _chartData = {{}};       // id → current data array
+const _charts    = {{}};   // id → ECharts instance
+const _chartData = {{}};   // id → current data array (运行时缓存)
 
-// ── 图表控件脚本通过 window['REPORT_SPEC'] 等访问，const 不挂 window，需显式暴露 ──
-window.REPORT_SPEC   = REPORT_SPEC;
-window.REPORT_ID     = REPORT_ID;
-window.REFRESH_TOKEN = REFRESH_TOKEN;
-window.API_BASE      = API_BASE;
-window._charts       = _charts;
-window._chartData    = _chartData;
+// ── 图表控件脚本通过 window 访问（const 不挂 window，需显式暴露）──────────
+window.REPORT_SPEC     = REPORT_SPEC;
+window.REPORT_ID       = REPORT_ID;
+window.REFRESH_TOKEN   = REFRESH_TOKEN;
+window.API_BASE        = API_BASE;
+window._charts         = _charts;
+window._chartData      = _chartData;
+window._DEFAULT_PARAMS = _DEFAULT_PARAMS;
 
 // ── 筛选器当前值 ──────────────────────────────────────────────────────────
 const _filterValues = {{}};
@@ -331,20 +357,154 @@ def _js_engine() -> str:
     """返回完整的 JS 运行时，负责所有图表渲染、筛选器联动和数据刷新。"""
     return r"""
 // ═══════════════════════════════════════════════════════════════════════════
-// 初始化
+// 初始化：动态加载模式
 // ═══════════════════════════════════════════════════════════════════════════
 window.addEventListener('DOMContentLoaded', () => {
-  // 1. 将服务端注入的数据缓存
-  for (const [id, rows] of Object.entries(REPORT_DATA)) {
-    _chartData[id] = rows;
+  // 预创建图表容器（ECharts 实例，暂无数据）
+  REPORT_SPEC.charts.forEach(spec => {
+    const el = document.getElementById(spec.id);
+    if (!el) return;
+    const lib = (spec.chart_lib || 'echarts').toLowerCase();
+    if (lib === 'echarts' || lib === 'llm_custom' || !lib) {
+      const chart = echarts.init(
+        el, REPORT_SPEC.theme === 'dark' ? 'dark' : null, {renderer: 'canvas'}
+      );
+      _charts[spec.id] = chart;
+    }
+  });
+
+  if (REPORT_ID && REPORT_ID !== 'preview') {
+    // 保存模式：动态加载数据
+    _loadData(_DEFAULT_PARAMS);
+  } else {
+    // 预览模式：直接渲染 baked-in 数据
+    for (const [id, rows] of Object.entries(REPORT_DATA)) {
+      _chartData[id] = rows;
+    }
+    REPORT_SPEC.charts.forEach(spec => initChart(spec));
   }
-  // 2. 初始化所有图表
-  REPORT_SPEC.charts.forEach(spec => initChart(spec));
-  // 3. 响应式
+
+  // 响应式
   window.addEventListener('resize', debounce(() => {
     Object.values(_charts).forEach(c => c && c.resize && c.resize());
   }, 250));
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 动态数据加载（参数化 SQL 查询）
+// ═══════════════════════════════════════════════════════════════════════════
+async function _loadData(params) {
+  const btn = document.getElementById('btn-refresh');
+  if (btn) { btn.disabled = true; btn.textContent = '加载中…'; }
+
+  // 显示每个图表的 loading 状态
+  REPORT_SPEC.charts.forEach(spec => _showChartLoading(spec.id));
+
+  // 构造 URL：token + 各 SQL 参数作为独立 query 参数
+  const urlParams = new URLSearchParams({ token: REFRESH_TOKEN });
+  for (const [k, v] of Object.entries(params || {})) {
+    if (Array.isArray(v)) {
+      v.forEach(vi => urlParams.append(k, vi));
+    } else if (v !== null && v !== undefined && v !== '') {
+      urlParams.set(k, String(v));
+    }
+  }
+
+  try {
+    const url = `${API_BASE}/reports/${REPORT_ID}/data?${urlParams}`;
+    const res = await fetch(url, { headers: { 'Accept': 'application/json' } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    if (!json.success) throw new Error(json.error || '加载失败');
+
+    // 更新数据缓存并重绘图表
+    const newData = json.data || {};
+    for (const [id, rows] of Object.entries(newData)) {
+      REPORT_DATA[id] = rows;
+      _chartData[id] = rows;
+    }
+    REPORT_SPEC.charts.forEach(spec => {
+      _hideChartLoading(spec.id);
+      _clearChartError(spec.id);
+      if (_charts[spec.id]) {
+        _charts[spec.id].setOption(buildEChartsOption(spec, REPORT_DATA[spec.id] || []), true);
+      } else {
+        initChart(spec);
+      }
+    });
+
+    // 查询出错的图表显示错误提示（其他图表正常渲染）
+    const errors = json.errors || {};
+    for (const [id, msg] of Object.entries(errors)) {
+      _showChartError(id, msg);
+    }
+
+    // 更新智能总结（如果有）
+    if (json.llm_summary) {
+      const el = document.getElementById('summary-body');
+      if (el) { el.textContent = json.llm_summary; el.classList.remove('summary-loading'); }
+    }
+
+  } catch(e) {
+    REPORT_SPEC.charts.forEach(spec => {
+      _hideChartLoading(spec.id);
+      _showChartError(spec.id, e.message);
+    });
+    showToast('加载失败: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '↻ 刷新数据'; }
+  }
+}
+
+const _debouncedLoadData = debounce(_loadData, 300);
+
+// 从当前筛选器值 + binds 映射，构造 SQL 参数对象
+function _currentParams() {
+  const p = Object.assign({}, _DEFAULT_PARAMS);
+  for (const fSpec of (REPORT_SPEC.filters || [])) {
+    const binds = fSpec.binds || {};
+    if (!binds || Object.keys(binds).length === 0) continue;
+    const val = _filterValues[fSpec.id];
+    if (!val) continue;
+    if (fSpec.type === 'date_range' && typeof val === 'object') {
+      if (binds.start && val.start) p[binds.start] = val.start;
+      if (binds.end   && val.end)   p[binds.end]   = val.end;
+    } else if (fSpec.type === 'multi_select' && Array.isArray(val)) {
+      if (binds.values) p[binds.values] = val;
+    } else {
+      if (binds.value && val) p[binds.value] = String(val);
+    }
+  }
+  return p;
+}
+
+// Per-chart loading/error 状态管理
+function _showChartLoading(id) {
+  const el = document.getElementById(`loading-${id}`);
+  if (el) { el.style.display = 'flex'; el.textContent = '加载中…'; }
+  _clearChartError(id);
+}
+function _hideChartLoading(id) {
+  const el = document.getElementById(`loading-${id}`);
+  if (el) el.style.display = 'none';
+}
+function _showChartError(id, msg) {
+  _hideChartLoading(id);
+  const card = document.getElementById(`card-${id}`);
+  if (!card) return;
+  let errEl = document.getElementById(`error-${id}`);
+  if (!errEl) {
+    errEl = document.createElement('div');
+    errEl.id = `error-${id}`;
+    errEl.className = 'chart-error';
+    card.appendChild(errEl);
+  }
+  errEl.textContent = '查询失败: ' + msg;
+}
+function _clearChartError(id) {
+  const errEl = document.getElementById(`error-${id}`);
+  if (errEl) errEl.remove();
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 图表初始化
@@ -753,13 +913,15 @@ function formatVal(v, spec) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 筛选器联动（客户端过滤）
+// 筛选器联动
+// 有 binds 字段 → 重查后端（参数化）；无 binds → 客户端内存过滤（兼容旧格式）
 // ═══════════════════════════════════════════════════════════════════════════
 function onFilterChange(filterId) {
   const filterSpec = (REPORT_SPEC.filters || []).find(f => f.id === filterId);
   if (!filterSpec) return;
   const ftype = filterSpec.type;
 
+  // 1. 读取当前筛选器值
   if (ftype === 'date_range') {
     const s = document.getElementById(`filter-${filterId}-start`)?.value;
     const e = document.getElementById(`filter-${filterId}-end`)?.value;
@@ -772,9 +934,17 @@ function onFilterChange(filterId) {
     _filterValues[filterId] = el ? el.value : null;
   }
 
-  // 确定目标图表
-  const targets = filterSpec.target_charts || REPORT_SPEC.charts.map(c => c.id);
-  targets.forEach(cid => applyFilterToChart(cid));
+  // 2. 路由：有 binds → 服务端重查；否则 → 客户端过滤
+  const binds = filterSpec.binds || {};
+  const isClientSide = filterSpec.client_side === true;
+  const hasBinds = Object.keys(binds).length > 0;
+
+  if (hasBinds && !isClientSide && REPORT_ID && REPORT_ID !== 'preview') {
+    _debouncedLoadData(_currentParams());
+  } else {
+    const targets = filterSpec.target_charts || REPORT_SPEC.charts.map(c => c.id);
+    targets.forEach(cid => applyFilterToChart(cid));
+  }
 }
 
 function applyFilterToChart(chartId) {
@@ -782,13 +952,11 @@ function applyFilterToChart(chartId) {
   if (!spec) return;
   let data = REPORT_DATA[chartId] || [];
 
-  // 对每个筛选器做客户端过滤
   (REPORT_SPEC.filters || []).forEach(fSpec => {
     const val = _filterValues[fSpec.id];
     if (!val || (Array.isArray(val) && val.length === 0)) return;
     const targets = fSpec.target_charts || REPORT_SPEC.charts.map(c => c.id);
     if (!targets.includes(chartId)) return;
-
     const field = fSpec.data_field || fSpec.id;
     if (fSpec.type === 'date_range' && val.start && val.end) {
       data = data.filter(r => r[field] >= val.start && r[field] <= val.end);
@@ -800,9 +968,7 @@ function applyFilterToChart(chartId) {
   });
 
   const chart = _charts[chartId];
-  if (chart) {
-    chart.setOption(buildEChartsOption(spec, data));
-  }
+  if (chart) chart.setOption(buildEChartsOption(spec, data));
 }
 
 function setDateRange(filterId, days) {
@@ -816,46 +982,14 @@ function setDateRange(filterId, days) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// 数据刷新（从后端重新查询）
+// 刷新数据（使用当前筛选器参数重新查询）
 // ═══════════════════════════════════════════════════════════════════════════
 async function refreshAllData() {
   if (!REPORT_ID || REPORT_ID === 'preview') {
     alert('当前报告为预览模式，无法刷新数据'); return;
   }
-  const btn = document.getElementById('btn-refresh');
-  if (btn) { btn.disabled = true; btn.textContent = '刷新中…'; }
-
-  try {
-    const url = `${API_BASE}/reports/${REPORT_ID}/refresh-data?token=${REFRESH_TOKEN}`;
-    const res = await fetch(url, { method: 'GET', headers: { 'Accept': 'application/json' } });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const json = await res.json();
-    if (!json.success) throw new Error(json.error || '刷新失败');
-
-    // 更新数据缓存
-    const newData = json.data || {};
-    for (const [id, rows] of Object.entries(newData)) {
-      REPORT_DATA[id] = rows;
-      _chartData[id] = rows;
-    }
-    // 重绘所有图表
-    REPORT_SPEC.charts.forEach(spec => {
-      const chart = _charts[spec.id];
-      if (chart) {
-        chart.setOption(buildEChartsOption(spec, REPORT_DATA[spec.id] || []), true);
-      }
-    });
-    // 检查总结是否更新
-    if (json.llm_summary) {
-      const el = document.getElementById('summary-body');
-      if (el) { el.textContent = json.llm_summary; el.classList.remove('summary-loading'); }
-    }
-    showToast('数据已更新');
-  } catch(e) {
-    showToast('刷新失败: ' + e.message, 'error');
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = '↻ 刷新数据'; }
-  }
+  await _loadData(_currentParams());
+  showToast('数据已更新');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -973,7 +1107,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 .chart-third {{ flex: 1 1 calc(33.33% - 11px); min-width: 260px; }}
 .chart-two-thirds {{ flex: 1 1 calc(66.66% - 8px); min-width: 420px; }}
 .chart-card-title {{ font-size: 14px; font-weight: 600; margin-bottom: 10px; color: {'#e0e0e0' if is_dark else '#262626'}; }}
-.chart-loading {{ font-size: 13px; color: #aaa; padding: 40px 0; text-align: center; }}
+.chart-loading {{ font-size: 13px; color: #aaa; padding: 40px 0; text-align: center; display: flex; align-items: center; justify-content: center; }}
 .chart-container {{ width: 100%; }}
 .chart-error {{ color: #ff4d4f; font-size: 13px; padding: 20px; text-align: center; }}
 

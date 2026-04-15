@@ -341,11 +341,19 @@ const REPORT_SPEC = {
       "id": "chart-bar-1",
       "chart_type": "bar",
       "title": "图表显示名称",
-      "sql": "SELECT ...",
+      "sql": "SELECT date, count() AS cnt FROM crm.realtime_dwd_crm_call_record WHERE call_start_time >= '{{ date_start }}' AND call_start_time < '{{ date_end }}' GROUP BY date ORDER BY date",
       "connection_env": "sg"
     }
   ],
-  "filters": []
+  "filters": [
+    {
+      "id": "date_range",
+      "type": "date_range",
+      "label": "时间范围",
+      "default_days": 30,
+      "binds": { "start": "date_start", "end": "date_end" }
+    }
+  ]
 };
 window.REPORT_SPEC = REPORT_SPEC;
 // ──────────────────────────────────────────────────────────────────────
@@ -355,7 +363,61 @@ window.REPORT_SPEC = REPORT_SPEC;
 **规则**：
 - `id` 必须与对应 `echarts.init(document.getElementById('chart-bar-1'))` 的 DOM id 完全一致
 - `chart_type` 取值：`bar` / `line` / `pie` / `scatter` / `area` / `gauge` / `radar`
-- `sql` 填写生成该图表数据所用的 SQL（可省略参数）
+- `sql` **必须使用 Jinja2 参数变量** `{{ date_start }}` / `{{ date_end }}` 等，**禁止硬编码日期**
 - `connection_env` 填写 ClickHouse 环境标识（`sg` / `idn` / `br` 等）
 - 每个 ECharts 图表必须对应 `charts` 数组中的一个元素
+- `filters` **必须包含** `binds` 字段，定义 filter 值 → SQL 变量的映射关系
 - 该标记使 Pilot 能够定位并修改每个图表的数据和样式
+
+---
+
+## 八、参数化 SQL 规范
+
+**报表 SQL 模板语法（Jinja2）**：使用 `{{ variable_name }}` 作为占位符，由筛选器 `binds` 字段绑定。
+
+### 标准 filter + SQL 对应写法
+
+```json
+// filter spec 示例
+{
+  "id": "date_range",
+  "type": "date_range",
+  "label": "时间范围",
+  "default_days": 30,
+  "binds": { "start": "date_start", "end": "date_end" }
+}
+```
+
+```sql
+-- 对应图表 SQL（使用 Jinja2 变量）
+SELECT
+  toDate(call_start_time) AS date,
+  countIf(call_code_type IN (1, 16)) AS connected_calls,
+  count() AS total_calls
+FROM crm.realtime_dwd_crm_call_record
+WHERE call_start_time >= '{{ date_start }}'
+  AND call_start_time < '{{ date_end }}'
+GROUP BY date
+ORDER BY date
+```
+
+### 多维度筛选示例
+
+```json
+// 企业筛选器（select 类型）
+{ "id": "ent_filter", "type": "select", "label": "企业", "options": [], "binds": { "value": "enterprise_id" } }
+```
+
+```sql
+-- SQL 同时使用日期和企业参数
+WHERE call_start_time >= '{{ date_start }}'
+  AND call_start_time < '{{ date_end }}'
+  {% if enterprise_id %}AND enterprise_id = '{{ enterprise_id }}'{% endif %}
+```
+
+### 注意事项
+
+1. **必须有筛选器**：生成报表时至少包含一个 `date_range` 类型的筛选器，并配置 `binds`
+2. **变量名一致**：`binds.start` / `binds.end` 的值必须与 SQL 中 `{{ }}` 内的变量名完全一致
+3. **AI 生成预览时**：先调用 `render_sql(template, default_params)` 预填默认参数再查询 ClickHouse
+4. **禁止硬编码**：SQL 中不得出现 `WHERE date >= '2025-01-01'` 形式的固定日期

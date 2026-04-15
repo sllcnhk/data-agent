@@ -134,6 +134,45 @@ always_inject: false
 
 ---
 
+## 参数化报表修改指南
+
+### 识别参数化报表
+
+**判断标志**：system prompt 中：
+- 图表列表含 `★参数化` 标注
+- 出现"参数化查询说明"段落
+- `图表配置（详细）`的 sql 字段含 `{{ }}` 语法
+
+### 参数化报表的修改规则
+
+| 用户说 | 正确做法 | 禁止做法 |
+|---|---|---|
+| "默认显示近7天数据" | 模式 B：`report__update_spec`，将 filter 的 `default_days` 改为 `7` | 把 SQL 中 `{{ date_start }}` 改为硬编码日期 |
+| "添加企业维度筛选" | 模式 B：在 spec.filters 中新增 select filter + binds，在 SQL 中添加 `{% if enterprise_id %}AND enterprise_id='{{ enterprise_id }}'{% endif %}` | 只改 SQL 不加 filter |
+| "把折线图改成面积图" | 模式 A：`chart_patch: {"chart_type": "area"}` | 无 |
+| "修改查询时间字段" | 模式 A：更新 chart.sql，保持 `{{ date_start }}` 变量不变，仅换字段名 | 替换成固定日期 |
+
+### 修改 filter 默认范围（模式 B 示例）
+
+```json
+// 调用 report__update_spec，spec.filters 中修改 default_days
+{
+  "id": "date_range",
+  "type": "date_range",
+  "label": "时间范围",
+  "default_days": 7,
+  "binds": { "start": "date_start", "end": "date_end" }
+}
+```
+
+### 重要原则
+
+- **参数化 SQL 中的 `{{ variable }}` 绝对不可替换为硬编码值**
+- 若用户要求"固定查询 2025 年全年"，应改 filter 的 `default_value`（startdate/enddate），而不改 SQL
+- 新增图表时，SQL 中**必须**使用与现有 filter binds 一致的变量名
+
+---
+
 ## 自由格式 HTML 报表的处理方式
 
 当 system prompt 中出现以下情况时，说明当前报表是**自由格式 HTML**（非结构化 spec 生成），图表无法通过 MCP 工具直接编辑：
