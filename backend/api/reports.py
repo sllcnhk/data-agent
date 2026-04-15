@@ -1132,6 +1132,7 @@ async def serve_report_html_by_path(
 
     ENABLE_AUTH=false 时跳过 token 验证（单用户模式）。
     """
+    is_superadmin = False
     if settings.enable_auth:
         if not token:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="未登录，请先登录")
@@ -1146,6 +1147,7 @@ async def serve_report_html_by_path(
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户不存在")
 
         username = user.username
+        is_superadmin = getattr(user, "is_superadmin", False)
     else:
         username = "default"
 
@@ -1160,10 +1162,17 @@ async def serve_report_html_by_path(
     abs_path = (_CUSTOMER_DATA_ROOT / rel).resolve()
 
     # 所有权验证：文件必须在 customer_data/{username}/ 下
-    if settings.enable_auth:
+    # superadmin 豁免：可访问 customer_data/ 下任意文件（用于调试和紧急救援）
+    if settings.enable_auth and not is_superadmin:
         user_root = (_CUSTOMER_DATA_ROOT / username).resolve()
         try:
             abs_path.relative_to(user_root)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问此文件")
+    elif settings.enable_auth and is_superadmin:
+        # superadmin 仍然要求文件在 customer_data/ 内（防止路径穿越）
+        try:
+            abs_path.relative_to(_CUSTOMER_DATA_ROOT.resolve())
         except ValueError:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无权访问此文件")
 

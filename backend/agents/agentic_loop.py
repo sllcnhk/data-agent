@@ -469,15 +469,20 @@ class AgenticLoop:
                         ):
                             result_data = raw_result if isinstance(raw_result, dict) else {}
                             report_id_val = result_data.get("report_id", tool_input.get("report_id", ""))
+                            refresh_token_val = result_data.get("refresh_token", tool_input.get("token", ""))
                             report_name_val = result_data.get("name", "报表")
                             written_files.append({
-                                "path": f"reports/{report_id_val}",
+                                # path 设为虚拟标识，前端通过 pinned_report_id 走 /reports/{id}/html 路径，不走 html-serve
+                                "path": f"__report__/{report_id_val}",
                                 "name": report_name_val,
                                 "size": 0,
                                 "mime_type": "text/html",
                                 "is_report": True,
                                 "doc_type": "dashboard",
                                 "report_id": report_id_val,
+                                # pinned_report_id + refresh_token 让前端直接走 /reports/{id}/html?token= 预览
+                                "pinned_report_id": report_id_val,
+                                "refresh_token": refresh_token_val,
                             })
                             logger.debug(
                                 "[AgenticLoop] 记录报表更新: tool=%s report_id=%s",
@@ -488,15 +493,13 @@ class AgenticLoop:
                         if "write_file" in tool_name and raw_result.get("success", False):
                             file_path = tool_input.get("path", "")
                             if file_path:
-                                # === 修复：将绝对路径转换为相对于 customer_data/ 的路径 ===
-                                # 统一转换为相对路径格式，便于下载 API 使用
+                                # === 步骤1：将绝对路径转换为相对于 customer_data/ 的路径 ===
                                 try:
                                     from pathlib import Path
                                     from backend.config.settings import settings
 
                                     path_obj = Path(file_path)
 
-                                    # 尝试找到相对于 customer_data 根目录的路径
                                     customer_root = (
                                         Path(settings.allowed_directories[0])
                                         if settings.allowed_directories
@@ -512,14 +515,35 @@ class AgenticLoop:
                                                 f"[AgenticLoop] 文件路径转换: 绝对路径 '{original_path}' -> 相对路径 '{file_path}'"
                                             )
                                         except ValueError:
-                                            # 不在 customer_data 下，保持原路径（可能是其他允许目录）
                                             logger.debug(
                                                 f"[AgenticLoop] 文件路径不在 customer_data 下，保持原路径: {file_path}"
                                             )
                                 except Exception as e:
-                                    # 转换失败，保持原路径并记录
                                     logger.warning(
                                         f"[AgenticLoop] 文件路径转换失败（将使用原路径）: {file_path}, 错误: {e}"
+                                    )
+
+                                # === 步骤2：验证并自动补全用户名前缀 ===
+                                # 若相对路径不以 {username}/ 开头，自动补全，防止 html-serve 403
+                                try:
+                                    _fp_norm = file_path.replace("\\", "/").lstrip("/")
+                                    _username = (context or {}).get("username", "")
+                                    if (
+                                        _username
+                                        and _fp_norm
+                                        and not _fp_norm.startswith(_username + "/")
+                                        # 排除技能目录路径（含 .claude）
+                                        and ".claude" not in _fp_norm
+                                    ):
+                                        original_fp = file_path
+                                        file_path = f"{_username}/{_fp_norm}"
+                                        logger.warning(
+                                            f"[AgenticLoop] 文件路径缺少用户名前缀，已自动修正: "
+                                            f"'{original_fp}' -> '{file_path}'"
+                                        )
+                                except Exception as e:
+                                    logger.warning(
+                                        f"[AgenticLoop] 用户名前缀验证失败，保持原路径: {e}"
                                     )
 
                                 file_name = file_path.replace("\\", "/").split("/")[-1]

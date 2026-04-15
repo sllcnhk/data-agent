@@ -176,6 +176,7 @@ class ReportToolMCPServer(BaseMCPServer):
             return {
                 "success": True,
                 "report_id": result["report_id"],
+                "refresh_token": token,
                 "name": result["name"],
                 "updated_at": result["updated_at"],
                 "chart_count": chart_count,
@@ -223,6 +224,7 @@ class ReportToolMCPServer(BaseMCPServer):
             return {
                 "success": True,
                 "report_id": result["report_id"],
+                "refresh_token": token,
                 "chart_id": chart_id,
                 "found": result["found"],
                 "total_charts": result["total_charts"],

@@ -64,9 +64,10 @@ const FileDownloadCards: React.FC<FileDownloadCardsProps> = ({ files, messageId,
   const markFilePinned = useChatStore((s) => s.markFilePinned);
 
   // 挂载时批量检测：对无 pinned_report_id 的报告文件发一次批量查询
+  // 排除虚拟路径（__report__/...），这些是 Pilot 修改报表后的占位路径，已含真实 pinned_report_id
   useEffect(() => {
     const unpinnedPaths = files
-      .filter((f) => f.is_report && !f.pinned_report_id && f.path)
+      .filter((f) => f.is_report && !f.pinned_report_id && !f.report_id && f.path && !f.path.startsWith('__report__/'))
       .map((f) => f.path);
     if (!unpinnedPaths.length) return;
 
@@ -130,8 +131,8 @@ const FileDownloadCards: React.FC<FileDownloadCardsProps> = ({ files, messageId,
         const isReport = file.is_report === true;
         const docType = file.doc_type ?? 'dashboard';
         const docLabel = docType === 'document' ? '报告' : '报表';
-        // 优先使用 store 中的 pinned_report_id，回退到批量检查结果
-        const effectivePinnedId = file.pinned_report_id ?? pinnedOverrides[file.path]?.report_id;
+        // 优先使用 store 中的 pinned_report_id，其次 report_id（Pilot 更新场景），最后批量检查结果
+        const effectivePinnedId = file.pinned_report_id ?? file.report_id ?? pinnedOverrides[file.path]?.report_id;
         const effectiveRefreshToken = file.refresh_token ?? pinnedOverrides[file.path]?.refresh_token;
         const isPinned = !!effectivePinnedId;
         // 合并有效的文件信息（用于预览弹窗）
