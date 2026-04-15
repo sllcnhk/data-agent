@@ -573,10 +573,15 @@ class ReportService:
 # Token 鉴权操作（供 MCP Tool Server 调用，无需 JWT）
 # ─────────────────────────────────────────────────────────────────────────────
 
+import json
+import logging
 import os
+import re
 import secrets as _secrets
 from pathlib import Path as _Path
 from uuid import UUID as _UUID
+
+_svc_logger = logging.getLogger(__name__)
 
 
 def _api_base_url() -> str:
@@ -595,6 +600,234 @@ def _get_customer_data_root() -> _Path:
         if settings.allowed_directories
         else _Path("customer_data")
     )
+
+
+def _extract_spec_via_report_spec_marker(content: str) -> "Dict[str, Any] | None":
+    """
+    策略 1：从 ``const REPORT_SPEC = {...}`` 标记提取（模板生成的 HTML）。
+    内部函数，供 extract_spec_from_html_file 调用链使用。
+    """
+    try:
+        m = re.search(r"const\s+REPORT_SPEC\s*=\s*", content)
+        if not m:
+            return None
+        start = content.index("{", m.end())
+        spec, _ = json.JSONDecoder().raw_decode(content, start)
+        if not isinstance(spec, dict):
+            return None
+        if "charts" not in spec:
+            spec["charts"] = []
+        return spec
+    except Exception:
+        return None
+
+
+def extract_spec_from_echarts_html(content_or_path: "str | _Path") -> "Dict[str, Any] | None":
+    """
+    策略 2：从自由书写的 ECharts HTML 中反向推断报表结构（无需 REPORT_SPEC 标记）。
+
+    适用场景：LLM 直接生成 ECharts 代码，未使用 build_report_html() 模板，
+    因此 HTML 中没有 ``const REPORT_SPEC`` 标记。
+
+    提取逻辑：
+    1. 报表标题：``<title>`` 标签 → 或 ``<h1>`` 第一个
+    2. 图表 ID 列表：所有 ``echarts.init(document.getElementById('xxx'))`` 调用
+    3. 图表标题：HTML 中 ``.chart-title`` / ``.chart-name`` / ``<h2>`` 按 DOM 顺序对应
+    4. 图表类型：各 ``setOption`` 块内的 ``type: 'bar'/'line'/'pie'/...``
+       （取最后一个 type 值，因为 series[0].type 在最内层）
+    5. 配对策略：DOM 顺序 chart-title[i] ↔ echarts.init[i]（顺序通常一致）
+
+    Returns:
+        spec dict（含 title, charts list, filters=[], theme="light"），
+        或 None（无法识别任何图表）
+    """
+    try:
+        if isinstance(content_or_path, _Path) or (
+            isinstance(content_or_path, str) and "\n" not in content_or_path and len(content_or_path) < 1000
+        ):
+            p = _Path(content_or_path)
+            if p.exists():
+                content = p.read_text(encoding="utf-8", errors="replace")
+            else:
+                content = content_or_path  # 当作字符串内容
+        else:
+            content = content_or_path
+
+        # ── 1. 报表标题 ──────────────────────────────────────────────────────
+        title = ""
+        m_title = re.search(r"<title[^>]*>(.*?)</title>", content, re.IGNORECASE | re.DOTALL)
+        if m_title:
+            title = re.sub(r"<[^>]+>", "", m_title.group(1)).strip()
+        if not title:
+            m_h1 = re.search(r"<h1[^>]*>(.*?)</h1>", content, re.IGNORECASE | re.DOTALL)
+            if m_h1:
+                title = re.sub(r"<[^>]+>", "", m_h1.group(1)).strip()
+
+        # ── 2. 图表 ID（按出现顺序）──────────────────────────────────────────
+        chart_ids = re.findall(
+            r"""echarts\.init\s*\(\s*document\.getElementById\s*\(\s*['"]([^'"]+)['"]\s*\)""",
+            content,
+        )
+        if not chart_ids:
+            # 备用：getElementById 单独出现（非 echarts.init 包裹）
+            chart_ids = re.findall(
+                r"""getElementById\s*\(\s*['"]([^'"]+)['"]\s*\)""", content
+            )
+            # 只保留看起来像图表容器的（含 chart）
+            chart_ids = [c for c in chart_ids if "chart" in c.lower()]
+        if not chart_ids:
+            return None
+
+        # 去重同时保序
+        seen: "set[str]" = set()
+        unique_ids = []
+        for cid in chart_ids:
+            if cid not in seen:
+                seen.add(cid)
+                unique_ids.append(cid)
+        chart_ids = unique_ids
+
+        # ── 3. 图表标题（按 DOM 出现顺序）──────────────────────────────────
+        chart_title_pattern = re.compile(
+            r'class=["\'][^"\']*(?:chart[-_]title|chart[-_]name|panel[-_]title)[^"\']*["\'][^>]*>(.*?)</\w+>',
+            re.IGNORECASE | re.DOTALL,
+        )
+        chart_display_names = [
+            re.sub(r"<[^>]+>", "", m.group(1)).strip()
+            for m in chart_title_pattern.finditer(content)
+        ]
+
+        # ── 4. 图表类型（从各 echarts.init 块提取）──────────────────────────
+        # 优先在 echarts.init[i] → echarts.init[i+1] 之间找类型
+        # 这样能覆盖"先定义 var series，再 setOption()"的写法
+        _chart_type_keywords = {"bar", "line", "pie", "scatter", "radar",
+                                 "gauge", "heatmap", "funnel", "treemap", "sankey"}
+        init_matches = list(re.finditer(
+            r"""echarts\.init\s*\(\s*document\.getElementById\s*\(\s*['"][^'"]+['"]\s*\)""",
+            content,
+        ))
+        chart_types: "list[str]" = []
+        for i, m_init in enumerate(init_matches):
+            # 本段：从当前 echarts.init 到下一个 echarts.init（或文件末尾）
+            seg_end = init_matches[i + 1].start() if i + 1 < len(init_matches) else len(content)
+            segment = content[m_init.start():seg_end]
+            types_in_seg = re.findall(r"""type\s*:\s*['"]([^'"]+)['"]""", segment)
+            if types_in_seg:
+                # 优先取 chart_type_keywords 中的值；再次优先取 series 上下文中的
+                chart_kw = [t for t in types_in_seg if t.lower() in _chart_type_keywords]
+                chart_types.append(chart_kw[-1] if chart_kw else "bar")
+            else:
+                chart_types.append("bar")  # 默认
+
+        # ── 5. 组装 charts 列表 ─────────────────────────────────────────────
+        charts = []
+        for i, cid in enumerate(chart_ids):
+            display_name = (
+                chart_display_names[i]
+                if i < len(chart_display_names)
+                else f"图表 {i + 1}"
+            )
+            ctype = chart_types[i] if i < len(chart_types) else "bar"
+            charts.append({
+                "id": cid,
+                "chart_type": ctype,
+                "title": display_name,
+                # sql / connection_env 对自由 HTML 不可知，留空
+                "sql": "",
+                "connection_env": "",
+                "_extracted": True,   # 标记为反向推断，非原始 spec
+            })
+
+        if not charts:
+            return None
+
+        _svc_logger.info(
+            "[extract_spec_from_echarts_html] 成功提取 %d 个图表，标题=%r",
+            len(charts), title,
+        )
+        return {
+            "title": title,
+            "subtitle": "",
+            "charts": charts,
+            "filters": [],
+            "theme": "light",
+            "_source": "echarts_html",   # 标记来源，供调用方判断
+        }
+
+    except Exception as e:
+        _svc_logger.debug("[extract_spec_from_echarts_html] 提取失败: %s", e)
+        return None
+
+
+def extract_html_context(content_or_path: "str | _Path", max_chars: int = 1500) -> str:
+    """
+    从 HTML 文件提取可读文本摘要（终极兜底），供 Pilot system_prompt 注入。
+
+    提取：标题 + h1/h2/h3 + 段落文本，剔除 script/style 标签，截断至 max_chars。
+    """
+    try:
+        if isinstance(content_or_path, _Path) or (
+            isinstance(content_or_path, str) and "\n" not in content_or_path and len(content_or_path) < 1000
+        ):
+            p = _Path(content_or_path)
+            if p.exists():
+                content = p.read_text(encoding="utf-8", errors="replace")
+            else:
+                content = content_or_path
+        else:
+            content = content_or_path
+
+        # 去掉 script / style 块
+        content = re.sub(r"<script[^>]*>.*?</script>", "", content, flags=re.DOTALL | re.IGNORECASE)
+        content = re.sub(r"<style[^>]*>.*?</style>", "", content, flags=re.DOTALL | re.IGNORECASE)
+        # 去掉剩余 HTML 标签
+        text = re.sub(r"<[^>]+>", " ", content)
+        # 压缩空白
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:max_chars]
+    except Exception:
+        return ""
+
+
+def extract_spec_from_html_file(html_path: "_Path | str") -> "Dict[str, Any] | None":
+    """
+    从 HTML 报告文件中提取报表 spec（两段式提取链）。
+
+    提取链：
+      Step 1 — ``const REPORT_SPEC`` 标记（模板生成 HTML，精确）
+      Step 2 — ECharts DOM 模式（LLM 自由书写 HTML，反向推断）
+      Step 3 — 返回 None（两策略均失败）
+
+    所有调用点（pin_report / spec-meta / get_spec_by_token）无需修改，
+    自动获得增强能力。
+
+    Args:
+        html_path: HTML 文件的绝对或相对路径
+
+    Returns:
+        spec dict（至少含 "charts" key），或 None
+    """
+    try:
+        html_path = _Path(html_path)
+        if not html_path.exists():
+            return None
+        content = html_path.read_text(encoding="utf-8", errors="replace")
+
+        # Step 1: REPORT_SPEC 标记（精确，优先）
+        spec = _extract_spec_via_report_spec_marker(content)
+        if spec is not None:
+            return spec
+
+        # Step 2: ECharts DOM 反向推断（自由书写 HTML）
+        spec = extract_spec_from_echarts_html(content)
+        if spec is not None:
+            return spec
+
+        return None
+
+    except Exception as e:
+        _svc_logger.debug("[extract_spec_from_html_file] 提取失败 path=%s err=%s", html_path, e)
+        return None
 
 
 def _verify_refresh_token(report: Report, refresh_token: str) -> None:
@@ -627,14 +860,48 @@ def get_spec_by_token(report_id: str, refresh_token: str) -> Dict[str, Any]:
         if not report:
             raise ValueError(f"报表不存在: {report_id}")
         _verify_refresh_token(report, refresh_token)
+
+        charts = list(report.charts or [])
+        filters = list(report.filters or [])
+        theme = report.theme or "light"
+
+        # 若 DB 中 charts 为 NULL（历史 pin 记录），尝试从 HTML 文件提取并持久化
+        if report.charts is None and report.report_file_path:
+            try:
+                customer_root = _get_customer_data_root()
+                _abs = (customer_root / report.report_file_path).resolve()
+                _spec = extract_spec_from_html_file(_abs)
+                if _spec:
+                    charts = _spec.get("charts", [])
+                    filters = _spec.get("filters", [])
+                    theme = _spec.get("theme", "light")
+                    # 懒写回 DB
+                    try:
+                        from sqlalchemy.orm.attributes import flag_modified
+                        report.charts = charts
+                        report.filters = filters
+                        report.theme = theme
+                        flag_modified(report, "charts")
+                        flag_modified(report, "filters")
+                        db.commit()
+                        _svc_logger.info(
+                            "[get_spec_by_token] 懒更新 spec: report_id=%s charts=%d",
+                            report_id, len(charts),
+                        )
+                    except Exception as _ce:
+                        db.rollback()
+                        _svc_logger.warning("[get_spec_by_token] 懒更新 DB 失败（非致命）: %s", _ce)
+            except Exception as _e:
+                _svc_logger.debug("[get_spec_by_token] 从 HTML 提取 spec 失败: %s", _e)
+
         return {
             "id": str(report.id),
             "name": report.name,
             "description": report.description or "",
             "doc_type": report.doc_type or "dashboard",
-            "theme": report.theme or "light",
-            "charts": list(report.charts or []),
-            "filters": list(report.filters or []),
+            "theme": theme,
+            "charts": charts,
+            "filters": filters,
             "data_sources": list(report.data_sources or []),
             "refresh_token": report.refresh_token,
             "report_file_path": report.report_file_path,

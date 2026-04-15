@@ -751,6 +751,25 @@ async def pin_report(
     db.add(report)
     db.flush()  # 获取 ID，但不提交
 
+    # 从 HTML 文件提取 spec，回填 charts / filters / theme
+    # 这样通过 "生成固定报表" pin 的报告，Pilot 能立刻读到图表结构
+    try:
+        from backend.services.report_service import extract_spec_from_html_file
+        from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+        _spec = extract_spec_from_html_file(abs_path)
+        if _spec:
+            report.charts = _spec.get("charts", [])
+            report.filters = _spec.get("filters", [])
+            report.theme = _spec.get("theme", "light")
+            _flag_modified(report, "charts")
+            _flag_modified(report, "filters")
+            logger.info(
+                "[Reports/pin] 从 HTML 提取 spec 成功: charts=%d, file=%s",
+                len(report.charts or []), norm_fp,
+            )
+    except Exception as _e:
+        logger.warning("[Reports/pin] 从 HTML 提取 spec 失败（非致命）: %s", _e)
+
     # T4: 回写 message.extra_metadata.files_written[i].pinned_report_id
     if req.message_id:
         try:
@@ -1352,6 +1371,83 @@ async def create_report_copilot(
 
     svc = ConversationService(db)
 
+    # ── C1: 若 charts 为空，先尝试从 HTML 文件提取 spec ───────────────────
+    _spec_extracted = False
+    if not report.charts and report.report_file_path:
+        try:
+            from backend.services.report_service import extract_spec_from_html_file
+            from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+            _abs = (_CUSTOMER_DATA_ROOT / report.report_file_path).resolve()
+            _spec = extract_spec_from_html_file(_abs)
+            if _spec and _spec.get("charts"):
+                report.charts = _spec.get("charts", [])
+                report.filters = _spec.get("filters", []) or (report.filters or [])
+                report.theme = _spec.get("theme", report.theme or "light")
+                _flag_modified(report, "charts")
+                _flag_modified(report, "filters")
+                db.commit()
+                db.refresh(report)
+                _spec_extracted = True
+                logger.info(
+                    "[Reports/copilot] 从 HTML 提取 spec 成功: report_id=%s, charts=%d",
+                    report_id, len(report.charts or []),
+                )
+        except Exception as _e:
+            logger.warning("[Reports/copilot] 从 HTML 提取 spec 失败（非致命）: %s", _e)
+
+    charts_list = report.charts or []
+
+    # ── C2: 仍为空时注入 HTML 文本摘要，给 Pilot 兜底上下文 ───────────────
+    _html_context_note = ""
+    if not charts_list and report.report_file_path:
+        try:
+            from backend.services.report_service import extract_html_context
+            _abs = (_CUSTOMER_DATA_ROOT / report.report_file_path).resolve()
+            _html_ctx = extract_html_context(_abs, max_chars=1500)
+            if _html_ctx:
+                _html_context_note = (
+                    "\n## 报表 HTML 内容摘要（spec 提取失败时的兜底上下文）\n"
+                    "注意：此报表为自由格式 HTML，图表配置未结构化存储。\n"
+                    "以下是 HTML 可读文本，仅供理解报表内容，不可直接编辑图表数据。\n"
+                    f"{_html_ctx}\n"
+                    "⚠️ 如需修改此报表，请告知用户「该报表为自由格式，Pilot 无法直接编辑图表数据，"
+                    "建议重新生成结构化报表。」\n"
+                )
+        except Exception:
+            pass
+
+    chart_summary = "\n".join(
+        f'  [{i+1}] id="{c.get("id","?")}" title="{c.get("title","?")}" type="{c.get("chart_type","?")}"'
+        for i, c in enumerate(charts_list)
+    )
+
+    def _build_copilot_prompt(cl: list, note: str) -> str:
+        return (
+            f"[Co-pilot 模式] 当前报表：{report.name}\n"
+            f"report_id：{report.id}\n"
+            f"refresh_token：{report.refresh_token}\n"
+            f"图表数量：{len(cl)}\n"
+            f"图表列表：\n{chart_summary or '  （无图表）'}\n"
+            f"图表配置（详细）：{json.dumps(cl, ensure_ascii=False)[:4000]}\n"
+            f"过滤器：{json.dumps(report.filters or [], ensure_ascii=False)[:500]}\n"
+            f"主题：{report.theme}\n\n"
+            "## 修改报表的 MCP 工具（直接调用，无需 JWT）\n\n"
+            "### 工具 1：report__get_spec\n"
+            "读取报表当前完整 spec，修改前先调用确认所有图表。\n"
+            "参数：report_id（见上方）、token（即 refresh_token）\n\n"
+            "### 工具 2：report__update_single_chart（优先使用）\n"
+            "局部更新单个图表，merge 操作，不影响其他图表。\n"
+            "参数：report_id、token、chart_id、chart_patch（只含需修改字段）\n\n"
+            "### 工具 3：report__update_spec（全量更新）\n"
+            "更新整个报表 spec，适用于添加/删除图表或批量修改。\n"
+            "⚠️ spec.charts 必须包含所有图表，缺少的图表将永久删除！\n"
+            "参数：report_id、token、spec（完整 spec JSON 含所有图表）\n\n"
+            f"{note}"
+            "请基于以上报表信息协助用户修改报表。修改完成后告知用户「报表已更新，请查看预览」。"
+        )
+
+    copilot_system_prompt = _build_copilot_prompt(charts_list, _html_context_note)
+
     # ── Upsert：先查已有对话，避免重复创建 ──────────────────────────────────
     existing = svc.find_pilot_conversation(
         context_type="report",
@@ -1359,42 +1455,38 @@ async def create_report_copilot(
         user_id=user_id,
     )
     if existing:
+        # ── C3: 若已有对话 system_prompt 中图表数量为 0 但现在有了 spec，刷新 prompt ──
+        _pilot_refreshed = False
+        try:
+            _old_prompt = existing.system_prompt or ""
+            _old_has_empty = "图表数量：0" in _old_prompt or "（无图表）" in _old_prompt
+            if _old_has_empty and charts_list:
+                from sqlalchemy.orm.attributes import flag_modified as _flag_modified2
+                _meta = dict(existing.extra_metadata or {})
+                _meta["system_prompt"] = copilot_system_prompt
+                existing.extra_metadata = _meta
+                _flag_modified2(existing, "extra_metadata")
+                db.commit()
+                _pilot_refreshed = True
+                logger.info(
+                    "[Reports/copilot] 刷新 stale system_prompt: conv_id=%s, charts=%d",
+                    existing.id, len(charts_list),
+                )
+        except Exception as _re:
+            logger.warning("[Reports/copilot] 刷新 system_prompt 失败（非致命）: %s", _re)
+
         logger.info(
-            "[Reports] co-pilot 对话已存在，复用: report_id=%s, conv_id=%s",
-            report_id, existing.id,
+            "[Reports] co-pilot 对话已存在，复用: report_id=%s, conv_id=%s, refreshed=%s",
+            report_id, existing.id, _pilot_refreshed,
         )
         return {
             "success": True,
-            "data": {"conversation_id": str(existing.id), "created": False},
+            "data": {
+                "conversation_id": str(existing.id),
+                "created": False,
+                "pilot_refreshed": _pilot_refreshed,
+            },
         }
-
-    charts_list = report.charts or []
-    chart_summary = "\n".join(
-        f'  [{i+1}] id="{c.get("id","?")}" title="{c.get("title","?")}" type="{c.get("chart_type","?")}"'
-        for i, c in enumerate(charts_list)
-    )
-    copilot_system_prompt = (
-        f"[Co-pilot 模式] 当前报表：{report.name}\n"
-        f"report_id：{report.id}\n"
-        f"refresh_token：{report.refresh_token}\n"
-        f"图表数量：{len(charts_list)}\n"
-        f"图表列表：\n{chart_summary or '  （无图表）'}\n"
-        f"图表配置（详细）：{json.dumps(charts_list, ensure_ascii=False)[:4000]}\n"
-        f"过滤器：{json.dumps(report.filters or [], ensure_ascii=False)[:500]}\n"
-        f"主题：{report.theme}\n\n"
-        "## 修改报表的 MCP 工具（直接调用，无需 JWT）\n\n"
-        "### 工具 1：report__get_spec\n"
-        "读取报表当前完整 spec，修改前先调用确认所有图表。\n"
-        "参数：report_id（见上方）、token（即 refresh_token）\n\n"
-        "### 工具 2：report__update_single_chart（优先使用）\n"
-        "局部更新单个图表，merge 操作，不影响其他图表。\n"
-        "参数：report_id、token、chart_id、chart_patch（只含需修改字段）\n\n"
-        "### 工具 3：report__update_spec（全量更新）\n"
-        "更新整个报表 spec，适用于添加/删除图表或批量修改。\n"
-        "⚠️ spec.charts 必须包含所有图表，缺少的图表将永久删除！\n"
-        "参数：report_id、token、spec（完整 spec JSON 含所有图表）\n\n"
-        "请基于以上报表信息协助用户修改报表。修改完成后告知用户「报表已更新，请查看预览」。"
-    )
 
     conv_title = req.title or f"报表助手 — {report.name}"
     conv = svc.create_conversation(
@@ -1408,10 +1500,17 @@ async def create_report_copilot(
         user_id=user_id,
     )
 
-    logger.info("[Reports] co-pilot 对话已创建: report_id=%s, conv_id=%s", report_id, conv.id)
+    logger.info(
+        "[Reports] co-pilot 对话已创建: report_id=%s, conv_id=%s, charts=%d, spec_extracted=%s",
+        report_id, conv.id, len(charts_list), _spec_extracted,
+    )
     return {
         "success": True,
-        "data": {"conversation_id": str(conv.id), "created": True},
+        "data": {
+            "conversation_id": str(conv.id),
+            "created": True,
+            "spec_extracted": _spec_extracted,
+        },
     }
 
 
@@ -1440,7 +1539,167 @@ async def get_report_spec_meta(
     if not secrets.compare_digest(report.refresh_token or "", token):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="无效的刷新令牌")
 
-    return {"success": True, "data": _report_to_dict(report)}
+    # D1: 懒更新 — charts 为 NULL 或空列表时尝试从 HTML 文件提取 spec 并回填 DB
+    if not report.charts and report.report_file_path:
+        try:
+            from backend.services.report_service import extract_spec_from_html_file
+            from sqlalchemy.orm.attributes import flag_modified
+            _abs = (_CUSTOMER_DATA_ROOT / report.report_file_path).resolve()
+            _spec = extract_spec_from_html_file(_abs)
+            if _spec and _spec.get("charts"):
+                report.charts = _spec.get("charts", [])
+                report.filters = _spec.get("filters", []) or (report.filters or [])
+                report.theme = _spec.get("theme", report.theme or "light")
+                flag_modified(report, "charts")
+                flag_modified(report, "filters")
+                try:
+                    db.commit()
+                    db.refresh(report)
+                    logger.info(
+                        "[Reports/spec-meta] 懒更新 spec 成功: report_id=%s, charts=%d",
+                        report_id, len(report.charts or []),
+                    )
+                except Exception as _ce:
+                    db.rollback()
+                    logger.warning("[Reports/spec-meta] 懒更新提交失败（非致命）: %s", _ce)
+        except Exception as _e:
+            logger.warning("[Reports/spec-meta] 从 HTML 提取 spec 失败（非致命）: %s", _e)
+
+    # D2: html_context 兜底字段 — 提取仍失败时提供 HTML 文本摘要
+    d = _report_to_dict(report)
+    if not report.charts and report.report_file_path:
+        try:
+            from backend.services.report_service import extract_html_context
+            _abs = (_CUSTOMER_DATA_ROOT / report.report_file_path).resolve()
+            _ctx = extract_html_context(_abs, max_chars=1500)
+            if _ctx:
+                d["html_context"] = _ctx
+        except Exception:
+            pass
+
+    return {"success": True, "data": d}
+
+
+@router.post("/{report_id}/rebuild-spec")
+async def rebuild_report_spec(
+    report_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_permission("reports", "create")),
+):
+    """
+    对已固定的报表按需重建 spec（适用于历史存量 / 自由书写 HTML）。
+
+    步骤：
+    1. 重新调用提取链（REPORT_SPEC 标记 → ECharts DOM 模式）
+    2. 将提取结果写入 Report.charts / .filters / .theme
+    3. 若该报表存在绑定的 Pilot 对话且其 system_prompt 含"图表数量：0"，
+       同时刷新 system_prompt
+
+    Returns:
+        {charts_extracted, charts_count, pilot_prompt_refreshed, source}
+    """
+    username = getattr(current_user, "username", "default")
+    report = _get_report_or_404(report_id, db)
+    _check_ownership(report, username, getattr(current_user, "is_superadmin", False))
+
+    if not report.report_file_path:
+        raise HTTPException(400, "该报表没有关联 HTML 文件，无法重建 spec")
+
+    _abs = (_CUSTOMER_DATA_ROOT / report.report_file_path).resolve()
+    if not _abs.exists():
+        raise HTTPException(404, f"HTML 文件不存在: {report.report_file_path}")
+
+    # ── 提取 ────────────────────────────────────────────────────────────────
+    from backend.services.report_service import extract_spec_from_html_file
+    from sqlalchemy.orm.attributes import flag_modified
+
+    _spec = extract_spec_from_html_file(_abs)
+    if not _spec or not _spec.get("charts"):
+        return {
+            "success": False,
+            "message": "无法从 HTML 文件中提取图表结构（文件可能没有可识别的图表元素）",
+            "charts_extracted": False,
+            "charts_count": 0,
+        }
+
+    report.charts = _spec.get("charts", [])
+    report.filters = _spec.get("filters", []) or (report.filters or [])
+    report.theme = _spec.get("theme", report.theme or "light")
+    flag_modified(report, "charts")
+    flag_modified(report, "filters")
+    db.commit()
+    db.refresh(report)
+
+    logger.info(
+        "[Reports/rebuild-spec] 重建成功: report_id=%s, charts=%d, source=%s",
+        report_id, len(report.charts), _spec.get("_source", "report_spec"),
+    )
+
+    # ── 刷新绑定的 Pilot 对话 system_prompt ─────────────────────────────────
+    _pilot_refreshed = False
+    try:
+        from backend.models.conversation import Conversation
+        from sqlalchemy.orm.attributes import flag_modified as _flag_modified2
+
+        _pilot_conv = (
+            db.query(Conversation)
+            .filter(
+                Conversation.extra_metadata["context_type"].astext == "report",
+                Conversation.extra_metadata["context_id"].astext == str(report.id),
+            )
+            .order_by(Conversation.created_at.desc())
+            .first()
+        )
+        if _pilot_conv:
+            _old_prompt = _pilot_conv.system_prompt or ""
+            if "图表数量：0" in _old_prompt or "（无图表）" in _old_prompt:
+                charts_list = report.charts or []
+                _chart_summary = "\n".join(
+                    f'  [{i+1}] id="{c.get("id","?")}" title="{c.get("title","?")}" type="{c.get("chart_type","?")}"'
+                    for i, c in enumerate(charts_list)
+                )
+                _new_prompt = (
+                    f"[Co-pilot 模式] 当前报表：{report.name}\n"
+                    f"report_id：{report.id}\n"
+                    f"refresh_token：{report.refresh_token}\n"
+                    f"图表数量：{len(charts_list)}\n"
+                    f"图表列表：\n{_chart_summary or '  （无图表）'}\n"
+                    f"图表配置（详细）：{json.dumps(charts_list, ensure_ascii=False)[:4000]}\n"
+                    f"过滤器：{json.dumps(report.filters or [], ensure_ascii=False)[:500]}\n"
+                    f"主题：{report.theme}\n\n"
+                    "## 修改报表的 MCP 工具（直接调用，无需 JWT）\n\n"
+                    "### 工具 1：report__get_spec\n"
+                    "读取报表当前完整 spec，修改前先调用确认所有图表。\n"
+                    "参数：report_id（见上方）、token（即 refresh_token）\n\n"
+                    "### 工具 2：report__update_single_chart（优先使用）\n"
+                    "局部更新单个图表，merge 操作，不影响其他图表。\n"
+                    "参数：report_id、token、chart_id、chart_patch（只含需修改字段）\n\n"
+                    "### 工具 3：report__update_spec（全量更新）\n"
+                    "更新整个报表 spec，适用于添加/删除图表或批量修改。\n"
+                    "⚠️ spec.charts 必须包含所有图表，缺少的图表将永久删除！\n"
+                    "参数：report_id、token、spec（完整 spec JSON 含所有图表）\n\n"
+                    "请基于以上报表信息协助用户修改报表。修改完成后告知用户「报表已更新，请查看预览」。"
+                )
+                _meta = dict(_pilot_conv.extra_metadata or {})
+                _meta["system_prompt"] = _new_prompt
+                _pilot_conv.extra_metadata = _meta
+                _flag_modified2(_pilot_conv, "extra_metadata")
+                db.commit()
+                _pilot_refreshed = True
+                logger.info(
+                    "[Reports/rebuild-spec] 刷新 Pilot system_prompt: conv_id=%s", _pilot_conv.id
+                )
+    except Exception as _pe:
+        logger.warning("[Reports/rebuild-spec] 刷新 Pilot prompt 失败（非致命）: %s", _pe)
+
+    return {
+        "success": True,
+        "charts_extracted": True,
+        "charts_count": len(report.charts),
+        "pilot_prompt_refreshed": _pilot_refreshed,
+        "source": _spec.get("_source", "report_spec"),
+        "data": _report_to_dict(report),
+    }
 
 
 @router.get("/{report_id}")

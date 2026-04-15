@@ -322,3 +322,40 @@ ORDER BY (c.connected_calls + c.am_calls) DESC
 6. **业务洞察 & 建议**
 
 报告文件写入路径：`{CURRENT_USER}/reports/`（文件系统根目录已指向 customer_data/，勿重复写 customer_data/ 前缀）
+
+---
+
+## 七、⚠️ HTML 报表文件强制规范 — REPORT_SPEC 标记
+
+**当你生成 HTML 可视化报表文件时，必须在 `<script>` 块中嵌入以下结构化标记**，否则固定到报表清单后 AI Pilot 无法识别图表内容。
+
+```html
+<script>
+// ── 报表结构化规格（AI Pilot 读取，请勿删除）─────────────────────────
+const REPORT_SPEC = {
+  "title": "报表标题",
+  "subtitle": "副标题（可为空字符串）",
+  "theme": "light",
+  "charts": [
+    {
+      "id": "chart-bar-1",
+      "chart_type": "bar",
+      "title": "图表显示名称",
+      "sql": "SELECT ...",
+      "connection_env": "sg"
+    }
+  ],
+  "filters": []
+};
+window.REPORT_SPEC = REPORT_SPEC;
+// ──────────────────────────────────────────────────────────────────────
+</script>
+```
+
+**规则**：
+- `id` 必须与对应 `echarts.init(document.getElementById('chart-bar-1'))` 的 DOM id 完全一致
+- `chart_type` 取值：`bar` / `line` / `pie` / `scatter` / `area` / `gauge` / `radar`
+- `sql` 填写生成该图表数据所用的 SQL（可省略参数）
+- `connection_env` 填写 ClickHouse 环境标识（`sg` / `idn` / `br` 等）
+- 每个 ECharts 图表必须对应 `charts` 数组中的一个元素
+- 该标记使 Pilot 能够定位并修改每个图表的数据和样式
