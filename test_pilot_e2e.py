@@ -168,15 +168,58 @@ def _make_schedule(owner_username, is_active=True):
 
 
 def _cleanup_test_data():
-    """删除本次测试生成的全部数据"""
+    """删除本次测试生成的全部数据（含磁盘 HTML 文件）"""
+    import os as _os
+    from pathlib import Path as _Path
+
+    _PROJECT_ROOT = _Path(__file__).resolve().parent
+
     try:
         from backend.models.user import User
         from backend.models.report import Report
-        from backend.models.conversation import Conversation
+        from backend.models.conversation import Conversation, Message
+
+        # 删除 Report 前先收集 HTML 文件路径（delete 后 ORM 对象属性仍可读）
+        _test_reports = (
+            _g_db.query(Report)
+            .filter(Report.name.like(f"{_PREFIX}%"))
+            .all()
+        )
+        _html_paths = []
+        for _r in _test_reports:
+            if _r.report_file_path:
+                _p = _Path(_r.report_file_path)
+                if not _p.is_absolute():
+                    _p = _PROJECT_ROOT / _p
+                _html_paths.append(_p)
+            _g_db.delete(_r)
+
+        # 删除 Pilot 对话（Message 先删，再删 Conversation）
+        _test_conv_ids = [
+            row[0] for row in
+            _g_db.query(Conversation.id)
+            .filter(Conversation.title.like(f"%{_PREFIX}%"))
+            .all()
+        ]
+        if _test_conv_ids:
+            _g_db.query(Message).filter(
+                Message.conversation_id.in_(_test_conv_ids)
+            ).delete(synchronize_session=False)
+            _g_db.query(Conversation).filter(
+                Conversation.id.in_(_test_conv_ids)
+            ).delete(synchronize_session=False)
+
         _g_db.query(User).filter(User.username.like(f"{_PREFIX}%")).delete(synchronize_session=False)
-        _g_db.query(Report).filter(Report.name.like(f"{_PREFIX}%")).delete(synchronize_session=False)
-        _g_db.query(Conversation).filter(Conversation.title.like(f"%{_PREFIX}%")).delete(synchronize_session=False)
         _g_db.commit()
+
+        # 提交后再删磁盘文件（DB 已清理，即使文件删除失败也不影响）
+        for _p in _html_paths:
+            try:
+                if _p.exists():
+                    _p.unlink()
+            except Exception:
+                pass
+
     except Exception:
         try:
             _g_db.rollback()
@@ -185,7 +228,20 @@ def _cleanup_test_data():
 
     try:
         from backend.models.scheduled_report import ScheduledReport
-        _g_db.query(ScheduledReport).filter(ScheduledReport.name.like(f"{_PREFIX}%")).delete(synchronize_session=False)
+        from backend.models.schedule_run_log import ScheduleRunLog
+        _test_sr_ids = [
+            row[0] for row in
+            _g_db.query(ScheduledReport.id)
+            .filter(ScheduledReport.name.like(f"{_PREFIX}%"))
+            .all()
+        ]
+        if _test_sr_ids:
+            _g_db.query(ScheduleRunLog).filter(
+                ScheduleRunLog.scheduled_report_id.in_(_test_sr_ids)
+            ).delete(synchronize_session=False)
+            _g_db.query(ScheduledReport).filter(
+                ScheduledReport.id.in_(_test_sr_ids)
+            ).delete(synchronize_session=False)
         _g_db.commit()
     except Exception:
         try:

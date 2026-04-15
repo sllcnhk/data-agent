@@ -143,16 +143,34 @@ def _cleanup_test_data(label: str = ""):
 
     db = SessionLocal()
     try:
-        # 清理测试报表 / 报告（username 匹配测试前缀）
+        # 清理测试报表 / 报告（username 匹配测试前缀），同时删除磁盘 HTML 文件
         try:
             from backend.models.report import Report
-            n = db.query(Report).filter(
-                Report.username.op('~')(r'^_[a-z][a-z0-9]*_')
-                | (Report.username == 'default')
-            ).delete(synchronize_session=False)
+            import os as _os
+            test_reports = (
+                db.query(Report)
+                .filter(
+                    Report.username.op('~')(r'^_[a-z][a-z0-9]*_')
+                    | (Report.username == 'default')
+                )
+                .all()
+            )
+            _deleted_html = 0
+            for _rpt in test_reports:
+                if _rpt.report_file_path:
+                    try:
+                        _p = _ROOT / _rpt.report_file_path if not _os.path.isabs(_rpt.report_file_path) else Path(_rpt.report_file_path)
+                        if _p.exists():
+                            _p.unlink()
+                            _deleted_html += 1
+                    except Exception:
+                        pass
+                db.delete(_rpt)
+            n = len(test_reports)
             if n:
                 tag = f"[{label}] " if label else ""
-                print(f"\n[conftest] {tag}Cleanup: deleted {n} report(s).")
+                html_note = f" (+{_deleted_html} HTML file(s))" if _deleted_html else ""
+                print(f"\n[conftest] {tag}Cleanup: deleted {n} report(s){html_note}.")
         except Exception as exc:
             print(f"\n[conftest] Report cleanup skipped (non-fatal): {exc}")
 
@@ -182,6 +200,29 @@ def _cleanup_test_data(label: str = ""):
                 print(f"\n[conftest] {tag}Cleanup: deleted {n_sr} scheduled report(s).")
         except Exception as exc:
             print(f"\n[conftest] ScheduledReport cleanup skipped (non-fatal): {exc}")
+
+        # 清理测试 Pilot 对话和消息（title 含测试前缀，或 extra_metadata.pilot_context 关联的报表被删）
+        try:
+            from backend.models.conversation import Conversation, Message
+            # 找出 title 匹配测试前缀的对话
+            test_convs = (
+                db.query(Conversation)
+                .filter(Conversation.title.op('~')(r'_[a-z][a-z0-9]*_'))
+                .all()
+            )
+            _conv_ids = [c.id for c in test_convs]
+            if _conv_ids:
+                db.query(Message).filter(
+                    Message.conversation_id.in_(_conv_ids)
+                ).delete(synchronize_session=False)
+                n_c = db.query(Conversation).filter(
+                    Conversation.id.in_(_conv_ids)
+                ).delete(synchronize_session=False)
+                if n_c:
+                    tag = f"[{label}] " if label else ""
+                    print(f"\n[conftest] {tag}Cleanup: deleted {n_c} conversation(s) with messages.")
+        except Exception as exc:
+            print(f"\n[conftest] Conversation cleanup skipped (non-fatal): {exc}")
 
         # 清理测试导入/导出任务（username 匹配测试前缀）
         try:

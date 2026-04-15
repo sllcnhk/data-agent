@@ -123,16 +123,43 @@ def _cleanup_test_data():
         from backend.models.user import User
         from backend.models.report import Report
         from backend.models.scheduled_report import ScheduledReport
+        from backend.models.schedule_run_log import ScheduleRunLog
+        from backend.models.conversation import Conversation, Message
 
-        # Remove reports owned by test users
+        # Remove reports owned by test users (name or username matches prefix)
         _g_db.query(Report).filter(
             Report.username.like(f"{_PREFIX}%")
         ).delete(synchronize_session=False)
 
-        # Remove scheduled reports owned by test users
-        _g_db.query(ScheduledReport).filter(
-            ScheduledReport.owner_username.like(f"{_PREFIX}%")
-        ).delete(synchronize_session=False)
+        # Remove scheduled reports + run logs owned by test users (FK order)
+        _test_sr_ids = [
+            row[0] for row in
+            _g_db.query(ScheduledReport.id)
+            .filter(ScheduledReport.owner_username.like(f"{_PREFIX}%"))
+            .all()
+        ]
+        if _test_sr_ids:
+            _g_db.query(ScheduleRunLog).filter(
+                ScheduleRunLog.scheduled_report_id.in_(_test_sr_ids)
+            ).delete(synchronize_session=False)
+            _g_db.query(ScheduledReport).filter(
+                ScheduledReport.id.in_(_test_sr_ids)
+            ).delete(synchronize_session=False)
+
+        # Remove Pilot conversations created during L3 tests (title contains prefix)
+        _test_conv_ids = [
+            row[0] for row in
+            _g_db.query(Conversation.id)
+            .filter(Conversation.title.like(f"%{_PREFIX}%"))
+            .all()
+        ]
+        if _test_conv_ids:
+            _g_db.query(Message).filter(
+                Message.conversation_id.in_(_test_conv_ids)
+            ).delete(synchronize_session=False)
+            _g_db.query(Conversation).filter(
+                Conversation.id.in_(_test_conv_ids)
+            ).delete(synchronize_session=False)
 
         # Remove test users (cascades UserRole etc.)
         _g_db.query(User).filter(

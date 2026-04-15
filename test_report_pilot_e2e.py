@@ -107,6 +107,31 @@ def _auth_headers() -> Dict[str, str]:
     return {"Authorization": "Bearer fake-jwt-token"}
 
 
+# ── 模块级 setup / teardown ──────────────────────────────────────────────────
+
+def setup_module(_module):
+    """模块启动：清理可能残留的 FastAPI dependency_overrides。"""
+    try:
+        from backend.main import app
+        app.dependency_overrides.clear()
+    except Exception:
+        pass
+
+
+def teardown_module(_module):
+    """
+    模块清理：重置 FastAPI dependency_overrides，防止污染其他测试模块。
+
+    本模块全部测试均使用 Mock DB（DATABASE_URL 指向假地址），不产生真实 DB 记录。
+    因此 teardown 不需要清理 DB；仅恢复应用依赖覆盖，避免全局状态泄漏。
+    """
+    try:
+        from backend.main import app
+        app.dependency_overrides.clear()
+    except Exception:
+        pass
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # P段 — GET /spec-meta 端点 HTTP 测试（10个）
 # ═══════════════════════════════════════════════════════════════════════════════
