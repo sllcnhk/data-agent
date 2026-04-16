@@ -1042,6 +1042,77 @@ async def refresh_report_data(
     )
 
 
+@router.post("/{report_id}/regenerate-html")
+async def regenerate_report_html(
+    report_id: str,
+    db: Session = Depends(get_db),
+    current_user=Depends(require_permission("reports", "create")),
+):
+    """
+    用最新 HTML 模板重新生成报表文件，并覆盖原文件。
+
+    适用场景：修复已有报表因旧版模板生成导致的 binds 格式错误、
+    筛选器不生效等问题，无需重新对话创建报表。
+
+    认证：需要 reports:create 权限；非 superadmin 只能重新生成自己的报表。
+    """
+    from backend.services.report_params_service import _normalize_binds as _nb
+
+    username = getattr(current_user, "username", "default")
+    is_superadmin = getattr(current_user, "is_superadmin", False)
+
+    report = _get_report_or_404(report_id, db)
+    _check_ownership(report, username, is_superadmin)
+
+    if not report.report_file_path:
+        raise HTTPException(status_code=400, detail="该报表无关联 HTML 文件，无法重新生成")
+
+    # 从 DB 中取 spec，归一化 binds
+    raw_filters = report.filters or []
+    normalized_filters = []
+    for _f in raw_filters:
+        _f2 = dict(_f)
+        if "binds" in _f2:
+            _f2["binds"] = _nb(_f2["binds"])
+        normalized_filters.append(_f2)
+
+    spec_for_html = {
+        "title": report.name or "分析报告",
+        "subtitle": report.description or "",
+        "theme": report.theme or "light",
+        "charts": report.charts or [],
+        "filters": normalized_filters,
+    }
+
+    try:
+        html_content = build_report_html(
+            spec=spec_for_html,
+            report_id=report_id,
+            refresh_token=report.refresh_token or "",
+            api_base_url=_api_base_url(),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"HTML 重新生成失败: {e}")
+
+    html_path = (_CUSTOMER_DATA_ROOT / report.report_file_path).resolve()
+    try:
+        html_path.parent.mkdir(parents=True, exist_ok=True)
+        html_path.write_text(html_content, encoding="utf-8")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"HTML 文件写入失败: {e}")
+
+    # 同步更新 DB 中存储的 filters（归一化后）
+    report.filters = normalized_filters
+    db.commit()
+
+    return {
+        "success": True,
+        "report_id": report_id,
+        "html_path": str(report.report_file_path),
+        "message": "HTML 文件已用最新模板重新生成，filters.binds 已归一化",
+    }
+
+
 # 模块级 ClickHouse 客户端缓存（env → client 实例，避免重复 TCP/HTTP 初始化）
 _ch_client_cache: Dict[str, Any] = {}
 

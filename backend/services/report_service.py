@@ -632,6 +632,16 @@ def create_report_with_spec(spec: Dict[str, Any], username: str) -> Dict[str, An
     title = (spec.get("title") or "").strip() or "分析报告"
     doc_type = spec.get("doc_type", "dashboard")
 
+    # ── 归一化 filters.binds：将 AI 可能传入的 list 格式转换为 dict 格式 ──────────
+    from backend.services.report_params_service import _normalize_binds as _nb
+    raw_filters = spec.get("filters", [])
+    normalized_filters = []
+    for _f in raw_filters:
+        _f2 = dict(_f)
+        if "binds" in _f2:
+            _f2["binds"] = _nb(_f2["binds"])
+        normalized_filters.append(_f2)
+
     # ── 生成唯一文件名 ──────────────────────────────────────────────────────────
     import time as _time
     _ts = _time.strftime("%Y%m%d%H%M%S")
@@ -651,7 +661,7 @@ def create_report_with_spec(spec: Dict[str, Any], username: str) -> Dict[str, An
             refresh_token=token,
             report_file_path=relative_path,
             charts=spec.get("charts", []),
-            filters=spec.get("filters", []),
+            filters=normalized_filters,
             theme=spec.get("theme", "light"),
             data_sources=spec.get("data_sources", []),
         )
@@ -660,9 +670,11 @@ def create_report_with_spec(spec: Dict[str, Any], username: str) -> Dict[str, An
         report_id = str(report.id)
 
         # ── 生成动态 HTML（report_id != "preview" → 不嵌入数据行） ──────────────
+        # 使用 normalized_filters 替换 spec 中的 filters，确保 HTML 内 binds 为 dict 格式
+        spec_for_html = {**spec, "filters": normalized_filters}
         try:
             html_content = build_report_html(
-                spec=spec,
+                spec=spec_for_html,
                 report_id=report_id,
                 refresh_token=token,
                 api_base_url=_api_base_url(),

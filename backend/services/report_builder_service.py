@@ -462,7 +462,16 @@ const _debouncedLoadData = debounce(_loadData, 300);
 function _currentParams() {
   const p = Object.assign({}, _DEFAULT_PARAMS);
   for (const fSpec of (REPORT_SPEC.filters || [])) {
-    const binds = fSpec.binds || {};
+    let binds = fSpec.binds || {};
+    // 兼容 AI 传入 list 格式 binds ["date_start","date_end"] → {start,end}
+    if (Array.isArray(binds)) {
+      const _b = {};
+      if (binds[0]) _b.start  = binds[0];
+      if (binds[1]) _b.end    = binds[1];
+      if (binds[2]) _b.value  = binds[2];
+      if (binds[3]) _b.values = binds[3];
+      binds = _b;
+    }
     if (!binds || Object.keys(binds).length === 0) continue;
     const val = _filterValues[fSpec.id];
     if (!val) continue;
