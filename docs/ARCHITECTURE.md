@@ -2,7 +2,7 @@
 
 > **适用对象**：LLM 模型（Claude Code / 其他 AI）、新加入开发者
 > **目的**：快速理解系统整体架构、模块职责、数据流向和交互接口
-> **最后更新**：2026-04-15（**v2.11 参数化动态报表 + 渲染修复**：`GET /reports/{id}/data`（refresh_token 鉴权，Jinja2 SQL 引擎，动态 ClickHouse 查询）+ `report_params_service.py`（render_sql / extract_default_params / compute_params_from_binds）+ `_autoDetectFields` JS 函数（缺字段时自动推断 x_field/y_fields/series_field）+ `echarts_override.series` 系列模板 merge 修复（防止样式模板覆盖数据数组）；无 DB 迁移；**v2.10 报表增强**：图表控件 ⋮ 菜单（Force Refresh / Fullscreen / View Query / Download）+ `GET /reports/{id}/spec-meta`（refresh_token 鉴权，无 JWT）+ `PUT /reports/{id}/charts/{chart_id}`（单图表 merge 更新）+ `ReportToolMCPServer`（3 MCP 工具）+ `ReportViewerPage`（`/report-view` 分屏页）+ Pilot 一对一绑定（upsert）；无 DB 迁移；**v2.9 2026-04-14**：AI Pilot 实时助手；**v2.5 2026-04-13**：数据管理中心 + 定时推送任务；**v2.4 2026-04-13**：多图表 HTML 报告生成）
+> **最后更新**：2026-04-16（**v2.11.1 动态报表 "Failed to fetch" 三大根因修复**：API_BASE IIFE+window.location.origin 回退（report_builder_service.py + report_service.py）+ connection_env 前缀剥离（reports.py:_get_or_init_ch_client）+ binds list→dict 容错（report_params_service.py:_normalize_binds）；测试：test_report_fetch_e2e.py 60 tests + test_dynamic_report_fetch.py G1-G4 24 tests；**v2.11 参数化动态报表 + 渲染修复**：`GET /reports/{id}/data`（refresh_token 鉴权，Jinja2 SQL 引擎，动态 ClickHouse 查询）+ `report_params_service.py`（render_sql / extract_default_params / compute_params_from_binds）+ `_autoDetectFields` JS 函数（缺字段时自动推断 x_field/y_fields/series_field）+ `echarts_override.series` 系列模板 merge 修复（防止样式模板覆盖数据数组）；无 DB 迁移；**v2.10 报表增强**：图表控件 ⋮ 菜单（Force Refresh / Fullscreen / View Query / Download）+ `GET /reports/{id}/spec-meta`（refresh_token 鉴权，无 JWT）+ `PUT /reports/{id}/charts/{chart_id}`（单图表 merge 更新）+ `ReportToolMCPServer`（3 MCP 工具）+ `ReportViewerPage`（`/report-view` 分屏页）+ Pilot 一对一绑定（upsert）；无 DB 迁移；**v2.9 2026-04-14**：AI Pilot 实时助手；**v2.5 2026-04-13**：数据管理中心 + 定时推送任务；**v2.4 2026-04-13**：多图表 HTML 报告生成）
 
 ---
 
@@ -106,7 +106,7 @@ data-agent/
 │   │   ├── notification_log.py     # ★ NotificationLog（通知渠道发送记录）
 │   │   └── ...                     # 其他模型（Conversation/Message/Task/Report 等）
 │   ├── scripts/
-│   │   ├── init_rbac.py            # ★ 初始化 4 角色 + 18 权限（幂等，首次部署运行）
+│   │   ├── init_rbac.py            # ★ 初始化 4 角色 + 21 权限（幂等，首次部署运行；含 reports:*/schedules:* 权限）
 │   │   ├── migrate_data_import.py  # ★ 创建 import_jobs 表 + 种子 data:import 权限（幂等）
 │   │   ├── migrate_data_export.py  # ★ 创建 export_jobs 表 + 种子 data:export 权限（幂等）
 │   │   └── migrate_datacenter_v1.py # ★ 创建 scheduled_reports/run_logs/notification_logs 表 + reports 新增字段（幂等）
@@ -1312,6 +1312,53 @@ GET /api/v1/reports/{id}/data?token=<refresh_token>
 
 **无 DB 迁移**：使用已有 `reports.charts` JSONB（含 SQL 模板 + x_field/y_fields 等字段）和 `reports.filters` JSONB（含 binds 字段）；无新列。
 
+### 4.25 动态报表"Failed to fetch"根因修复（v2.11.1，2026-04-16）
+
+动态报表在 iframe 预览时，图表数据显示"查询失败: Failed to fetch"。根因与修复如下：
+
+**根因 A：API_BASE 跨域硬编码**
+
+报表 HTML 中 `API_BASE` 原硬编码为 `"http://localhost:8000/api/v1"`，iframe 在 Vite 代理（端口 3000→8000）中访问时触发浏览器 CORS 跨域拦截。
+
+```
+旧行为：const API_BASE = "http://localhost:8000/api/v1";  ← 硬编码，跨域
+新行为：const API_BASE = (function(){
+  var h = "{api_base_url}";  ← 生产 PUBLIC_HOST 值（有则用）
+  return h || (window.location.origin + '/api/v1');  ← 无则回退到同域
+})();
+```
+
+- `report_service.py:_api_base_url()` 在无 `PUBLIC_HOST` 时返回 `""` 而非 `"http://localhost:8000/api/v1"`，使 IIFE 触发 `window.location.origin` 回退路径
+- `report_builder_service.py`：HTML 模板改为 IIFE 模式
+
+**根因 B：connection_env 带 `clickhouse-` 前缀**
+
+LLM 有时生成 `"connection_env": "clickhouse-sg"` 而非正确的 `"sg"`，导致 `_get_or_init_ch_client()` 在 `_ch_client_cache` 中找不到键，初始化失败。
+
+修复（`backend/api/reports.py:_get_or_init_ch_client()`）：
+
+```python
+# 兼容 AI 传入 "clickhouse-sg" / "clickhouse-sg-azure" 等带前缀格式
+if env.startswith("clickhouse-"):
+    env = env[len("clickhouse-"):]
+```
+
+**根因 C：binds 字段传 list 而非 dict**
+
+LLM 有时生成 `"binds": ["date_start", "date_end"]`（list 格式），而 `extract_default_params()` 调用 `f.get("binds", {})` 后直接使用 `binds.get("start", ...)` — list 没有 `.get()` 方法，导致 `AttributeError`。
+
+修复（`backend/services/report_params_service.py`）：新增 `_normalize_binds(binds: Any) -> Dict[str, str]` 辅助函数，自动将 list 转换为 dict（list[0] → `"start"`，list[1] → `"end"`），两个消费函数均已改用 `_normalize_binds` 替代直接 `f.get("binds", {})`。
+
+**根因 D：skill 文件缺少格式警告**
+
+`.claude/skills/project/clickhouse-analyst.md` 已在"零-B"节后补充：
+- `⚠️ connection_env 格式`：必须是环境短名（`sg`、`idn`），不能带 `clickhouse-` 前缀
+- `⚠️ binds 格式`：必须是 dict `{"start": "date_start", "end": "date_end"}`，不能是 list
+
+**测试**：`test_report_fetch_e2e.py`（60 tests，H-O 段：FastAPI TestClient / SQL 参数 / Jinja2 渲染 / HTML Builder / 权限矩阵 / E2E / 边界 / 异步 ClickHouse 客户端）+ `test_dynamic_report_fetch.py`（G1–G4 新增 24 tests：API_BASE / connection_env / binds / skill 四层验证，共 60 tests）
+
+**无 DB 迁移**；无新权限键；无新环境变量。
+
 ---
 
 ## 5. SSE 事件类型参考
@@ -1428,7 +1475,7 @@ GET /api/v1/reports/{id}/data?token=<refresh_token>
 ### 权限 `/permissions`
 | 方法 | 路径 | 权限要求 | 说明 |
 |------|------|---------|------|
-| GET | `/permissions` | `users:read` | 全量权限定义列表（共 18 条，含 resource/action/description）|
+| GET | `/permissions` | `users:read` | 全量权限定义列表（共 21 条，含 resource/action/description；13 RBAC基础 + data:import/export + reports:read/create/delete + schedules:read/write/admin）|
 
 ### 文件下载 `/files`
 

@@ -202,7 +202,7 @@ async def list_all_users_conversations(
 @router.get("", response_model=ConversationListResponse, summary="获取对话列表")
 async def list_conversations(
     status: Optional[str] = Query(default="active", description="状态筛选"),
-    limit: int = Query(default=50, ge=1, le=100),
+    limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
     current_user=Depends(get_current_user),

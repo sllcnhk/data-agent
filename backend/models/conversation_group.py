@@ -27,7 +27,7 @@ class ConversationGroup(Base):
     icon = Column(String(50), comment="图标（emoji或图标名）")
     color = Column(String(20), comment="颜色标识")
     sort_order = Column(Integer, default=0, comment="排序顺序，数字越小越靠前")
-    is_expanded = Column(Boolean, default=True, comment="是否展开（前端状态）")
+    is_expanded = Column(Boolean, default=False, comment="是否展开（前端状态）；新分组默认折叠")
     conversation_count = Column(Integer, default=0, comment="对话数量（冗余字段）")
     created_at = Column(DateTime, default=datetime.utcnow, comment="创建时间")
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, comment="更新时间")

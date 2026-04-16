@@ -136,6 +136,7 @@ export interface Conversation {
   created_at: string;
   updated_at: string;
   last_message_at?: string;
+  extra_metadata?: Record<string, any>;
 }
 
 interface ChatState {

@@ -462,15 +462,28 @@ class AgenticLoop:
                             },
                         )
 
-                        # 检测 report tool 调用：收集报表更新记录，供 files_written 事件使用
+                        # 检测 report tool 调用：收集报表更新/创建记录，供 files_written 事件使用
                         if (
-                            tool_name in ("report__update_spec", "report__update_single_chart")
+                            tool_name in ("report__update_spec", "report__update_single_chart", "report__create")
                             and raw_result.get("success", False)
                         ):
-                            result_data = raw_result if isinstance(raw_result, dict) else {}
-                            report_id_val = result_data.get("report_id", tool_input.get("report_id", ""))
-                            refresh_token_val = result_data.get("refresh_token", tool_input.get("token", ""))
-                            report_name_val = result_data.get("name", "报表")
+                            # raw_result = MCPResponse.to_dict() = {success, data, error, traceback}
+                            # 工具实际返回字段在 raw_result["data"] 中，不在外层
+                            _outer = raw_result if isinstance(raw_result, dict) else {}
+                            result_data = _outer.get("data") or {}
+                            if not isinstance(result_data, dict):
+                                result_data = {}
+                            # report_id / refresh_token: 优先从 result_data 取（create 场景）
+                            # 兜底从 tool_input 取（update_* 场景：input 含 report_id / token）
+                            report_id_val = (
+                                result_data.get("report_id")
+                                or tool_input.get("report_id", "")
+                            )
+                            refresh_token_val = (
+                                result_data.get("refresh_token")
+                                or tool_input.get("token", "")
+                            )
+                            report_name_val = result_data.get("name") or "报表"
                             written_files.append({
                                 # path 设为虚拟标识，前端通过 pinned_report_id 走 /reports/{id}/html 路径，不走 html-serve
                                 "path": f"__report__/{report_id_val}",
@@ -861,7 +874,11 @@ class AgenticLoop:
                         _date_hint = ""
                     path_rule = (
                         f"- 路径规则（必须严格遵循，禁止混用两类根目录）：\n"
-                        f"  • 数据文件（CSV/JSON/SQL/分析结果等）→ 写入 {user_data_root}/\n"
+                        f"  • HTML 图表报表（含 ECharts 可视化）→ 写入 {user_data_root}/reports/\n"
+                        f"    ⚠️ 用户请求含图表类型词（堆积图/折线图/柱状图/面积图/饼图/散点图/可视化/图表/chart）\n"
+                        f"       必须生成 .html 文件，禁止用 .md 替代\n"
+                        f"  • 纯文字分析报告（无图表，Markdown 格式）→ 写入 {user_data_root}/\n"
+                        f"  • 数据文件（CSV/JSON/SQL）→ 写入 {user_data_root}/\n"
                         f"    （每位用户数据存储在独立子目录，禁止写入其他用户目录）\n"
                         f"{_date_hint}"
                         f"  • 用户技能文件（*.md SKILL格式）→ 写入 {skills_root}/user/{current_username}/\n"

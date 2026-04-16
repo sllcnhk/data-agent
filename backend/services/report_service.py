@@ -585,12 +585,15 @@ _svc_logger = logging.getLogger(__name__)
 
 
 def _api_base_url() -> str:
-    """推断后端 API 前缀（与 reports.py 保持一致）。"""
+    """推断后端 API 前缀（与 reports.py 保持一致）。
+
+    无 PUBLIC_HOST 时返回空字符串，让前端 HTML 通过 window.location.origin 自动推断，
+    避免 iframe 跨域问题（Vite dev proxy 下 iframe 同源为 localhost:3000）。
+    """
     host = os.environ.get("PUBLIC_HOST", "")
-    port = os.environ.get("PORT", "8000")
     if host:
         return f"{host}/api/v1"
-    return f"http://localhost:{port}/api/v1"
+    return ""
 
 
 def _get_customer_data_root() -> _Path:
@@ -600,6 +603,97 @@ def _get_customer_data_root() -> _Path:
         if settings.allowed_directories
         else _Path("customer_data")
     )
+
+
+def create_report_with_spec(spec: Dict[str, Any], username: str) -> Dict[str, Any]:
+    """
+    根据 spec 创建新报表：在 DB 注册记录 + 生成动态 HTML 文件。
+
+    HTML 采用"动态加载模式"（build_report_html report_id != 'preview'），
+    打开时自动调用 GET /reports/{id}/data 实时查询 ClickHouse，无嵌入静态数据。
+
+    Args:
+        spec:     完整报表 spec（title/subtitle/theme/charts[]/filters[]）
+        username: 当前用户名（CURRENT_USER）
+
+    Returns:
+        {report_id, refresh_token, name, html_path, message}
+
+    Raises:
+        RuntimeError: HTML 生成或文件写入失败
+    """
+    from backend.config.database import get_db_context
+    from backend.models.report import Report as _Report, ReportType as _ReportType
+    from backend.services.report_builder_service import build_report_html, generate_refresh_token
+
+    if not isinstance(spec, dict):
+        raise ValueError("spec 必须是 JSON 对象")
+
+    title = (spec.get("title") or "").strip() or "分析报告"
+    doc_type = spec.get("doc_type", "dashboard")
+
+    # ── 生成唯一文件名 ──────────────────────────────────────────────────────────
+    import time as _time
+    _ts = _time.strftime("%Y%m%d%H%M%S")
+    _safe_title = re.sub(r"[^\w\u4e00-\u9fff-]", "_", title)[:40]
+    file_name = f"{_safe_title}_{_ts}.html"
+    relative_path = f"{username}/reports/{file_name}"
+
+    with get_db_context() as db:
+        token = generate_refresh_token()
+
+        report = _Report(
+            name=title,
+            description=spec.get("subtitle", ""),
+            report_type=_ReportType.DASHBOARD,
+            doc_type=doc_type,
+            username=username,
+            refresh_token=token,
+            report_file_path=relative_path,
+            charts=spec.get("charts", []),
+            filters=spec.get("filters", []),
+            theme=spec.get("theme", "light"),
+            data_sources=spec.get("data_sources", []),
+        )
+        db.add(report)
+        db.flush()  # 获取自动生成的 UUID
+        report_id = str(report.id)
+
+        # ── 生成动态 HTML（report_id != "preview" → 不嵌入数据行） ──────────────
+        try:
+            html_content = build_report_html(
+                spec=spec,
+                report_id=report_id,
+                refresh_token=token,
+                api_base_url=_api_base_url(),
+            )
+        except Exception as e:
+            raise RuntimeError(f"HTML 生成失败: {e}") from e
+
+        customer_root = _get_customer_data_root()
+        html_path = customer_root / relative_path
+        html_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            html_path.write_text(html_content, encoding="utf-8")
+        except Exception as e:
+            raise RuntimeError(f"HTML 文件写入失败: {e}") from e
+
+        db.commit()
+
+    _svc_logger.info(
+        "[create_report_with_spec] 报表已创建: id=%s name=%s user=%s path=%s",
+        report_id, title, username, relative_path,
+    )
+    return {
+        "report_id": report_id,
+        "refresh_token": token,
+        "name": title,
+        "html_path": relative_path,
+        "message": (
+            f"报表《{title}》已创建（{len(spec.get('charts', []))} 个图表），"
+            f"打开时自动实时查询数据库，无需嵌入静态数据。"
+        ),
+    }
 
 
 def _extract_spec_via_report_spec_marker(content: str) -> "Dict[str, Any] | None":

@@ -201,22 +201,46 @@ def _cleanup_test_data(label: str = ""):
         except Exception as exc:
             print(f"\n[conftest] ScheduledReport cleanup skipped (non-fatal): {exc}")
 
-        # 清理测试 Pilot 对话和消息（title 含测试前缀，或 extra_metadata.pilot_context 关联的报表被删）
+        # 清理测试 Pilot 对话和消息
+        # 策略 1：通过 user_id 精准删测试用户的对话（避免误伤真实数据）
+        # 策略 2：对 null user_id（匿名/default 用户）的对话，用严格锚定正则仅匹配
+        #         以完整测试前缀开头的标题（格式: ^_[a-z][a-z0-9]+_[0-9a-f]{6}_，
+        #         如 _ci_abc123_、_pilot_def456_），杜绝误匹配含下划线的真实报表名
         try:
             from backend.models.conversation import Conversation, Message
-            # 找出 title 匹配测试前缀的对话
-            test_convs = (
-                db.query(Conversation)
-                .filter(Conversation.title.op('~')(r'_[a-z][a-z0-9]*_'))
+
+            _conv_ids = set()
+
+            # 策略 1：找出测试用户（先拿 ID，稍后统一删）
+            test_user_ids = [u.id for u in db.query(User).all()
+                             if u.username not in _PROTECTED_USERS and _is_test_entity(u.username)]
+            if test_user_ids:
+                user_conv_ids = [
+                    c.id for c in db.query(Conversation.id)
+                    .filter(Conversation.user_id.in_(test_user_ids))
+                    .all()
+                ]
+                _conv_ids.update(user_conv_ids)
+
+            # 策略 2：null user_id + 标题严格以测试前缀开头
+            # 正则 ^_[a-z][a-z0-9]+_[0-9a-f]{6}_ 要求含6位hex，避免匹配 _sales_ 等正常词
+            anon_conv_ids = [
+                c.id for c in db.query(Conversation.id)
+                .filter(
+                    Conversation.user_id.is_(None),
+                    Conversation.title.op('~')(r'^_[a-z][a-z0-9]+_[0-9a-f]{6}_'),
+                )
                 .all()
-            )
-            _conv_ids = [c.id for c in test_convs]
+            ]
+            _conv_ids.update(anon_conv_ids)
+
             if _conv_ids:
+                conv_id_list = list(_conv_ids)
                 db.query(Message).filter(
-                    Message.conversation_id.in_(_conv_ids)
+                    Message.conversation_id.in_(conv_id_list)
                 ).delete(synchronize_session=False)
                 n_c = db.query(Conversation).filter(
-                    Conversation.id.in_(_conv_ids)
+                    Conversation.id.in_(conv_id_list)
                 ).delete(synchronize_session=False)
                 if n_c:
                     tag = f"[{label}] " if label else ""

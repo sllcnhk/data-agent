@@ -31,6 +31,40 @@ class ReportToolMCPServer(BaseMCPServer):
         self._register_tools()
 
     def _register_tools(self) -> None:
+        # ── create ────────────────────────────────────────────────────────────
+        self.register_tool(
+            name="create",
+            description=(
+                "创建新报表：在数据库注册报表记录并生成动态 HTML 文件。\n"
+                "HTML 打开时自动实时查询 ClickHouse（Jinja2 参数化 SQL），无静态嵌入数据。\n"
+                "适用场景：用户要求生成图表类报表（堆积图/折线图/柱状图等）时使用。\n"
+                "⚠️ 不要用 filesystem__write_file 写 HTML 报表，改用此工具。\n"
+                "调用后得到 report_id + refresh_token，无需额外操作，报表已自动生成。"
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "spec": {
+                        "type": "object",
+                        "description": (
+                            "完整报表 spec。必填字段：\n"
+                            "  title: 报表名称\n"
+                            "  charts[]: 图表列表，每个图表含 id/chart_type/title/sql/connection_env/"
+                            "x_field/y_fields/series_field\n"
+                            "  filters[]: 筛选器列表（推荐含 date_range 筛选器，binds date_start/date_end）\n"
+                            "可选字段：subtitle/theme(light|dark)/data_sources[]"
+                        ),
+                    },
+                    "username": {
+                        "type": "string",
+                        "description": "当前用户名（系统提示中的 CURRENT_USER 值）",
+                    },
+                },
+                "required": ["spec", "username"],
+            },
+            callback=self._create,
+        )
+
         # ── get_spec ──────────────────────────────────────────────────────────
         self.register_tool(
             name="get_spec",
@@ -125,6 +159,48 @@ class ReportToolMCPServer(BaseMCPServer):
         )
 
     # ── 工具实现 ───────────────────────────────────────────────────────────────
+
+    async def _create(self, spec: Any, username: str) -> Dict[str, Any]:
+        """创建新报表（生成 DB 记录 + 动态 HTML 文件）。"""
+        if isinstance(spec, str):
+            try:
+                spec = json.loads(spec)
+            except json.JSONDecodeError as e:
+                return {"success": False, "error": f"spec JSON 解析失败: {e}"}
+
+        if not isinstance(spec, dict):
+            return {"success": False, "error": "spec 必须是 JSON 对象"}
+
+        if not username or not isinstance(username, str):
+            return {"success": False, "error": "username 不能为空"}
+
+        charts = spec.get("charts") or []
+        if not charts:
+            return {"success": False, "error": "spec.charts 不能为空，至少需要一个图表"}
+
+        try:
+            from backend.services.report_service import create_report_with_spec
+            result = create_report_with_spec(spec=spec, username=username.strip())
+            chart_count = len(charts)
+            logger.info(
+                "[ReportTool] create 成功: report_id=%s user=%s charts=%d",
+                result["report_id"], username, chart_count,
+            )
+            return {
+                "success": True,
+                "report_id": result["report_id"],
+                "refresh_token": result["refresh_token"],
+                "name": result["name"],
+                "html_path": result["html_path"],
+                "chart_count": chart_count,
+                "message": result["message"],
+            }
+        except (ValueError, RuntimeError) as e:
+            logger.error("[ReportTool] create 失败: user=%s err=%s", username, e)
+            return {"success": False, "error": str(e)}
+        except Exception as e:
+            logger.error("[ReportTool] create 意外错误: %s", e, exc_info=True)
+            return {"success": False, "error": f"创建失败：{e}"}
 
     async def _get_spec(self, report_id: str, token: str) -> Dict[str, Any]:
         """读取报表当前 spec。"""

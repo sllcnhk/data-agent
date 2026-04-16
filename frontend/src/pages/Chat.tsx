@@ -141,7 +141,7 @@ const Chat: React.FC = () => {
       // 加载对话列表
       const convsRes = await conversationApi.listConversations({
         status: 'active',
-        limit: 50
+        limit: 200
       });
       if (convsRes.conversations) {
         setConversations(convsRes.conversations);
@@ -506,7 +506,12 @@ const Chat: React.FC = () => {
   };
 
   const handleToggleGroupExpand = (groupId: string) => {
-    toggleGroupExpand(groupId);
+    // 先获取当前状态，再翻转，用于持久化
+    const currentGroup = groups.find((g) => g.id === groupId);
+    const newExpanded = currentGroup ? !currentGroup.is_expanded : true;
+    toggleGroupExpand(groupId);  // 立即更新本地 Zustand（UI 无感刷新）
+    // 静默持久化到后端，失败不影响本地操作
+    groupApi.updateGroup(groupId, { is_expanded: newExpanded }).catch(() => {});
   };
 
   // 对话相关操作

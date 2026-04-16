@@ -1,6 +1,6 @@
 # 部署指南
 
-> 版本：v2.11 · 2026-04-15（**参数化动态报表 + 渲染修复**：`GET /reports/{id}/data`（Jinja2 SQL 引擎 + ClickHouse 动态查询）+ `_autoDetectFields` 字段自动检测 + `echarts_override.series` 系列模板修复；**无 DB 迁移**，无新环境变量，复用已有 `reports.charts`/`reports.filters` JSONB 字段；v2.10 · 2026-04-15：**报表增强**：图表控件 ⋮ 菜单 + `GET /spec-meta` + `PUT /charts/{chart_id}` + `ReportToolMCPServer` + `ReportViewerPage` + Pilot 一对一绑定；**无 DB 迁移**，复用已有 `reports.charts` JSONB + `reports.version_seq`；v2.9 · 2026-04-14：**AI Pilot 实时助手**：三入口 Co-pilot；无 DB 迁移；v2.6 · 2026-04-14：**对话报表手动固定 Pin**：`POST /reports/pin`；无 DB 迁移；v2.5 · 2026-04-13：**数据管理中心**：`migrate_datacenter_v1.py` DB 迁移；v2.4 · 2026-04-13：**多图表 HTML 报告生成**：`migrate_reports_enhancement.py` + `migrate_reports_permissions.py`）
+> 版本：v2.11.1 · 2026-04-16（**动态报表 "Failed to fetch" 三大根因修复**：A：API_BASE IIFE+window.location.origin（report_builder_service.py + report_service.py）/ B：connection_env 前缀剥离（reports.py:_get_or_init_ch_client）/ C：binds list→dict 容错（report_params_service.py:_normalize_binds）；**无 DB 迁移**，无新环境变量；v2.11 · 2026-04-15：**参数化动态报表 + 渲染修复**：`GET /reports/{id}/data`（Jinja2 SQL 引擎 + ClickHouse 动态查询）+ `_autoDetectFields` 字段自动检测 + `echarts_override.series` 系列模板修复；**无 DB 迁移**，无新环境变量，复用已有 `reports.charts`/`reports.filters` JSONB 字段；v2.10 · 2026-04-15：**报表增强**：图表控件 ⋮ 菜单 + `GET /spec-meta` + `PUT /charts/{chart_id}` + `ReportToolMCPServer` + `ReportViewerPage` + Pilot 一对一绑定；**无 DB 迁移**，复用已有 `reports.charts` JSONB + `reports.version_seq`；v2.9 · 2026-04-14：**AI Pilot 实时助手**：三入口 Co-pilot；无 DB 迁移；v2.6 · 2026-04-14：**对话报表手动固定 Pin**：`POST /reports/pin`；无 DB 迁移；v2.5 · 2026-04-13：**数据管理中心**：`migrate_datacenter_v1.py` DB 迁移；v2.4 · 2026-04-13：**多图表 HTML 报告生成**：`migrate_reports_enhancement.py` + `migrate_reports_permissions.py`）
 >
 > 本文档说明如何将数据智能分析 Agent 系统从 Windows 开发环境迁移到 Linux 服务器，供团队多人共用。
 
@@ -256,7 +256,7 @@ EOF
 python -m alembic upgrade head
 
 # 初始化 RBAC 角色和权限数据（幂等，重复运行无副作用）
-# 写入 4 个预置角色（viewer/analyst/admin/superadmin）和 18 条权限定义（含 reports:read/create/delete）
+# 写入 4 个预置角色（viewer/analyst/admin/superadmin）和 21 条权限定义（含 reports:read/create/delete + schedules:read/write/admin）
 # ENABLE_AUTH=true 时必须执行；ENABLE_AUTH=false 时可跳过
 python backend/scripts/init_rbac.py
 
@@ -1022,7 +1022,7 @@ SESSION_IDLE_TIMEOUT_MINUTES=120       # Session 空闲超时；超时后 /auth/
 | `viewer` | 只读用户 | `chat:use` |
 | `analyst` | 数据分析师 | `chat:use` + `skills.user:读写` + `skills.project/system:读` |
 | `admin` | 管理员 | analyst 全部 + `skills.project:写` + `models:读` + `settings:读` + `settings:写`（**无** `users:*`）|
-| `superadmin` | 超级管理员 | 全部 15 项权限（含 `users:读写/角色分配`、`data:import/export`），`is_superadmin=true` |
+| `superadmin` | 超级管理员 | 全部 21 项权限（含 `users:读写/角色分配`、`data:import/export`、`reports:read/create/delete`、`schedules:read/write/admin`），`is_superadmin=true` |
 
 > **注意**：`admin` 角色无用户管理权限（无 `users:read/write/assign_role`）。用户管理功能仅 `is_superadmin=true` 的账号可用。
 
@@ -1449,6 +1449,20 @@ client_max_body_size 100m;
 4. **AI 无法识别**：Claude API 对图片识别支持最好；PDF 仅提供文本内容（无图片提取）；文本文件会被解码并注入为文本块。若 AI 返回「无法读取文件内容」，检查文件是否为有效的 UTF-8 编码文本。
 
 5. **Windows 系统 MIME 类型问题**：部分系统 `file.type` 为空字符串，前端会按文件扩展名推断 MIME（如 `.md` → `text/markdown`）。若仍失败，检查浏览器控制台是否有 JavaScript 错误。
+
+---
+
+### Q: 参数化动态报表的图表区域显示"查询失败: Failed to fetch"
+
+**A:** 此问题已在 v2.11.1（2026-04-16）修复。若仍遇到，确认后端已更新到最新代码。三个已知根因：
+
+1. **API_BASE 跨域**（最常见，开发环境）：开发模式下 HTML 的 `API_BASE` 原硬编码为 `http://localhost:8000/api/v1`，Vite 代理将其识别为跨域请求并被浏览器阻断。修复后 HTML 使用 IIFE 自动回退到 `window.location.origin + '/api/v1'`，始终保持同源。生产环境（Nginx 反代）不受此影响，但仍建议在 `.env` 中设置 `PUBLIC_HOST=https://your-domain.com` 以生成正确的绝对路径。
+
+2. **connection_env 带 `clickhouse-` 前缀**：AI 生成报表时若传入 `"connection_env": "clickhouse-sg"` 而非 `"sg"`，服务端会找不到对应 ClickHouse 环境。修复后服务端自动剥离 `clickhouse-` 前缀，历史报表无需修改。
+
+3. **binds 传 list 格式**：AI 生成报表时若传入 `"binds": ["date_start","date_end"]`（list）而非正确的 `{"start":"date_start","end":"date_end"}`（dict），服务端会 crash。修复后 `_normalize_binds()` 自动转换。
+
+若问题仍未解决，检查后端日志中是否有 `ClickHouseMCPServer initialize failed` 错误，以及报表的 `connection_env` 字段值（不应带 `clickhouse-` 前缀）。
 
 ---
 

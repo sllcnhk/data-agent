@@ -218,7 +218,7 @@ const REPORT_SPEC      = {spec_json};
 const REPORT_DATA      = {data_json};        // 预览模式有数据；保存模式为 {{}}
 const REPORT_ID        = "{report_id}";
 const REFRESH_TOKEN    = "{refresh_token}";
-const API_BASE         = "{api_base_url.rstrip('/')}";
+const API_BASE         = (function(){{ var h = "{api_base_url.rstrip('/')}"; return h || (window.location.origin + '/api/v1'); }})();
 const PALETTE          = REPORT_SPEC.palette;
 const _DEFAULT_PARAMS  = {default_params_json};  // 从 filter 默认值计算的 SQL 参数
 

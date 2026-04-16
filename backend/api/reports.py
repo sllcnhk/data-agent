@@ -1051,7 +1051,12 @@ async def _get_or_init_ch_client(env: str) -> Any:
     获取或初始化指定 env 的 ClickHouse 客户端（带模块级缓存）。
 
     优先使用 TCP（native）连接，失败自动回退 HTTP，逻辑与 ClickHouseMCPServer.initialize() 一致。
+
+    connection_env 兼容处理：AI 可能传 "clickhouse-sg" 而非 "sg"，此处自动去掉前缀。
     """
+    # 兼容 AI 传入 "clickhouse-sg" / "clickhouse-sg-azure" 等带前缀格式
+    if env.startswith("clickhouse-"):
+        env = env[len("clickhouse-"):]
     if env not in _ch_client_cache:
         from backend.mcp.clickhouse.server import ClickHouseMCPServer
         srv = ClickHouseMCPServer(env=env)

@@ -67,6 +67,33 @@ def render_sql(template: str, params: Dict[str, Any]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# binds 格式兼容
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _normalize_binds(binds: Any) -> Dict[str, str]:
+    """
+    将 binds 统一转换为 dict 格式。
+
+    AI 有时会传 list 格式（如 ["date_start", "date_end"]），正确格式是
+    dict（如 {"start": "date_start", "end": "date_end"}）。
+    此函数做容错兼容：
+      list[0] → start, list[1] → end（date_range 惯例）
+    """
+    if isinstance(binds, dict):
+        return binds
+    if isinstance(binds, list):
+        result: Dict[str, str] = {}
+        if len(binds) >= 1:
+            result["start"] = str(binds[0])
+        if len(binds) >= 2:
+            result["end"] = str(binds[1])
+        if len(binds) >= 3:
+            result["value"] = str(binds[2])
+        return result
+    return {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 默认参数提取（页面初次加载）
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -87,7 +114,7 @@ def extract_default_params(spec: Dict[str, Any]) -> Dict[str, Any]:
     for f in spec.get("filters", []):
         ftype = f.get("type", "select")
         fid = f.get("id", "")
-        binds: Dict[str, str] = f.get("binds", {})
+        binds: Dict[str, str] = _normalize_binds(f.get("binds", {}))
 
         if ftype == "date_range":
             default_days = int(f.get("default_days", 30))
@@ -140,7 +167,7 @@ def compute_params_from_binds(
     for f in filter_specs:
         fid = f.get("id", "")
         ftype = f.get("type", "select")
-        binds: Dict[str, str] = f.get("binds", {})
+        binds: Dict[str, str] = _normalize_binds(f.get("binds", {}))
         val = filter_values.get(fid)
 
         if val is None:

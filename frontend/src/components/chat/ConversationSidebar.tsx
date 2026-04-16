@@ -8,6 +8,7 @@ import {
   Modal,
   Popconfirm,
   Spin,
+  Tag,
   Tabs,
   Tooltip,
   message,
@@ -124,6 +125,7 @@ const ConversationSidebar: React.FC<ConversationSidebarProps> = ({
 
   // 渲染单个对话
   const renderConversation = (conv: Conversation, paddingLeft = 12) => {
+    const isPilot = conv.extra_metadata?.context_type === 'report';
     const moveToGroupMenuItems = [
       {
         key: 'ungrouped',
@@ -224,10 +226,19 @@ const ConversationSidebar: React.FC<ConversationSidebarProps> = ({
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',
                   whiteSpace: 'nowrap',
+                  flex: 1,
                 }}
               >
                 {conv.title}
               </span>
+              {isPilot && (
+                <Tag
+                  color="blue"
+                  style={{ fontSize: 10, padding: '0 4px', lineHeight: '16px', marginLeft: 4, flexShrink: 0 }}
+                >
+                  Pilot
+                </Tag>
+              )}
             </div>
             <div
               style={{
