@@ -102,9 +102,23 @@ end
 
 ---
 
-### 规则 4：测试企业标准过滤（必须同时附加）
+### 规则 4：测试企业标准过滤（必须先关联企业维表，再过滤）
 
 ```sql
+LEFT JOIN (
+    SELECT
+        Environment,
+        Enterprise_ID,
+        Enterprise_Name,
+        Create_User,
+        Unique_ID_Latest_Create,
+        Name_Test_Flag AS test_flag
+    FROM integrated_data.Dim_Enterprise ent FINAL
+    WHERE ent.statistic_is_delete = 0
+) ent
+    ON ent.Environment = bb.SaaS
+   AND ent.Enterprise_ID = bb.enterprise_id
+
 WHERE ent.test_flag = 0
   AND ent.Enterprise_Name not ilike '%zhujinli%'
   AND ent.Enterprise_Name not ilike '%zhouli%'
@@ -112,6 +126,7 @@ WHERE ent.test_flag = 0
   AND ent.Enterprise_Name not ilike '%PM_XUNLIN%'
 ```
 
+> 汇集库（`integrated_data`）查询企业维度时，必须按 `Environment + Enterprise_ID` 关联 `Dim_Enterprise`，并将 `Name_Test_Flag` 映射为 `test_flag`。
 > `test_flag` 来源：`Dim_Enterprise.Name_Test_Flag`（字段别名 `test_flag`）。
 > 4 个 hardcode 名称为历史测试企业，`test_flag` 未及时标记，需手动排除。
 
@@ -171,6 +186,32 @@ WHERE s_day >= toDate('2024-07-01T00:00:00')
 ```
 
 > ⚠️ SQL 中出现 `s_day >= toDate('2023-09-01')` 的旧过滤是历史兜底，实际以较新的日期为准。
+
+---
+
+## 五-B、⚠️ 动态报表参数化规范（生成 report__create 时必须遵守）
+
+**禁止在报表 SQL 中使用任何硬编码日期**（包括 `today() - N` 形式）。
+必须使用 Jinja2 参数 + filter binds 双向绑定：
+
+```json
+// filter spec
+{ "id": "date_range", "type": "date_range", "default_days": 30,
+  "binds": { "start": "date_start", "end": "date_end" } }
+```
+
+```sql
+-- 对应图表 SQL（integrated_data 日度表用 s_day 字段）
+WHERE s_day >= toDate('{{ date_start }}') AND s_day <= toDate('{{ date_end }}')
+-- 或月度聚合
+WHERE s_day >= toStartOfMonth(toDate('{{ date_start }}'))
+  AND s_day < toDate('{{ date_end }}')
+```
+
+**关键约束**：
+- `binds.start = "date_start"` → SQL 必须用 `{{ date_start }}`（字符完全一致）
+- `binds.end = "date_end"` → SQL 必须用 `{{ date_end }}`
+- **严禁**将图表 ID（`c1`、`c2`）写入 binds.start/end（会导致日期为空 → Code 38）
 
 ---
 

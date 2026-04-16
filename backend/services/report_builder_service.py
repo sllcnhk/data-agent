@@ -75,6 +75,7 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from backend.report_spec_utils import normalize_report_spec
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,7 @@ def build_report_html(
     Returns:
         HTML 字符串
     """
+    spec = normalize_report_spec(spec)
     title = spec.get("title", "数据分析报告")
     subtitle = spec.get("subtitle", "")
     theme = spec.get("theme", "light")
@@ -140,7 +142,9 @@ def build_report_html(
     # 生成各区域 HTML 片段
     filter_html = _render_filter_html(filters)
     chart_divs = _render_chart_divs(charts)
-    summary_html = _render_summary_html(llm_summary, include_summary)
+    # T4: 已有 ai_analysis 卡片时不渲染顶部 summary-section（两者功能重叠，避免冗余）
+    _has_ai_chart = any(c.get("chart_type") == "ai_analysis" for c in charts if isinstance(c, dict))
+    summary_html = _render_summary_html(llm_summary, include_summary and not _has_ai_chart)
 
     # 序列化 JSON（注意 datetime 处理）
     # 注：JSON 中的 </script> 必须转义，防止 HTML 解析器提前关闭 script 标签
@@ -257,6 +261,20 @@ def _render_chart_divs(charts: List[Dict]) -> str:
         width_cls = _WIDTH_CLASS.get(c.get("width", "half"), "chart-half")
         height = c.get("height", 320)
         chart_lib = c.get("chart_lib", "echarts")
+
+        # ai_analysis 图表：全宽文字卡片，无 ECharts，不设固定高度
+        if c.get("chart_type") == "ai_analysis":
+            parts.append(f"""  <div class="chart-card chart-full ai-analysis-card" id="card-{cid}">
+    <div class="chart-card-title ai-analysis-card-title">
+      <span class="ai-analysis-badge">🤖 AI 分析</span>{_esc(title)}
+    </div>
+    <div class="chart-loading" id="loading-{cid}" style="display:none"></div>
+    <div class="ai-analysis-container" id="{cid}">
+      <div class="ai-waiting">⏳ 数据加载完成后，AI 将自动进行分析，请稍候…</div>
+    </div>
+  </div>""")
+            continue
+
         parts.append(f"""  <div class="chart-card {width_cls}" id="card-{cid}">
     <div class="chart-card-title">{_esc(title)}</div>
     <div class="chart-loading" id="loading-{cid}">加载中…</div>
@@ -362,6 +380,7 @@ def _js_engine() -> str:
 window.addEventListener('DOMContentLoaded', () => {
   // 预创建图表容器（ECharts 实例，暂无数据）
   REPORT_SPEC.charts.forEach(spec => {
+    if (spec.chart_type === 'ai_analysis') return;
     const el = document.getElementById(spec.id);
     if (!el) return;
     const lib = (spec.chart_lib || 'echarts').toLowerCase();
@@ -396,6 +415,14 @@ window.addEventListener('DOMContentLoaded', () => {
 async function _loadData(params) {
   const btn = document.getElementById('btn-refresh');
   if (btn) { btn.disabled = true; btn.textContent = '加载中…'; }
+
+  // T5: 重置 AI 分析状态，允许新查询完成后重新触发分析
+  _aiAnalysisInProgress = false;
+  // T5: 数据加载时立即把 AI 卡片切换为"等待中"状态，避免显示上次的陈旧结果
+  (REPORT_SPEC.charts || []).filter(c => c.chart_type === 'ai_analysis').forEach(c => {
+    const cont = document.querySelector('#card-' + c.id + ' .ai-analysis-container');
+    if (cont) cont.innerHTML = '<div class="ai-waiting">⏳ 数据更新中，AI 将自动重新分析…</div>';
+  });
 
   // 显示每个图表的 loading 状态
   REPORT_SPEC.charts.forEach(spec => _showChartLoading(spec.id));
@@ -445,6 +472,9 @@ async function _loadData(params) {
       if (el) { el.textContent = json.llm_summary; el.classList.remove('summary-loading'); }
     }
 
+    // 触发 AI 数据分析（ai_analysis chart 存在时自动调用）
+    _triggerAiAnalysis();
+
   } catch(e) {
     REPORT_SPEC.charts.forEach(spec => {
       _hideChartLoading(spec.id);
@@ -473,7 +503,8 @@ function _currentParams() {
       binds = _b;
     }
     if (!binds || Object.keys(binds).length === 0) continue;
-    const val = _filterValues[fSpec.id];
+    // T2: 兼容旧 HTML filter spec 中 id 为 undefined 的情况
+    const val = _filterValues[fSpec.id ?? fSpec.type ?? ''];
     if (!val) continue;
     if (fSpec.type === 'date_range' && typeof val === 'object') {
       if (binds.start && val.start) p[binds.start] = val.start;
@@ -522,6 +553,11 @@ function initChart(spec) {
   const el = document.getElementById(spec.id);
   if (!el) return;
   hideLoading(spec.id);
+
+  if (spec.chart_type === 'ai_analysis') {
+    initAiAnalysisChart(spec);
+    return;
+  }
 
   const lib = (spec.chart_lib || 'echarts').toLowerCase();
   const data = _chartData[spec.id] || [];
@@ -587,6 +623,8 @@ function buildEChartsOption(spec, data) {
       delete override.series;  // 已处理，避免 deepMerge 再次覆盖
     }
     deepMerge(option, override);
+    // T3: 将 echarts_override 中的字符串 formatter 还原为真正的 JS 函数
+    _reviveFormatters(option);
   }
   return option;
 }
@@ -987,7 +1025,8 @@ function formatVal(v, spec) {
 // 有 binds 字段 → 重查后端（参数化）；无 binds → 客户端内存过滤（兼容旧格式）
 // ═══════════════════════════════════════════════════════════════════════════
 function onFilterChange(filterId) {
-  const filterSpec = (REPORT_SPEC.filters || []).find(f => f.id === filterId);
+  // T2: (f.id ?? f.type ?? '') 兼容旧 HTML filter spec 中 id 为 undefined 的情况
+  const filterSpec = (REPORT_SPEC.filters || []).find(f => (f.id ?? f.type ?? '') === filterId);
   if (!filterSpec) return;
   const ftype = filterSpec.type;
 
@@ -1093,6 +1132,246 @@ function deepMerge(target, source) {
     }
   }
 }
+
+// T3: 递归把 echarts option 中值为函数字符串的 formatter 还原为真正的 JS 函数
+// ECharts 不会自动 eval 字符串 formatter，deepMerge 后需要手动 revive
+function _reviveFormatters(obj) {
+  if (!obj || typeof obj !== 'object') return;
+  if (Array.isArray(obj)) { obj.forEach(_reviveFormatters); return; }
+  for (const key of Object.keys(obj)) {
+    if (key === 'formatter' && typeof obj[key] === 'string') {
+      const s = obj[key].trim();
+      // 匹配 "function(...){...}" 或 "(v) => ..." 形式的函数字符串
+      if (s.startsWith('function') || (s.startsWith('(') && s.includes('=>'))) {
+        try { obj[key] = new Function('return (' + s + ')')(); } catch(e) {
+          console.warn('[_reviveFormatters] formatter 转换失败:', e.message, s.slice(0, 60));
+        }
+      }
+    } else if (obj[key] && typeof obj[key] === 'object') {
+      _reviveFormatters(obj[key]);
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+// AI 数据分析（ai_analysis chart 类型专用）
+// 使用 /analyze/stream SSE 端点流式接收，等待时显示 3 点跳动动画（复用 chat 风格）
+// ═══════════════════════════════════════════════════════════════════════════
+
+function initAiAnalysisChart(spec) {
+  const el = document.getElementById(spec.id);
+  if (!el) return;
+  const container = el.querySelector('.ai-analysis-container');
+  if (container) {
+    container.innerHTML = '<div class="ai-waiting">⏳ 数据加载完成后，AI 将自动进行分析，请稍候…</div>';
+  }
+}
+
+let _aiAnalysisInProgress = false;
+
+/** 渲染等待中的加载动画（仿 Chat 界面"正在思考…"效果）*/
+function _showAiLoading(container) {
+  container.innerHTML = `
+    <div class="ai-thinking-indicator">
+      <div class="ai-thinking-avatar">🤖</div>
+      <div class="ai-thinking-body">
+        <div class="ai-thinking-label">AI助手</div>
+        <div class="ai-thinking-bubble">
+          <div class="ai-thinking-dots">
+            <span></span><span></span><span></span>
+          </div>
+          <span class="ai-thinking-text">正在分析数据…</span>
+        </div>
+      </div>
+    </div>
+    <div class="ai-stream-preview" id="ai-stream-preview" style="display:none"></div>`;
+}
+
+async function _triggerAiAnalysis() {
+  if (_aiAnalysisInProgress) return;
+  const aiCharts = (REPORT_SPEC.charts || []).filter(c => c.chart_type === 'ai_analysis');
+  if (aiCharts.length === 0) return;
+
+  const chartsData = {};
+  const chartSpecs = [];
+
+  for (const c of (REPORT_SPEC.charts || [])) {
+    if (c.chart_type === 'ai_analysis') continue;
+    const data = _chartData[c.id];
+    if (!data) continue;
+    chartsData[c.id] = data;
+    chartSpecs.push(c);
+  }
+
+  if (Object.keys(chartsData).length === 0) {
+    for (const c of aiCharts) {
+      const container = document.querySelector('#card-' + c.id + ' .ai-analysis-container');
+      if (container) container.innerHTML = '<div class="ai-waiting">⏳ 等待图表数据加载…</div>';
+    }
+    return;
+  }
+
+  _aiAnalysisInProgress = true;
+
+  // 显示仿 Chat 加载动画
+  for (const c of aiCharts) {
+    const container = document.querySelector('#card-' + c.id + ' .ai-analysis-container');
+    if (container) _showAiLoading(container);
+  }
+
+  const urlParams = new URLSearchParams({ token: REFRESH_TOKEN });
+  const streamUrl = `${API_BASE}/reports/${REPORT_ID}/analyze/stream?${urlParams}`;
+  const reqBody = JSON.stringify({
+    charts_data: chartsData,
+    report_title: REPORT_SPEC.title,
+    analysis_focus: ['trend', 'anomaly', 'insight', 'conclusion'],
+    chart_specs: chartSpecs,
+  });
+
+  let accumulated = '';
+  let finalSections = null;
+  let hasError = false;
+  let errorMsg = '';
+
+  try {
+    const resp = await fetch(streamUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: reqBody,
+    });
+
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+
+    // 读取 SSE 流
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let lineBuf = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      lineBuf += decoder.decode(value, { stream: true });
+      const lines = lineBuf.split('\n');
+      lineBuf = lines.pop(); // 保留不完整的最后一行
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const dataStr = line.slice(6).trim();
+        if (dataStr === '[DONE]') break;
+
+        let evt;
+        try { evt = JSON.parse(dataStr); } catch { continue; }
+
+        if (evt.type === 'chunk' && evt.text) {
+          accumulated += evt.text;
+          // 实时展示流式文本（灰色预览区）
+          const preview = document.getElementById('ai-stream-preview');
+          if (preview) {
+            preview.style.display = 'block';
+            preview.textContent = accumulated;
+          }
+        } else if (evt.type === 'done') {
+          finalSections = evt.sections || [];
+        } else if (evt.type === 'error') {
+          hasError = true;
+          errorMsg = evt.message || '分析失败';
+        } else if (evt.type === 'empty') {
+          hasError = true;
+          errorMsg = 'LLM 服务暂不可用，请检查服务配置';
+        }
+      }
+    }
+  } catch (e) {
+    hasError = true;
+    errorMsg = (e.message || '').includes('HTTP')
+      ? 'AI 分析接口连接失败 (' + e.message + ')，请刷新重试'
+      : 'AI 分析失败：' + e.message;
+  }
+
+  // 渲染最终结果
+  if (hasError) {
+    for (const c of aiCharts) {
+      const container = document.querySelector('#card-' + c.id + ' .ai-analysis-container');
+      if (container) {
+        container.innerHTML =
+          '<div class="ai-waiting">⚠️ ' + errorMsg +
+          ' &nbsp;<button class="btn-ai-retry" onclick="_retryAiAnalysis()">重试</button></div>';
+      }
+    }
+  } else {
+    // 优先用 done 事件中的 sections；否则尝试从累积文本解析
+    let sections = finalSections;
+    if (!sections && accumulated) {
+      try {
+        const parsed = JSON.parse(accumulated.trim());
+        sections = Array.isArray(parsed)
+          ? parsed.filter(s => s && typeof s === 'object' && 'content' in s)
+          : null;
+      } catch {
+        const m = accumulated.match(/\[[\s\S]*\]/);
+        if (m) {
+          try {
+            const arr = JSON.parse(m[0]);
+            sections = Array.isArray(arr) ? arr : null;
+          } catch { sections = null; }
+        }
+        if (!sections && accumulated.trim()) {
+          sections = [{ type: 'insight', title: '数据分析', content: accumulated.trim().slice(0, 800) }];
+        }
+      }
+    }
+    for (const c of aiCharts) {
+      _renderAiSections(c.id, sections || []);
+    }
+  }
+
+  _aiAnalysisInProgress = false;
+}
+
+function _retryAiAnalysis() {
+  _aiAnalysisInProgress = false;
+  _triggerAiAnalysis();
+}
+
+function _renderAiSections(chartId, sections) {
+  const container = document.querySelector('#card-' + chartId + ' .ai-analysis-container');
+  if (!container) return;
+
+  if (!sections || sections.length === 0) {
+    container.innerHTML =
+      '<div class="ai-waiting">⚠️ AI 暂未返回分析内容（LLM 服务可能不可用）' +
+      ' &nbsp;<button class="btn-ai-retry" onclick="_retryAiAnalysis()">刷新重试</button></div>';
+    return;
+  }
+
+  const SECTION_META = {
+    trend:      { icon: '📈', color: '#1890ff' },
+    anomaly:    { icon: '⚠️',  color: '#fa8c16' },
+    insight:    { icon: '💡', color: '#52c41a' },
+    conclusion: { icon: '✅', color: '#722ed1' },
+  };
+
+  let html = '<div class="ai-sections">';
+  for (const s of sections) {
+    const meta = SECTION_META[s.type] || { icon: '📊', color: '#1890ff' };
+    const title = s.title || meta.icon + ' ' + s.type;
+    const content = (s.content || '').replace(/\n/g, '<br>');
+    html += `
+      <div class="ai-section" style="--section-color:${meta.color}">
+        <div class="ai-section-header">
+          <span class="ai-section-icon">${meta.icon}</span>
+          <span class="ai-section-title">${title}</span>
+        </div>
+        <div class="ai-section-content">${content}</div>
+      </div>
+    `;
+  }
+  html += '</div>';
+
+  container.innerHTML = html;
+}
 """
 
 
@@ -1185,6 +1464,75 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 .kpi-value {{ font-size: 42px; font-weight: 700; color: #1677ff; }}
 .kpi-unit {{ font-size: 18px; margin-left: 4px; }}
 .kpi-trend {{ font-size: 14px; margin-top: 6px; }}
+
+/* AI 分析卡片（全宽文字卡片） */
+.ai-analysis-card {{ border-left: 4px solid #722ed1; }}
+.ai-analysis-card-title {{ display: flex; align-items: center; gap: 8px; }}
+.ai-analysis-badge {{ font-size: 11px; background: #f9f0ff; color: #722ed1;
+  border: 1px solid #d3adf7; border-radius: 4px; padding: 1px 7px; white-space: nowrap; }}
+.ai-analysis-container {{ min-height: 80px; padding: 10px 0; }}
+.ai-waiting {{ color: #aaa; font-size: 13px; text-align: center; padding: 24px 0; }}
+
+/* 仿 Chat "正在思考…" 加载状态 */
+.ai-thinking-indicator {{
+  display: flex; gap: 12px; padding: 16px 8px; align-items: flex-start;
+}}
+.ai-thinking-avatar {{
+  width: 36px; height: 36px; border-radius: 50%; background: #52c41a;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 18px; flex-shrink: 0;
+}}
+.ai-thinking-body {{ display: flex; flex-direction: column; gap: 4px; }}
+.ai-thinking-label {{ font-size: 13px; font-weight: 500; color: {'#e0e0e0' if is_dark else '#262626'}; }}
+.ai-thinking-bubble {{
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 14px; border-radius: 8px;
+  background: {card_bg}; border: 1px solid {border};
+  font-size: 13px; color: #999;
+}}
+.ai-thinking-dots {{ display: flex; gap: 4px; align-items: center; }}
+.ai-thinking-dots span {{
+  width: 7px; height: 7px; border-radius: 50%; background: #1677ff;
+  animation: aiDotBounce 1.2s ease-in-out infinite;
+}}
+.ai-thinking-dots span:nth-child(1) {{ animation-delay: 0s; }}
+.ai-thinking-dots span:nth-child(2) {{ animation-delay: 0.2s; }}
+.ai-thinking-dots span:nth-child(3) {{ animation-delay: 0.4s; }}
+@keyframes aiDotBounce {{
+  0%, 60%, 100% {{ transform: translateY(0); opacity: 0.4; }}
+  30% {{ transform: translateY(-6px); opacity: 1; }}
+}}
+
+/* 流式预览文本区域 */
+.ai-stream-preview {{
+  margin: 4px 8px 8px 56px; font-size: 12px; color: #bbb;
+  line-height: 1.6; max-height: 120px; overflow: hidden;
+  white-space: pre-wrap; border-left: 2px solid {border};
+  padding-left: 10px;
+}}
+
+/* 重试按钮 */
+.btn-ai-retry {{
+  font-size: 12px; padding: 2px 10px; border-radius: 4px;
+  border: 1px solid #1677ff; color: #1677ff; background: transparent;
+  cursor: pointer; margin-left: 6px; vertical-align: middle;
+}}
+.btn-ai-retry:hover {{ background: #e6f4ff; }}
+
+/* 旧 spinner（兜底，保留向后兼容） */
+.ai-analysis-spinner {{ display: flex; justify-content: center; align-items: center; gap: 6px; color: #1677ff; font-size: 13px; padding: 24px 0; }}
+.ai-analysis-spinner::before {{ content: ""; width: 14px; height: 14px; border: 2px solid #e6f7ff; border-top: 2px solid #1677ff; border-radius: 50%;
+  animation: spin 1s linear infinite; display: inline-block; }}
+@keyframes spin {{ from {{ transform: rotate(0deg); }} to {{ transform: rotate(360deg); }} }}
+
+.ai-sections {{ display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }}
+.ai-section {{ background: {bg}; border: 1px solid {border}; border-left: 4px solid var(--section-color, #1890ff);
+  border-radius: 8px; padding: 14px; transition: box-shadow .2s; }}
+.ai-section:hover {{ box-shadow: 0 2px 8px rgba(0,0,0,.06); }}
+.ai-section-header {{ display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; margin-bottom: 8px; }}
+.ai-section-icon {{ font-size: 16px; }}
+.ai-section-title {{ flex: 1; }}
+.ai-section-content {{ font-size: 13px; line-height: 1.7; color: {'#ccc' if is_dark else '#444'}; white-space: pre-wrap; }}
 
 .toast {{
   position: fixed; bottom: 24px; right: 24px; padding: 10px 18px;

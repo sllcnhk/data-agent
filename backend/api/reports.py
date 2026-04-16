@@ -33,10 +33,23 @@ from backend.core.auth.jwt import decode_token
 from backend.config.database import get_db
 from backend.config.settings import settings
 from backend.models.report import Report
+from backend.report_spec_utils import (
+    chart_validation_errors,
+    has_ai_analysis_chart,
+    normalize_chart_spec,
+    normalize_report_spec,
+    summary_requested,
+    validate_report_spec,
+)
 from backend.services.report_builder_service import (
     build_report_html,
     generate_llm_summary,
     generate_refresh_token,
+)
+from backend.services.report_analysis_service import (
+    _get_adapter as _get_report_analysis_adapter,
+    analyze_report_data,
+    stream_analyze_report_data,
 )
 
 router = APIRouter(prefix="/reports", tags=["报告"])
@@ -552,14 +565,17 @@ async def build_report(
     如果 include_summary=true，则异步触发 LLM 总结生成。
     """
     username = getattr(current_user, "username", "default")
-    spec = req.spec
+    spec = normalize_report_spec(req.spec)
 
     # 生成 UUID 和刷新令牌
     report_id = str(uuid.uuid4())
     refresh_token = generate_refresh_token()
 
     # 注入 include_summary 到 spec（供 HTML 渲染总结区域）
-    spec["include_summary"] = req.include_summary
+    spec["include_summary"] = bool(req.include_summary or spec.get("include_summary"))
+    spec, spec_errors = validate_report_spec(spec)
+    if spec_errors:
+        raise HTTPException(status_code=400, detail="报告 spec 非法: " + "; ".join(spec_errors))
 
     # 生成 HTML
     try:
@@ -603,13 +619,17 @@ async def build_report(
         username=username,
         refresh_token=refresh_token,
         report_file_path=rel_path,
-        summary_status="pending" if req.include_summary else "skipped",
+        summary_status="pending" if spec.get("include_summary") else "skipped",
         # 将原始 spec 中的 charts + data_sources 存入已有字段
         charts=spec.get("charts", []),
         data_sources=_build_data_sources(spec),
         filters=spec.get("filters", []),
         theme=spec.get("theme", "light"),
-        extra_metadata={"spec_version": "1.0", "file_name": filename},
+        extra_metadata={
+            "spec_version": "1.0",
+            "file_name": filename,
+            "include_summary": bool(spec.get("include_summary")),
+        },
     )
     try:
         report.doc_type = req.doc_type
@@ -620,7 +640,7 @@ async def build_report(
     db.refresh(report)
 
     # 异步生成 LLM 总结
-    if req.include_summary:
+    if spec.get("include_summary"):
         background_tasks.add_task(_async_generate_summary, report_id, spec, db)
 
     logger.info("[Reports] 报告已生成: id=%s, file=%s", report_id, rel_path)
@@ -638,6 +658,7 @@ async def build_report(
 
 def _build_data_sources(spec: Dict) -> List[Dict]:
     """从 charts 提取 data_sources 列表（存入 Report.data_sources）。"""
+    spec = normalize_report_spec(spec or {})
     sources = []
     seen = set()
     for c in spec.get("charts", []):
@@ -651,6 +672,37 @@ def _build_data_sources(spec: Dict) -> List[Dict]:
                 "query": c.get("sql", ""),
             })
     return sources
+
+
+def _report_include_summary(report: Report, spec: Optional[Dict[str, Any]] = None) -> bool:
+    extra = getattr(report, "extra_metadata", None) or {}
+    if isinstance(extra, dict) and "include_summary" in extra:
+        return bool(extra.get("include_summary")) or bool(spec and summary_requested(spec))
+    if spec is not None:
+        return summary_requested(spec)
+    return bool(report.llm_summary) or has_ai_analysis_chart(list(report.charts or []))
+
+
+def _persist_llm_summary_to_html(report: Report, summary: str) -> None:
+    if not report or not report.report_file_path or not summary:
+        return
+    html_path = _CUSTOMER_DATA_ROOT / report.report_file_path
+    if not html_path.exists():
+        return
+    html = html_path.read_text(encoding="utf-8")
+    html = html.replace(
+        "分析总结生成中，请稍候…",
+        summary.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"),
+        1,
+    )
+    html_path.write_text(html, encoding="utf-8")
+
+
+async def _get_default_llm_adapter():
+    adapter, _provider = await _get_report_analysis_adapter()
+    if adapter is None:
+        raise RuntimeError("未找到可用的 LLM provider")
+    return adapter
 
 
 def _slugify(s: str) -> str:
@@ -895,8 +947,7 @@ async def check_pin_status_batch(
 async def _async_generate_summary(report_id: str, spec: Dict, db: Session) -> None:
     """后台任务：调用 LLM 生成总结并更新 DB + 本地 HTML 文件。"""
     try:
-        from backend.agents.factory import get_default_llm_adapter
-        llm_adapter = get_default_llm_adapter()
+        llm_adapter = await _get_default_llm_adapter()
 
         # 更新状态为 generating
         rpt = db.query(Report).filter(Report.id == uuid.UUID(report_id)).first()
@@ -912,16 +963,8 @@ async def _async_generate_summary(report_id: str, spec: Dict, db: Session) -> No
             db.commit()
 
         # 同步更新 HTML 文件中的总结（简单替换占位符）
-        if rpt and rpt.report_file_path and summary:
-            html_path = _CUSTOMER_DATA_ROOT / rpt.report_file_path
-            if html_path.exists():
-                html = html_path.read_text(encoding="utf-8")
-                html = html.replace(
-                    "分析总结生成中，请稍候…",
-                    summary.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"),
-                    1,
-                )
-                html_path.write_text(html, encoding="utf-8")
+        if rpt and summary:
+            _persist_llm_summary_to_html(rpt, summary)
         logger.info("[Reports] LLM 总结生成完成: report_id=%s", report_id)
     except Exception as e:
         logger.error("[Reports] LLM 总结生成失败: %s", e, exc_info=True)
@@ -973,6 +1016,16 @@ async def get_report_data(
     if not secrets.compare_digest(report.refresh_token or "", token):
         raise HTTPException(403, "无效的刷新令牌")
 
+    report_spec = normalize_report_spec({
+        "title": report.name or "数据报告",
+        "subtitle": report.description or "",
+        "theme": report.theme or "light",
+        "charts": report.charts or [],
+        "filters": report.filters or [],
+        "llm_summary": report.llm_summary or "",
+        "include_summary": _report_include_summary(report),
+    })
+
     # 提取 SQL 参数（除 token 外所有 query 参数）
     raw_params: Dict[str, Any] = {}
     if request is not None:
@@ -982,21 +1035,30 @@ async def get_report_data(
             if k != "token"
         }
 
-    # 若无运行时参数，使用 spec 默认值
+    # T-B3: 始终计算 spec 默认值，与运行时参数合并（默认值作为兜底，运行时参数优先）
+    # 防止 HTML 中 _DEFAULT_PARAMS 含错误 key（如 AI 将图表 ID 作为 binds 变量名）时
+    # 导致 SQL 模板变量渲染为空字符串（ClickHouse Code 38）
     spec_for_defaults = {
-        "filters": report.filters or [],
-        "charts": report.charts or [],
+        "filters": report_spec.get("filters", []),
+        "charts": report_spec.get("charts", []),
     }
-    if not raw_params:
-        raw_params = extract_default_params(spec_for_defaults)
+    default_params = extract_default_params(spec_for_defaults)
+    raw_params = {**default_params, **raw_params}  # 默认值先，运行时参数覆盖
 
     # 逐图表渲染 SQL 并执行
     new_data: Dict[str, Any] = {}
     errors: Dict[str, str] = {}
-    charts = report.charts or []
+    charts = report_spec.get("charts", [])
 
     for chart in charts:
-        cid = chart.get("id")
+        chart = normalize_chart_spec(chart)
+        cid = chart.get("id") or "unknown_chart"
+        missing = chart_validation_errors(chart)
+        if missing and chart.get("chart_type") != "ai_analysis":
+            errors[cid] = "报表图表配置不完整: " + ", ".join(missing)
+            logger.warning("[Reports/data] 跳过不可执行图表 chart=%s: %s", cid, errors[cid])
+            continue
+
         sql_template = chart.get("sql", "")
         env = chart.get("connection_env", "")
         conn_type = chart.get("connection_type", "clickhouse")
@@ -1009,6 +1071,24 @@ async def get_report_data(
         except Exception as exc:
             errors[cid] = str(exc)
             logger.warning("[Reports/data] 查询失败 chart=%s: %s", cid, exc)
+
+    if _report_include_summary(report, report_spec) and not (report.llm_summary or "").strip() and new_data:
+        try:
+            llm_adapter = await _get_default_llm_adapter()
+            summary = await generate_llm_summary(
+                {**report_spec, "data": new_data},
+                llm_adapter,
+            )
+            if summary:
+                report.llm_summary = summary
+                report.summary_status = "done"
+                _persist_llm_summary_to_html(report, summary)
+            elif not report.summary_status:
+                report.summary_status = "failed"
+        except Exception as exc:
+            logger.warning("[Reports/data] 生成 llm_summary 失败 report=%s: %s", report_id, exc)
+            if not report.summary_status or report.summary_status == "pending":
+                report.summary_status = "failed"
 
     # 更新 view_count
     report.increment_view_count()
@@ -1076,13 +1156,15 @@ async def regenerate_report_html(
             _f2["binds"] = _nb(_f2["binds"])
         normalized_filters.append(_f2)
 
-    spec_for_html = {
+    spec_for_html = normalize_report_spec({
         "title": report.name or "分析报告",
         "subtitle": report.description or "",
         "theme": report.theme or "light",
         "charts": report.charts or [],
         "filters": normalized_filters,
-    }
+        "llm_summary": report.llm_summary or "",
+        "include_summary": _report_include_summary(report),
+    })
 
     try:
         html_content = build_report_html(
@@ -1101,16 +1183,196 @@ async def regenerate_report_html(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"HTML 文件写入失败: {e}")
 
-    # 同步更新 DB 中存储的 filters（归一化后）
-    report.filters = normalized_filters
+    # 同步更新 DB 中存储的 filters/charts（归一化后：binds 修正 + SQL 参数化 + connection_env 清洁）
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified_regen
+    report.filters = spec_for_html.get("filters", normalized_filters)
+    report.charts = spec_for_html.get("charts", report.charts or [])
+    _flag_modified_regen(report, "filters")
+    _flag_modified_regen(report, "charts")
     db.commit()
 
     return {
         "success": True,
         "report_id": report_id,
         "html_path": str(report.report_file_path),
-        "message": "HTML 文件已用最新模板重新生成，filters.binds 已归一化",
+        "message": "HTML 文件已用最新模板重新生成，SQL 参数化 + filters.binds + connection_env 已归一化并回写 DB",
     }
+
+
+# ── AI 数据分析 ───────────────────────────────────────────────────────────────
+
+class AnalyzeReportRequest(BaseModel):
+    """POST /{report_id}/analyze 请求体"""
+    charts_data: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="图表查询结果 {chart_id: [行数据...]}",
+    )
+    report_title: str = Field(
+        default="数据报告",
+        description="报告标题，注入 LLM prompt 作为业务上下文",
+    )
+    analysis_focus: List[str] = Field(
+        default=["trend", "anomaly", "insight", "conclusion"],
+        description="分析维度：trend / anomaly / insight / conclusion",
+    )
+    chart_specs: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="图表配置列表（含 title/chart_type/x_field/y_fields），用于生成更准确的数据摘要",
+    )
+
+
+@router.post("/{report_id}/analyze")
+async def analyze_report(
+    report_id: str,
+    body: AnalyzeReportRequest,
+    token: str = Query(..., description="报告刷新令牌（与 /data 端点相同）"),
+    db: Session = Depends(get_db),
+):
+    """
+    AI 数据分析：接收图表查询结果，调用 LLM 生成结构化分析（趋势/异常/洞察/建议）。
+
+    认证方式：report refresh_token（无需 JWT 登录态，与 /data 端点一致）。
+    适用场景：HTML 报告页面数据加载完成后，前端自动调用此接口进行 AI 分析。
+
+    LLM 调用优先级：Claude → OpenAI → Gemini → Qianwen → Doubao（任一可用即使用，失败自动 fallback）。
+    LLM 等待时间通常 5-15 秒，前端需显示分析中状态。
+
+    返回：
+        success:  bool
+        report_id: str
+        sections: [{type, title, content}]  分析结果列表；无可用 LLM 时为 []
+        count:    int  sections 数量
+    """
+    try:
+        uid = uuid.UUID(report_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="无效的报告 ID")
+
+    report = db.query(Report).filter(Report.id == uid).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="报告不存在")
+    if not secrets.compare_digest(report.refresh_token or "", token):
+        raise HTTPException(status_code=403, detail="无效的刷新令牌")
+
+    # 限制请求体数据总行数，防止超大 payload 打爆 LLM token
+    MAX_TOTAL_ROWS = 2000
+    total_rows = sum(
+        len(v) for v in body.charts_data.values() if isinstance(v, list)
+    )
+    if total_rows > MAX_TOTAL_ROWS and body.charts_data:
+        cap_per_chart = max(1, MAX_TOTAL_ROWS // len(body.charts_data))
+        capped_data: Dict[str, Any] = {
+            k: (v[:cap_per_chart] if isinstance(v, list) else v)
+            for k, v in body.charts_data.items()
+        }
+        logger.info(
+            "[Reports/analyze] 数据截断: 总行数 %d → 限制每图表 %d 行",
+            total_rows, cap_per_chart,
+        )
+    else:
+        capped_data = body.charts_data
+
+    # 过滤掉 ai_analysis 类型的 chart_specs（避免 LLM 分析自己）
+    filtered_specs = [
+        s for s in (body.chart_specs or [])
+        if s.get("chart_type") != "ai_analysis"
+    ]
+
+    try:
+        sections = await analyze_report_data(
+            charts_data=capped_data,
+            report_title=body.report_title or report.name or "数据报告",
+            analysis_focus=body.analysis_focus,
+            chart_specs=filtered_specs,
+        )
+    except Exception as exc:
+        logger.warning("[Reports/analyze] LLM 分析异常: %s", exc)
+        sections = []
+
+    return {
+        "success": True,
+        "report_id": report_id,
+        "sections": sections,
+        "count": len(sections),
+    }
+
+
+# ── AI 数据分析（流式 SSE）──────────────────────────────────────────────────────
+
+@router.post("/{report_id}/analyze/stream")
+async def analyze_report_stream(
+    report_id: str,
+    body: AnalyzeReportRequest,
+    token: str = Query(..., description="报告刷新令牌"),
+    db: Session = Depends(get_db),
+):
+    """
+    AI 数据分析流式端点（SSE）。
+
+    与 /analyze 相同的鉴权和参数，但以 text/event-stream 格式流式返回 LLM 响应。
+
+    SSE 事件格式：
+        data: {"type": "chunk",  "text": "..."}    — LLM 文本片段
+        data: {"type": "done",   "sections": [...]} — 分析完成，携带解析后的 sections
+        data: {"type": "error",  "message": "..."}  — 出错
+        data: {"type": "empty"}                     — 无数据或无可用 LLM
+        data: [DONE]                                — 流结束标记
+    """
+    from fastapi.responses import StreamingResponse as _StreamingResponse
+
+    try:
+        uid = uuid.UUID(report_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="无效的报告 ID")
+
+    report = db.query(Report).filter(Report.id == uid).first()
+    if not report:
+        raise HTTPException(status_code=404, detail="报告不存在")
+    if not secrets.compare_digest(report.refresh_token or "", token):
+        raise HTTPException(status_code=403, detail="无效的刷新令牌")
+
+    # 截断超大数据（与 /analyze 端点一致）
+    MAX_TOTAL_ROWS = 2000
+    total_rows = sum(len(v) for v in body.charts_data.values() if isinstance(v, list))
+    if total_rows > MAX_TOTAL_ROWS and body.charts_data:
+        cap_per_chart = max(1, MAX_TOTAL_ROWS // len(body.charts_data))
+        capped_data: Dict[str, Any] = {
+            k: (v[:cap_per_chart] if isinstance(v, list) else v)
+            for k, v in body.charts_data.items()
+        }
+    else:
+        capped_data = body.charts_data
+
+    filtered_specs = [
+        s for s in (body.chart_specs or [])
+        if s.get("chart_type") != "ai_analysis"
+    ]
+
+    report_title = body.report_title or report.name or "数据报告"
+
+    async def _event_generator():
+        try:
+            async for event in stream_analyze_report_data(
+                charts_data=capped_data,
+                report_title=report_title,
+                analysis_focus=body.analysis_focus,
+                chart_specs=filtered_specs,
+            ):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        except Exception as exc:
+            logger.warning("[Reports/analyze/stream] 生成器异常: %s", exc)
+            yield f"data: {json.dumps({'type': 'error', 'message': str(exc)}, ensure_ascii=False)}\n\n"
+        finally:
+            yield "data: [DONE]\n\n"
+
+    return _StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # 模块级 ClickHouse 客户端缓存（env → client 实例，避免重复 TCP/HTTP 初始化）
@@ -1341,10 +1603,17 @@ async def update_report_spec(
     username = getattr(current_user, "username", "default")
     report = _get_report_or_404(report_id, db)
     _check_ownership(report, username, getattr(current_user, "is_superadmin", False))
+    normalized_spec, spec_errors = validate_report_spec({
+        **(req.spec or {}),
+        "include_summary": bool((req.spec or {}).get("include_summary")) or _report_include_summary(report),
+        "llm_summary": report.llm_summary or "",
+    })
+    if spec_errors:
+        raise HTTPException(status_code=400, detail="报告 spec 非法: " + "; ".join(spec_errors))
 
     try:
         html_content = build_report_html(
-            spec=req.spec,
+            spec=normalized_spec,
             report_id=str(report.id),
             refresh_token=report.refresh_token,
             api_base_url=_api_base_url(),
@@ -1361,12 +1630,16 @@ async def update_report_spec(
     html_path.write_text(html_content, encoding="utf-8")
 
     # 更新数据库字段
-    report.charts = req.spec.get("charts", report.charts)
-    report.data_sources = _build_data_sources(req.spec) or report.data_sources
-    report.filters = req.spec.get("filters", report.filters)
-    report.theme = req.spec.get("theme", report.theme)
-    if req.spec.get("title"):
-        report.name = req.spec["title"]
+    report.charts = normalized_spec.get("charts", report.charts)
+    report.data_sources = _build_data_sources(normalized_spec) or report.data_sources
+    report.filters = normalized_spec.get("filters", report.filters)
+    report.theme = normalized_spec.get("theme", report.theme)
+    extra_meta = dict(report.extra_metadata or {})
+    extra_meta["include_summary"] = bool(normalized_spec.get("include_summary"))
+    report.extra_metadata = extra_meta
+    report.summary_status = "pending" if normalized_spec.get("include_summary") else "skipped"
+    if normalized_spec.get("title"):
+        report.name = normalized_spec["title"]
     db.commit()
 
     logger.info("[Reports] spec 更新完成: id=%s", report_id)
@@ -1432,13 +1705,17 @@ async def update_single_chart(
         "filters": report.filters or [],
         "data_sources": report.data_sources or [],
         "charts": merged_charts,
-        "include_summary": False,
+        "include_summary": _report_include_summary(report),
+        "llm_summary": report.llm_summary or "",
         "data": {},
     }
+    normalized_merged_spec, spec_errors = validate_report_spec(merged_spec)
+    if spec_errors:
+        raise HTTPException(status_code=400, detail="报告 spec 非法: " + "; ".join(spec_errors))
 
     try:
         html_content = build_report_html(
-            spec=merged_spec,
+            spec=normalized_merged_spec,
             report_id=str(report.id),
             refresh_token=report.refresh_token,
             api_base_url=_api_base_url(),
@@ -1455,7 +1732,11 @@ async def update_single_chart(
     html_path.parent.mkdir(parents=True, exist_ok=True)
     html_path.write_text(html_content, encoding="utf-8")
 
-    report.charts = merged_charts
+    report.charts = normalized_merged_spec.get("charts", merged_charts)
+    extra_meta = dict(report.extra_metadata or {})
+    extra_meta["include_summary"] = bool(normalized_merged_spec.get("include_summary"))
+    report.extra_metadata = extra_meta
+    report.summary_status = "pending" if normalized_merged_spec.get("include_summary") else "skipped"
     db.commit()
 
     logger.info("[Reports] 单图更新完成: report_id=%s chart_id=%s found=%s", report_id, chart_id, found)
@@ -1601,42 +1882,49 @@ async def create_report_copilot(
         param_sql_section = ""
         if _has_param_sql and _default_params_str:
             param_sql_section = (
-                f"\n## 参数化查询说明\n"
-                f"当前默认参数（由筛选器 default_days/default_value 推导）：\n"
+                f"\n## ???????\n"
+                f"??????????? default_days/default_value ????\n"
                 f"  {_default_params_str}\n\n"
-                "SQL 模板语法（Jinja2）：\n"
-                "  图表 SQL 中使用 `{{ param_name }}` 引用筛选器绑定的参数变量。\n"
-                "  例：`WHERE call_start_time >= '{{ date_start }}' AND call_start_time < '{{ date_end }}'`\n"
-                "  筛选器 binds 字段定义映射：date_range → {\"start\": \"date_start\", \"end\": \"date_end\"}\n\n"
-                "⚠️ 修改注意事项：\n"
-                "  - 修改时间范围默认值 → 改 filter 的 `default_days` 或 `default_value`，不要在 SQL 中硬编码日期\n"
-                "  - 新增筛选维度 → 在 filter spec 中添加 binds，并在 SQL 中添加对应 `{{ variable }}` 条件\n"
-                "  - 禁止把参数化 SQL 改回硬编码日期（会导致报表刷新时查询范围无法变化）\n"
+                "SQL ?????Jinja2??\n"
+                "  ?? SQL ??? `{{ param_name }}` ?????????????\n"
+                "  ??`WHERE call_start_time >= '{{ date_start }}' AND call_start_time < '{{ date_end }}'`\n"
+                "  ??? binds ???????date_range ? {\"start\": \"date_start\", \"end\": \"date_end\"}\n\n"
+                "?? ???????\n"
+                "  - ????????? ? ? filter ? `default_days` ? `default_value`???? SQL ??????\n"
+                "  - ?????? ? ? filter spec ??? binds??? SQL ????? `{{ variable }}` ??\n"
+                "  - ?????? SQL ?????????????????????????\n"
+                "  - ?N?/??/????????? date_range ????????? {{ date_start }}/{{ date_end }}\n"
+                "  - ??????/??/???????? include_summary=true ? ai_analysis\n"
+                "  - ????? table + UNION ALL ????????\n"
             )
 
         return (
-            f"[Co-pilot 模式] 当前报表：{report.name}\n"
-            f"report_id：{report.id}\n"
-            f"refresh_token：{report.refresh_token}\n"
-            f"图表数量：{len(cl)}\n"
-            f"图表列表：\n{_chart_summary_with_tags}\n"
-            f"图表配置（详细）：{json.dumps(cl, ensure_ascii=False)[:4000]}\n"
-            f"过滤器配置（含参数绑定）：{json.dumps(report.filters or [], ensure_ascii=False)[:600]}\n"
-            f"主题：{report.theme}\n"
+            f"[Co-pilot ??] ?????{report.name}\n"
+            f"report_id?{report.id}\n"
+            f"refresh_token?{report.refresh_token}\n"
+            f"?????{len(cl)}\n"
+            f"?????\n{_chart_summary_with_tags}\n"
+            f"?????????{json.dumps(cl, ensure_ascii=False)[:4000]}\n"
+            f"?????????????{json.dumps(report.filters or [], ensure_ascii=False)[:600]}\n"
+            f"???{report.theme}\n"
             f"{param_sql_section}\n"
-            "## 修改报表的 MCP 工具（直接调用，无需 JWT）\n\n"
-            "### 工具 1：report__get_spec\n"
-            "读取报表当前完整 spec，修改前先调用确认所有图表。\n"
-            "参数：report_id（见上方）、token（即 refresh_token）\n\n"
-            "### 工具 2：report__update_single_chart（优先使用）\n"
-            "局部更新单个图表，merge 操作，不影响其他图表。\n"
-            "参数：report_id、token、chart_id、chart_patch（只含需修改字段）\n\n"
-            "### 工具 3：report__update_spec（全量更新）\n"
-            "更新整个报表 spec，适用于添加/删除图表、修改筛选器或批量修改。\n"
-            "⚠️ spec.charts 必须包含所有图表，缺少的图表将永久删除！\n"
-            "参数：report_id、token、spec（完整 spec JSON 含所有图表和 filters）\n\n"
+            "## ????? MCP ?????????? JWT?\n\n"
+            "### ?? 1?report__get_spec\n"
+            "???????? spec??????????????\n"
+            "???report_id??????token?? refresh_token?\n\n"
+            "### ?? 2?report__update_single_chart??????\n"
+            "?????????merge ???????????\n"
+            "???report_id?token?chart_id?chart_patch?????????\n\n"
+            "### ?? 3?report__update_spec??????\n"
+            "?????? spec??????/????????????????\n"
+            "?? spec.charts ????????????????????\n"
+            "???report_id?token?spec??? spec JSON ?????? filters?\n\n"
             f"{note}"
-            "请基于以上报表信息协助用户修改报表。修改完成后告知用户「报表已更新，请查看预览」。"
+            "## ????\n"
+            "- ???????????chart_type/sql/connection_env/x_field/y_fields/series_field?????? type/dataset/xField/yField/seriesField ? legacy ???\n"
+            "- ?N?/??/???????? date_range ??? note????????????? SQL?\n"
+            "- ???????/??/??????? include_summary=true ? ai_analysis?????????????????? table + UNION ALL ?????\n"
+            "?????????????????????????????????????????"
         )
 
     copilot_system_prompt = _build_copilot_prompt(charts_list, _html_context_note)
@@ -1858,26 +2146,30 @@ async def rebuild_report_spec(
                     for i, c in enumerate(charts_list)
                 )
                 _new_prompt = (
-                    f"[Co-pilot 模式] 当前报表：{report.name}\n"
-                    f"report_id：{report.id}\n"
-                    f"refresh_token：{report.refresh_token}\n"
-                    f"图表数量：{len(charts_list)}\n"
-                    f"图表列表：\n{_chart_summary or '  （无图表）'}\n"
-                    f"图表配置（详细）：{json.dumps(charts_list, ensure_ascii=False)[:4000]}\n"
-                    f"过滤器：{json.dumps(report.filters or [], ensure_ascii=False)[:500]}\n"
-                    f"主题：{report.theme}\n\n"
-                    "## 修改报表的 MCP 工具（直接调用，无需 JWT）\n\n"
-                    "### 工具 1：report__get_spec\n"
-                    "读取报表当前完整 spec，修改前先调用确认所有图表。\n"
-                    "参数：report_id（见上方）、token（即 refresh_token）\n\n"
-                    "### 工具 2：report__update_single_chart（优先使用）\n"
-                    "局部更新单个图表，merge 操作，不影响其他图表。\n"
-                    "参数：report_id、token、chart_id、chart_patch（只含需修改字段）\n\n"
-                    "### 工具 3：report__update_spec（全量更新）\n"
-                    "更新整个报表 spec，适用于添加/删除图表或批量修改。\n"
-                    "⚠️ spec.charts 必须包含所有图表，缺少的图表将永久删除！\n"
-                    "参数：report_id、token、spec（完整 spec JSON 含所有图表）\n\n"
-                    "请基于以上报表信息协助用户修改报表。修改完成后告知用户「报表已更新，请查看预览」。"
+                    f"[Co-pilot ??] ?????{report.name}\n"
+                    f"report_id?{report.id}\n"
+                    f"refresh_token?{report.refresh_token}\n"
+                    f"?????{len(charts_list)}\n"
+                    f"?????\n{_chart_summary or '  ?????'}\n"
+                    f"?????????{json.dumps(charts_list, ensure_ascii=False)[:4000]}\n"
+                    f"????{json.dumps(report.filters or [], ensure_ascii=False)[:500]}\n"
+                    f"???{report.theme}\n\n"
+                    "## ????? MCP ?????????? JWT?\n\n"
+                    "### ?? 1?report__get_spec\n"
+                    "???????? spec??????????????\n"
+                    "???report_id??????token?? refresh_token?\n\n"
+                    "### ?? 2?report__update_single_chart??????\n"
+                    "?????????merge ???????????\n"
+                    "???report_id?token?chart_id?chart_patch?????????\n\n"
+                    "### ?? 3?report__update_spec??????\n"
+                    "?????? spec??????/??????????\n"
+                    "?? spec.charts ????????????????????\n"
+                    "???report_id?token?spec??? spec JSON ??????\n\n"
+                    "## ????\n"
+                    "- ???????????chart_type/sql/connection_env/x_field/y_fields/series_field?????? type/dataset/xField/yField/seriesField ? legacy ???\n"
+                    "- ?N?/??/????????? date_range + date_start/date_end ??? SQL?????????????? note?\n"
+                    "- ???????/??/??????? include_summary=true ? ai_analysis?????????????????? table + UNION ALL ?????\n"
+                    "?????????????????????????????????????????"
                 )
                 _meta = dict(_pilot_conv.extra_metadata or {})
                 _meta["system_prompt"] = _new_prompt

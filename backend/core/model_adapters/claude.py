@@ -522,6 +522,103 @@ class ClaudeAdapter(BaseModelAdapter):
         message = await self.chat(conversation, **kwargs)
         yield message.content
 
+    async def stream_plain_text(
+        self,
+        messages: list,
+        system_prompt: str,
+        **kwargs
+    ) -> AsyncIterator[str]:
+        """
+        流式调用 Claude API（SSE 模式），逐块返回文本片段。
+
+        优先使用真正的流式 API（stream:true），若代理不支持则自动回退到
+        chat_plain 一次性获取全部文本后按单词逐步 yield（模拟打字效果）。
+
+        Args:
+            messages:      Raw message list [{role, content}]
+            system_prompt: 系统提示词
+            **kwargs:      max_tokens / temperature 等可选覆盖
+        """
+        import json as _json
+
+        url = f"{self.base_url}/v1/messages"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        }
+
+        max_tokens = int(kwargs.get("max_tokens", 1500))
+        temperature = float(kwargs.get("temperature", 0.7))
+
+        request_body = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": True,
+        }
+        if system_prompt:
+            request_body["system"] = system_prompt
+
+        client_kwargs: dict = {"timeout": 120.0}
+        if self.proxies:
+            client_kwargs["proxies"] = self.proxies
+
+        got_stream_events = False
+        try:
+            async with httpx.AsyncClient(**client_kwargs) as client:
+                async with client.stream("POST", url, headers=headers, json=request_body) as resp:
+                    if resp.status_code != 200:
+                        # 非 200 → 回退到非流式
+                        logger.warning(
+                            "[stream_plain_text] HTTP %d，回退到 chat_plain", resp.status_code
+                        )
+                    else:
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data: "):
+                                continue
+                            data_str = line[6:]
+                            if data_str.strip() == "[DONE]":
+                                break
+                            try:
+                                event = _json.loads(data_str)
+                                etype = event.get("type", "")
+                                if etype == "content_block_delta":
+                                    delta = event.get("delta", {})
+                                    if delta.get("type") == "text_delta":
+                                        text = delta.get("text", "")
+                                        if text:
+                                            got_stream_events = True
+                                            yield text
+                            except (_json.JSONDecodeError, KeyError):
+                                pass
+                        return  # 流式正常结束
+        except Exception as exc:
+            logger.warning("[stream_plain_text] 流式请求失败: %s，回退到 chat_plain", exc)
+
+        # 回退：非流式获取完整文本，然后按单词逐步 yield（打字效果）
+        if not got_stream_events:
+            try:
+                resp_data = await self.chat_plain(
+                    messages=messages,
+                    system_prompt=system_prompt,
+                    **{k: v for k, v in kwargs.items() if k in ("max_tokens", "temperature")},
+                )
+                full_text = ""
+                for block in (resp_data.get("content") or []):
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        full_text += block.get("text", "")
+
+                # 按单词模拟打字效果
+                import asyncio as _asyncio
+                for word in full_text.split(" "):
+                    if word:
+                        yield word + " "
+                        await _asyncio.sleep(0.025)  # 25ms / 词 ≈ 40词/秒
+            except Exception as exc2:
+                logger.error("[stream_plain_text] 回退 chat_plain 也失败: %s", exc2)
+
     def calculate_cost(self, input_tokens: int, output_tokens: int) -> float:
         """计算成本"""
         # 简化版本，实际应从配置中获取

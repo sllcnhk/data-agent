@@ -51,7 +51,7 @@ def _make_mock_report(
     r.id = uuid.UUID(report_id) if report_id else uuid.uuid4()
     r.name = name
     r.refresh_token = refresh_token
-    r.charts = charts if charts is not None else [{"id": "c1", "title": "Chart 1", "chart_type": "line"}]
+    r.charts = charts if charts is not None else [{"id": "c1", "title": "Chart 1", "chart_type": "line", "sql": "SELECT 1", "connection_env": "sg", "connection_type": "clickhouse"}]
     r.filters = filters or []
     r.theme = theme
     r.report_file_path = report_file_path
@@ -110,6 +110,21 @@ class TestReportToolServerRegistration(unittest.TestCase):
         schema = s.tools["update_single_chart"].input_schema
         for key in ("report_id", "token", "chart_id", "chart_patch"):
             self.assertIn(key, schema["required"])
+
+    def test_a08_create_tool_description_strengthened(self):
+        s = self._server()
+        desc = s.tools["create"].description
+        self.assertIn("date_range", desc)
+        self.assertIn("include_summary=true", desc)
+        self.assertIn("UNION ALL", desc)
+
+    def test_a09_update_tools_description_strengthened(self):
+        s = self._server()
+        self.assertIn("date_start", s.tools["update_spec"].description)
+        self.assertIn("ai_analysis", s.tools["update_single_chart"].description)
+        patch_desc = s.tools["update_single_chart"].input_schema["properties"]["chart_patch"]["description"]
+        self.assertIn("date_end", patch_desc)
+        self.assertIn("ai_analysis", patch_desc)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -212,25 +227,25 @@ class TestUpdateSpecByToken(unittest.TestCase):
 
     def test_c01_returns_report_id_on_success(self):
         rid = str(uuid.uuid4())
-        result = self._call(rid, {"charts": [{"id": "c1"}], "theme": "dark"}, "valid_token_abc")
+        result = self._call(rid, {"charts": [{"id": "c1", "chart_type": "line", "sql": "SELECT 1", "connection_env": "sg"}], "theme": "dark"}, "valid_token_abc")
         self.assertEqual(result["report_id"], rid)
 
     def test_c02_returns_updated_at(self):
         rid = str(uuid.uuid4())
-        result = self._call(rid, {"charts": []}, "valid_token_abc")
+        result = self._call(rid, {"charts": [{"id": "c1", "chart_type": "line", "sql": "SELECT 1", "connection_env": "sg"}]}, "valid_token_abc")
         self.assertIn("updated_at", result)
 
     def test_c03_invalid_token_raises_permission_error(self):
         rid = str(uuid.uuid4())
         with self.assertRaises(PermissionError):
-            self._call(rid, {"charts": []}, "wrong_token")
+            self._call(rid, {"charts": [{"id": "c1", "chart_type": "line", "sql": "SELECT 1", "connection_env": "sg"}]}, "wrong_token")
 
     def test_c04_no_file_path_raises_value_error(self):
         rid = str(uuid.uuid4())
         report = _make_mock_report(report_id=rid, report_file_path=None)
         report.report_file_path = None
         with self.assertRaises(ValueError):
-            self._call(rid, {"charts": []}, "valid_token_abc", mock_report=report)
+            self._call(rid, {"charts": [{"id": "c1", "chart_type": "line", "sql": "SELECT 1", "connection_env": "sg"}]}, "valid_token_abc", mock_report=report)
 
     def test_c05_html_generation_failure_raises_runtime_error(self):
         rid = str(uuid.uuid4())
@@ -243,18 +258,18 @@ class TestUpdateSpecByToken(unittest.TestCase):
              patch("backend.services.report_builder_service.build_report_html", side_effect=Exception("build error")):
             from backend.services.report_service import update_spec_by_token
             with self.assertRaises(RuntimeError):
-                update_spec_by_token(rid, {"charts": []}, "valid_token_abc")
+                update_spec_by_token(rid, {"charts": [{"id": "c1", "chart_type": "line", "sql": "SELECT 1", "connection_env": "sg"}]}, "valid_token_abc")
 
     def test_c06_updates_title_when_provided(self):
         rid = str(uuid.uuid4())
         mock_report = _make_mock_report(report_id=rid)
-        result = self._call(rid, {"charts": [], "title": "New Title"}, "valid_token_abc", mock_report=mock_report)
+        result = self._call(rid, {"charts": [{"id": "c1", "chart_type": "line", "sql": "SELECT 1", "connection_env": "sg"}], "title": "New Title"}, "valid_token_abc", mock_report=mock_report)
         self.assertEqual(mock_report.name, "New Title")
 
     def test_c07_updates_theme_when_provided(self):
         rid = str(uuid.uuid4())
         mock_report = _make_mock_report(report_id=rid)
-        self._call(rid, {"charts": [], "theme": "dark"}, "valid_token_abc", mock_report=mock_report)
+        self._call(rid, {"charts": [{"id": "c1", "chart_type": "line", "sql": "SELECT 1", "connection_env": "sg"}], "theme": "dark"}, "valid_token_abc", mock_report=mock_report)
         self.assertEqual(mock_report.theme, "dark")
 
     def test_c08_invalid_uuid_raises_value_error(self):
@@ -265,6 +280,31 @@ class TestUpdateSpecByToken(unittest.TestCase):
             from backend.services.report_service import update_spec_by_token
             with self.assertRaises(ValueError):
                 update_spec_by_token("bad-uuid", {}, "token")
+
+    def test_c09_legacy_chart_spec_is_normalized_before_persist(self):
+        rid = str(uuid.uuid4())
+        mock_report = _make_mock_report(report_id=rid)
+        legacy_spec = {
+            "title": "Legacy Normalized",
+            "charts": [{
+                "id": "c1",
+                "type": "bar",
+                "dataset": {
+                    "source": "clickhouse",
+                    "server": "clickhouse-sg",
+                    "query": "SELECT 1 AS cnt",
+                },
+                "xField": "dt",
+                "yField": "cnt",
+            }],
+        }
+        self._call(rid, legacy_spec, "valid_token_abc", mock_report=mock_report)
+        self.assertEqual(mock_report.charts[0]["chart_type"], "bar")
+        self.assertEqual(mock_report.charts[0]["sql"], "SELECT 1 AS cnt")
+        # "clickhouse-sg" 在 normalize_chart_spec 中被自动剥离前缀为 "sg"
+        self.assertEqual(mock_report.charts[0]["connection_env"], "sg")
+        self.assertEqual(mock_report.charts[0]["x_field"], "dt")
+        self.assertEqual(mock_report.charts[0]["y_fields"], ["cnt"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -300,7 +340,7 @@ class TestUpdateSingleChartByToken(unittest.TestCase):
 
     def test_d02_not_found_appends_new_chart(self):
         rid = str(uuid.uuid4())
-        result = self._call(rid, "c99", {"title": "New"}, "valid_token_abc")
+        result = self._call(rid, "c99", {"title": "New", "chart_type": "bar", "sql": "SELECT 2", "connection_env": "sg"}, "valid_token_abc")
         self.assertFalse(result["found"])
         self.assertEqual(result["total_charts"], 2)  # original 1 + new 1
 
@@ -318,7 +358,7 @@ class TestUpdateSingleChartByToken(unittest.TestCase):
         rid = str(uuid.uuid4())
         report = _make_mock_report(
             report_id=rid,
-            charts=[{"id": "c1", "title": "Original", "chart_type": "line", "sql": "SELECT 1"}],
+            charts=[{"id": "c1", "title": "Original", "chart_type": "line", "sql": "SELECT 1", "connection_env": "sg"}],
         )
         self._call(rid, "c1", {"chart_type": "bar"}, "valid_token_abc", mock_report=report)
         # After merge, charts should have chart_type=bar AND sql=SELECT 1
@@ -377,7 +417,7 @@ class TestReportToolServerCallbacks(unittest.IsolatedAsyncioTestCase):
         with patch("backend.services.report_service.update_spec_by_token", return_value=mock_result):
             resp = await s.call_tool("update_spec", {
                 "report_id": "r1", "token": "tok",
-                "spec": {"charts": [], "theme": "light"},
+                "spec": {"charts": [{"id": "c1", "chart_type": "line", "sql": "SELECT 1", "connection_env": "sg"}], "theme": "light"},
             })
         self.assertTrue(resp.data["success"])
         self.assertIn("报表已更新", resp.data["message"])

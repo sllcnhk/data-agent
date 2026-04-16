@@ -11,6 +11,7 @@ from uuid import UUID
 from datetime import datetime
 
 from backend.models.report import Report, Chart, ReportType, ChartType, ShareScope
+from backend.report_spec_utils import normalize_report_spec, validate_report_spec
 
 
 class ReportService:
@@ -629,18 +630,13 @@ def create_report_with_spec(spec: Dict[str, Any], username: str) -> Dict[str, An
     if not isinstance(spec, dict):
         raise ValueError("spec 必须是 JSON 对象")
 
-    title = (spec.get("title") or "").strip() or "分析报告"
-    doc_type = spec.get("doc_type", "dashboard")
+    normalized_spec, spec_errors = validate_report_spec(spec, require_charts=True)
+    if spec_errors:
+        raise ValueError("报表 spec 非法: " + "; ".join(spec_errors))
 
-    # ── 归一化 filters.binds：将 AI 可能传入的 list 格式转换为 dict 格式 ──────────
-    from backend.services.report_params_service import _normalize_binds as _nb
-    raw_filters = spec.get("filters", [])
-    normalized_filters = []
-    for _f in raw_filters:
-        _f2 = dict(_f)
-        if "binds" in _f2:
-            _f2["binds"] = _nb(_f2["binds"])
-        normalized_filters.append(_f2)
+    title = (normalized_spec.get("title") or "").strip() or "分析报告"
+    doc_type = normalized_spec.get("doc_type", "dashboard")
+    normalized_filters = normalized_spec.get("filters", [])
 
     # ── 生成唯一文件名 ──────────────────────────────────────────────────────────
     import time as _time
@@ -654,16 +650,21 @@ def create_report_with_spec(spec: Dict[str, Any], username: str) -> Dict[str, An
 
         report = _Report(
             name=title,
-            description=spec.get("subtitle", ""),
+            description=normalized_spec.get("subtitle", ""),
             report_type=_ReportType.DASHBOARD,
             doc_type=doc_type,
             username=username,
             refresh_token=token,
             report_file_path=relative_path,
-            charts=spec.get("charts", []),
+            charts=normalized_spec.get("charts", []),
             filters=normalized_filters,
-            theme=spec.get("theme", "light"),
-            data_sources=spec.get("data_sources", []),
+            theme=normalized_spec.get("theme", "light"),
+            data_sources=normalized_spec.get("data_sources", []),
+            summary_status="pending" if normalized_spec.get("include_summary") else "skipped",
+            extra_metadata={
+                "spec_version": "1.0",
+                "include_summary": bool(normalized_spec.get("include_summary")),
+            },
         )
         db.add(report)
         db.flush()  # 获取自动生成的 UUID
@@ -671,7 +672,7 @@ def create_report_with_spec(spec: Dict[str, Any], username: str) -> Dict[str, An
 
         # ── 生成动态 HTML（report_id != "preview" → 不嵌入数据行） ──────────────
         # 使用 normalized_filters 替换 spec 中的 filters，确保 HTML 内 binds 为 dict 格式
-        spec_for_html = {**spec, "filters": normalized_filters}
+        spec_for_html = {**normalized_spec, "filters": normalized_filters}
         try:
             html_content = build_report_html(
                 spec=spec_for_html,
@@ -702,7 +703,7 @@ def create_report_with_spec(spec: Dict[str, Any], username: str) -> Dict[str, An
         "name": title,
         "html_path": relative_path,
         "message": (
-            f"报表《{title}》已创建（{len(spec.get('charts', []))} 个图表），"
+            f"报表《{title}》已创建（{len(normalized_spec.get('charts', []))} 个图表），"
             f"打开时自动实时查询数据库，无需嵌入静态数据。"
         ),
     }
@@ -967,8 +968,8 @@ def get_spec_by_token(report_id: str, refresh_token: str) -> Dict[str, Any]:
             raise ValueError(f"报表不存在: {report_id}")
         _verify_refresh_token(report, refresh_token)
 
-        charts = list(report.charts or [])
-        filters = list(report.filters or [])
+        charts = normalize_report_spec({"charts": list(report.charts or [])}).get("charts", [])
+        filters = normalize_report_spec({"filters": list(report.filters or [])}).get("filters", [])
         theme = report.theme or "light"
 
         # 若 DB 中 charts 为 NULL（历史 pin 记录），尝试从 HTML 文件提取并持久化
@@ -978,8 +979,9 @@ def get_spec_by_token(report_id: str, refresh_token: str) -> Dict[str, Any]:
                 _abs = (customer_root / report.report_file_path).resolve()
                 _spec = extract_spec_from_html_file(_abs)
                 if _spec:
-                    charts = _spec.get("charts", [])
-                    filters = _spec.get("filters", [])
+                    normalized_from_html = normalize_report_spec(_spec)
+                    charts = normalized_from_html.get("charts", [])
+                    filters = normalized_from_html.get("filters", [])
                     theme = _spec.get("theme", "light")
                     # 懒写回 DB
                     try:
@@ -1008,6 +1010,9 @@ def get_spec_by_token(report_id: str, refresh_token: str) -> Dict[str, Any]:
             "theme": theme,
             "charts": charts,
             "filters": filters,
+            "include_summary": bool((report.extra_metadata or {}).get("include_summary"))
+            or any(c.get("chart_type") == "ai_analysis" for c in charts)
+            or bool(report.llm_summary),
             "data_sources": list(report.data_sources or []),
             "refresh_token": report.refresh_token,
             "report_file_path": report.report_file_path,
@@ -1053,9 +1058,13 @@ def update_spec_by_token(
         if not report.report_file_path:
             raise ValueError("报表尚无 HTML 文件路径，无法覆写")
 
+        normalized_spec, spec_errors = validate_report_spec(spec, require_charts=True)
+        if spec_errors:
+            raise ValueError("报告 spec 非法: " + "; ".join(spec_errors))
+
         try:
             html_content = build_report_html(
-                spec=spec,
+                spec=normalized_spec,
                 report_id=str(report.id),
                 refresh_token=report.refresh_token,
                 api_base_url=_api_base_url(),
@@ -1068,12 +1077,16 @@ def update_spec_by_token(
         html_path.parent.mkdir(parents=True, exist_ok=True)
         html_path.write_text(html_content, encoding="utf-8")
 
-        report.charts = spec.get("charts", report.charts)
-        report.data_sources = spec.get("data_sources", report.data_sources)
-        report.filters = spec.get("filters", report.filters)
-        report.theme = spec.get("theme", report.theme)
-        if spec.get("title"):
-            report.name = spec["title"]
+        report.charts = normalized_spec.get("charts", report.charts)
+        report.data_sources = normalized_spec.get("data_sources", report.data_sources)
+        report.filters = normalized_spec.get("filters", report.filters)
+        report.theme = normalized_spec.get("theme", report.theme)
+        extra_meta = dict(report.extra_metadata or {})
+        extra_meta["include_summary"] = bool(normalized_spec.get("include_summary"))
+        report.extra_metadata = extra_meta
+        report.summary_status = "pending" if normalized_spec.get("include_summary") else "skipped"
+        if normalized_spec.get("title"):
+            report.name = normalized_spec["title"]
         report.updated_at = datetime.utcnow()
 
         return {
@@ -1119,7 +1132,9 @@ def update_single_chart_by_token(
         if not report.report_file_path:
             raise ValueError("报表尚无 HTML 文件路径，无法覆写")
 
-        existing_charts: List[Dict[str, Any]] = list(report.charts or [])
+        existing_charts: List[Dict[str, Any]] = normalize_report_spec(
+            {"charts": list(report.charts or [])}
+        ).get("charts", [])
         incoming = dict(chart_patch)
         incoming["id"] = chart_id  # chart_id 优先
 
@@ -1134,20 +1149,27 @@ def update_single_chart_by_token(
         if not found:
             merged_charts.append(incoming)
 
-        merged_spec: Dict[str, Any] = {
+        merged_spec: Dict[str, Any] = normalize_report_spec({
             "title": report.name,
             "subtitle": report.description or "",
             "theme": report.theme or "light",
             "filters": report.filters or [],
             "data_sources": report.data_sources or [],
             "charts": merged_charts,
-            "include_summary": False,
+            "include_summary": bool((report.extra_metadata or {}).get("include_summary"))
+            or any((c or {}).get("chart_type") == "ai_analysis" for c in existing_charts)
+            or bool(report.llm_summary),
+            "llm_summary": report.llm_summary or "",
             "data": {},
-        }
+        })
+
+        _normalized_merged_spec, spec_errors = validate_report_spec(merged_spec, require_charts=True)
+        if spec_errors:
+            raise ValueError("报告 spec 非法: " + "; ".join(spec_errors))
 
         try:
             html_content = build_report_html(
-                spec=merged_spec,
+                spec=_normalized_merged_spec,
                 report_id=str(report.id),
                 refresh_token=report.refresh_token,
                 api_base_url=_api_base_url(),
@@ -1160,7 +1182,11 @@ def update_single_chart_by_token(
         html_path.parent.mkdir(parents=True, exist_ok=True)
         html_path.write_text(html_content, encoding="utf-8")
 
-        report.charts = merged_charts
+        report.charts = _normalized_merged_spec.get("charts", merged_charts)
+        extra_meta = dict(report.extra_metadata or {})
+        extra_meta["include_summary"] = bool(_normalized_merged_spec.get("include_summary"))
+        report.extra_metadata = extra_meta
+        report.summary_status = "pending" if _normalized_merged_spec.get("include_summary") else "skipped"
         report.updated_at = datetime.utcnow()
 
         return {

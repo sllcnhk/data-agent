@@ -368,9 +368,11 @@ class TestB_SecurityFixes(unittest.TestCase):
         self.assertEqual(res.status_code, 403, res.text)
 
     def test_B3_compare_digest_used_in_source(self):
-        """源码层确认使用 secrets.compare_digest（防止时序攻击）"""
+        """源码层确认使用 secrets.compare_digest（防止时序攻击）。
+        /refresh-data 委托给 get_report_data，因此检查 get_report_data 中的实现。"""
         import backend.api.reports as rmod
-        src = inspect.getsource(rmod.refresh_report_data)
+        # refresh_report_data 委托给 get_report_data，token 校验在 get_report_data 中
+        src = inspect.getsource(rmod.get_report_data)
         self.assertIn("compare_digest", src, "缺少 compare_digest，存在时序攻击风险")
 
     def test_B4_export_status_checks_ownership(self):
@@ -746,6 +748,415 @@ class TestI_Regression(unittest.TestCase):
         self.assertIn("reports:create", src)
         # admin 角色有 reports:delete
         self.assertIn("reports:delete", src)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# J — T-B3 参数合并：GET /data 端点默认值兜底验证
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestJ_ParamMerge(unittest.TestCase):
+    """J: T-B3 fix — {**default_params, **raw_params} 合并，防止错误 _DEFAULT_PARAMS 导致 Code 38。"""
+
+    from datetime import date as _date, timedelta as _td
+
+    @classmethod
+    def setUpClass(cls):
+        cls._patcher = patch("backend.api.reports._CUSTOMER_DATA_ROOT", _TMPDIR)
+        cls._patcher.start()
+        cls.client = _build_client(_SuperAdmin())
+        # 创建有 date_range filter 的报表
+        import secrets as _sec
+        cls.refresh_token = _sec.token_urlsafe(48)
+        cls.report_id = str(uuid.uuid4())
+        rpt = Report(
+            id=uuid.UUID(cls.report_id),
+            name="ParamMergeTest",
+            username="superadmin",
+            refresh_token=cls.refresh_token,
+            charts=[{
+                "id": "c1",
+                "chart_type": "bar",
+                "sql": "SELECT toDate(s_day) AS day, sum(cnt) AS cnt FROM t WHERE s_day >= toDate('{{ date_start }}') AND s_day <= toDate('{{ date_end }}') GROUP BY day",
+                "connection_env": "sg",
+                "connection_type": "clickhouse",
+                "x_field": "day",
+                "y_fields": ["cnt"],
+            }],
+            filters=[{
+                "id": "date_range",
+                "type": "date_range",
+                "default_days": 30,
+                "binds": {"start": "date_start", "end": "date_end"},
+            }],
+            data_sources=[],
+        )
+        _mock_store[cls.report_id] = rpt
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._patcher.stop()
+        _mock_store.pop(cls.report_id, None)
+
+    def _get_data(self, extra_params=None):
+        from unittest.mock import AsyncMock, patch as _patch
+        params = {"token": self.refresh_token}
+        if extra_params:
+            params.update(extra_params)
+        with _patch("backend.api.reports._run_query", new=AsyncMock(return_value=[])):
+            return self.client.get(f"/api/v1/reports/{self.report_id}/data", params=params)
+
+    def test_J1_no_params_defaults_applied(self):
+        """未传参数 → default_days=30 自动计算 date_start/date_end。"""
+        from datetime import date, timedelta
+        resp = self._get_data()
+        self.assertEqual(resp.status_code, 200)
+        params = resp.json().get("params_used", {})
+        today = date.today()
+        expected = (today - timedelta(days=30)).isoformat()
+        self.assertEqual(params.get("date_start"), expected, f"params={params}")
+        self.assertEqual(params.get("date_end"), today.isoformat(), f"params={params}")
+
+    def test_J2_wrong_key_params_still_get_default_dates(self):
+        """T-B3 核心: 传 c1/c2（图表 ID 错误 key）→ date_start/date_end 由默认兜底填入。
+        这是 Code 38 根本修复的 E2E 验证。"""
+        from datetime import date, timedelta
+        resp = self._get_data({"c1": "2026-03-17", "c2": "2026-04-16"})
+        self.assertEqual(resp.status_code, 200)
+        params = resp.json().get("params_used", {})
+        today = date.today()
+        expected = (today - timedelta(days=30)).isoformat()
+        self.assertEqual(params.get("date_start"), expected,
+                         f"T-B3 应兜底 date_start，params={params}")
+        self.assertEqual(params.get("date_end"), today.isoformat(),
+                         f"T-B3 应兜底 date_end，params={params}")
+        # 错误 key 仍透传
+        self.assertIn("c1", params)
+        self.assertIn("c2", params)
+
+    def test_J3_correct_params_override_defaults(self):
+        """运行时 date_start/date_end 覆盖默认值（{**default, **runtime} 顺序正确）。"""
+        resp = self._get_data({"date_start": "2024-01-01", "date_end": "2024-12-31"})
+        self.assertEqual(resp.status_code, 200)
+        params = resp.json().get("params_used", {})
+        self.assertEqual(params.get("date_start"), "2024-01-01", "运行时参数覆盖默认值")
+        self.assertEqual(params.get("date_end"), "2024-12-31", "运行时参数覆盖默认值")
+
+    def test_J4_mixed_params_partial_override(self):
+        """混合参数: c1 错误 + date_start 正确 → date_start 覆盖，date_end 由默认填充。"""
+        from datetime import date
+        resp = self._get_data({"c1": "2026-01-01", "date_start": "2025-01-01"})
+        self.assertEqual(resp.status_code, 200)
+        params = resp.json().get("params_used", {})
+        self.assertEqual(params.get("date_start"), "2025-01-01", "传入值覆盖默认")
+        self.assertEqual(params.get("date_end"), date.today().isoformat(), "未传由默认填充")
+
+    def test_J5_wrong_token_returns_403(self):
+        """回归：错误 token → 403。"""
+        from unittest.mock import AsyncMock, patch as _patch
+        with _patch("backend.api.reports._run_query", new=AsyncMock(return_value=[])):
+            resp = self.client.get(f"/api/v1/reports/{self.report_id}/data",
+                                   params={"token": "WRONG-TOKEN"})
+        self.assertEqual(resp.status_code, 403)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# K — T-A1/A2/B1/B2: /build 端点 binds 自动修正 + today()-N 不阻塞
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestK_BuildBindsCorrection(unittest.TestCase):
+    """K: POST /reports/build — T-A1（非阻塞）+ T-A2（auto-parameterize）+ T-B1/B2（binds 修正）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._patcher = patch("backend.api.reports._CUSTOMER_DATA_ROOT", _TMPDIR)
+        cls._patcher.start()
+        cls.client = _build_client(_SuperAdmin())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._patcher.stop()
+
+    def _get_newly_stored_report(self, before_keys):
+        """找到 POST /build 后新增到 _mock_store 的 Report 对象。"""
+        for k, v in _mock_store.items():
+            if k not in before_keys:
+                return v
+        return None
+
+    def test_K1_wrong_binds_does_not_block_build(self):
+        """T-A1/B1: binds 使用图表 ID (c1/c2) 而非 SQL 变量名 → HTTP 200，不返回 400。"""
+        spec = {
+            "title": "test_wrong_binds_K1",
+            "charts": [{
+                "id": "c1",
+                "chart_type": "bar",
+                "title": "近30天接通",
+                "sql": "SELECT toDate(s_day) AS day, cnt FROM t WHERE s_day >= toDate('{{ date_start }}') AND s_day <= toDate('{{ date_end }}')",
+                "connection_env": "sg",
+                "x_field": "day",
+                "y_fields": ["cnt"],
+            }],
+            "filters": [{
+                "id": "date_range",
+                "type": "date_range",
+                "default_days": 30,
+                "binds": {"start": "c1", "end": "c2"},  # ❌ 图表 ID 作为 binds 变量名
+            }],
+        }
+        res = self.client.post("/api/v1/reports/build", json={"spec": spec})
+        self.assertEqual(res.status_code, 200, f"resp: {res.text}")
+        self.assertTrue(res.json().get("success"))
+
+    def test_K2_wrong_binds_corrected_in_stored_filters(self):
+        """T-B1/B2: 创建后 DB 存储的 report.filters.binds 已自动修正为 date_start/date_end。"""
+        before = set(_mock_store.keys())
+        spec = {
+            "title": "test_wrong_binds_K2",
+            "charts": [{
+                "id": "c1",
+                "chart_type": "line",
+                "title": "趋势",
+                "sql": "SELECT s_day, cnt FROM t WHERE s_day >= toDate('{{ date_start }}') AND s_day < toDate('{{ date_end }}')",
+                "connection_env": "sg",
+                "x_field": "s_day",
+                "y_fields": ["cnt"],
+            }],
+            "filters": [{
+                "id": "date_range",
+                "type": "date_range",
+                "default_days": 30,
+                "binds": {"start": "c1", "end": "c2"},
+            }],
+        }
+        res = self.client.post("/api/v1/reports/build", json={"spec": spec})
+        self.assertEqual(res.status_code, 200)
+        rpt = self._get_newly_stored_report(before)
+        self.assertIsNotNone(rpt, "新报告应存入 _mock_store")
+        stored_filters = rpt.filters if hasattr(rpt, "filters") else []
+        date_filter = next((f for f in stored_filters if f.get("type") == "date_range"), None)
+        self.assertIsNotNone(date_filter, f"应有 date_range filter: {stored_filters}")
+        binds = date_filter.get("binds", {})
+        self.assertEqual(binds.get("start"), "date_start",
+                         f"binds.start 应修正为 date_start，实际: {binds}")
+        self.assertEqual(binds.get("end"), "date_end",
+                         f"binds.end 应修正为 date_end，实际: {binds}")
+
+    def test_K3_today_n_sql_does_not_block_build(self):
+        """T-A1: SQL 含 today()-N 形式 → HTTP 200（软警告，不阻塞）。"""
+        spec = {
+            "title": "test_today_n_K3",
+            "charts": [{
+                "id": "c1",
+                "chart_type": "bar",
+                "title": "近30天",
+                "sql": "SELECT s_day, cnt FROM t WHERE s_day >= today() - 30 AND s_day <= today()",
+                "connection_env": "sg",
+                "x_field": "s_day",
+                "y_fields": ["cnt"],
+            }],
+            "filters": [{
+                "id": "date_range",
+                "type": "date_range",
+                "default_days": 30,
+                "binds": {"start": "date_start", "end": "date_end"},
+            }],
+        }
+        res = self.client.post("/api/v1/reports/build", json={"spec": spec})
+        self.assertEqual(res.status_code, 200, f"resp: {res.text}")
+        self.assertTrue(res.json().get("success"))
+
+    def test_K4_today_n_sql_auto_parameterized_in_stored_spec(self):
+        """T-A2: today()-N SQL 经 normalize 自动替换为 {{ date_start }}/{{ date_end }}。"""
+        before = set(_mock_store.keys())
+        spec = {
+            "title": "test_today_n_K4",
+            "charts": [{
+                "id": "c1",
+                "chart_type": "bar",
+                "title": "日趋势",
+                "sql": "SELECT s_day, cnt FROM t WHERE s_day >= today() - 30 AND s_day <= today()",
+                "connection_env": "sg",
+                "x_field": "s_day",
+                "y_fields": ["cnt"],
+            }],
+            "filters": [{
+                "id": "date_range",
+                "type": "date_range",
+                "default_days": 30,
+                "binds": {"start": "date_start", "end": "date_end"},
+            }],
+        }
+        res = self.client.post("/api/v1/reports/build", json={"spec": spec})
+        self.assertEqual(res.status_code, 200)
+        rpt = self._get_newly_stored_report(before)
+        self.assertIsNotNone(rpt)
+        stored_charts = rpt.charts if hasattr(rpt, "charts") else []
+        stored_sql = stored_charts[0].get("sql", "") if stored_charts else ""
+        self.assertIn("{{ date_start }}", stored_sql,
+                      f"today()-N 应被参数化: {stored_sql}")
+        self.assertIn("{{ date_end }}", stored_sql,
+                      f"today()-N 应被参数化: {stored_sql}")
+        self.assertNotIn("today()", stored_sql,
+                         f"today() 不应遗留: {stored_sql}")
+
+    def test_K5_empty_charts_blocked(self):
+        """硬错误保留：spec.charts 为空 → 400。"""
+        res = self.client.post("/api/v1/reports/build",
+                               json={"spec": {"title": "x", "charts": [], "filters": []}})
+        self.assertEqual(res.status_code, 400)
+
+    def test_K6_chart_missing_connection_env_blocked(self):
+        """硬错误保留：图表缺少 connection_env → 400。"""
+        spec = {
+            "title": "no_conn",
+            "charts": [{"id": "c1", "chart_type": "bar", "sql": "SELECT 1"}],
+            "filters": [],
+        }
+        res = self.client.post("/api/v1/reports/build", json={"spec": spec})
+        self.assertEqual(res.status_code, 400)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# L — 新端点 RBAC 与功能验证（analyze / regenerate-html / rebuild-spec）
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestL_NewEndpoints(unittest.TestCase):
+    """L: 本次新增/修改端点的 RBAC 权限配置 + 基本行为验证。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import secrets as _sec
+        cls._patcher = patch("backend.api.reports._CUSTOMER_DATA_ROOT", _TMPDIR)
+        cls._patcher.start()
+        cls.superadmin_client = _build_client(_SuperAdmin())
+        cls.refresh_token = _sec.token_urlsafe(48)
+        cls.report_id = str(uuid.uuid4())
+        rpt = Report(
+            id=uuid.UUID(cls.report_id),
+            name="NewEndpointTest",
+            username="superadmin",
+            refresh_token=cls.refresh_token,
+            charts=[{"id": "c1", "chart_type": "bar", "sql": "SELECT 1", "connection_env": "sg"}],
+            filters=[],
+            data_sources=[],
+        )
+        _mock_store[cls.report_id] = rpt
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._patcher.stop()
+        _mock_store.pop(cls.report_id, None)
+
+    # ── analyze endpoint ──────────────────────────────────────────────────────
+
+    def test_L1_analyze_wrong_token_returns_403(self):
+        """POST /{id}/analyze: 错误 token → 403（与 /data 端点鉴权一致）。"""
+        res = self.superadmin_client.post(
+            f"/api/v1/reports/{self.report_id}/analyze",
+            params={"token": "WRONG"},
+            json={"charts_data": {}},
+        )
+        self.assertEqual(res.status_code, 403, res.text)
+
+    def test_L2_analyze_valid_token_returns_success(self):
+        """POST /{id}/analyze: 正确 token + mock LLM → 200 success。"""
+        from unittest.mock import AsyncMock, patch as _patch
+        fake = [{"type": "trend", "title": "趋势", "content": "上升趋势"}]
+        with _patch("backend.api.reports.analyze_report_data", new=AsyncMock(return_value=fake)):
+            res = self.superadmin_client.post(
+                f"/api/v1/reports/{self.report_id}/analyze",
+                params={"token": self.refresh_token},
+                json={"charts_data": {"c1": [{"day": "2026-04-01", "cnt": 100}]},
+                      "report_title": "测试"},
+            )
+        self.assertEqual(res.status_code, 200, res.text)
+        body = res.json()
+        self.assertTrue(body["success"])
+        self.assertEqual(body["count"], 1)
+
+    def test_L3_analyze_ai_analysis_chart_specs_filtered(self):
+        """POST /{id}/analyze: chart_specs 中 ai_analysis 自动过滤，不进入 LLM 分析。"""
+        from unittest.mock import AsyncMock, patch as _patch
+        captured: list = []
+
+        async def _fake(charts_data, report_title, analysis_focus, chart_specs):
+            captured.extend(chart_specs)
+            return []
+
+        with _patch("backend.api.reports.analyze_report_data", new=_fake):
+            self.superadmin_client.post(
+                f"/api/v1/reports/{self.report_id}/analyze",
+                params={"token": self.refresh_token},
+                json={
+                    "charts_data": {},
+                    "chart_specs": [
+                        {"id": "c1", "chart_type": "bar"},
+                        {"id": "s1", "chart_type": "ai_analysis"},
+                    ],
+                },
+            )
+        ai_specs = [s for s in captured if s.get("chart_type") == "ai_analysis"]
+        self.assertEqual(len(ai_specs), 0, "ai_analysis 不应传给 LLM")
+        self.assertEqual(len(captured), 1)
+
+    def test_L4_analyze_oversized_data_capped(self):
+        """POST /{id}/analyze: 总行数 >2000 时截断（防 LLM token 超限）。"""
+        from unittest.mock import AsyncMock, patch as _patch
+        big = [{"day": str(i), "cnt": i} for i in range(1001)]
+        captured: list = []
+
+        async def _fake(charts_data, **kwargs):
+            captured.append(charts_data)
+            return []
+
+        with _patch("backend.api.reports.analyze_report_data", new=_fake):
+            self.superadmin_client.post(
+                f"/api/v1/reports/{self.report_id}/analyze",
+                params={"token": self.refresh_token},
+                json={"charts_data": {"c1": big, "c2": big, "c3": big}},
+            )
+
+        self.assertEqual(len(captured), 1)
+        total = sum(len(v) for v in captured[0].values() if isinstance(v, list))
+        self.assertLessEqual(total, 2003, f"截断后 ≤ 2000，实际: {total}")
+
+    # ── regenerate-html / rebuild-spec RBAC ──────────────────────────────────
+
+    def test_L5_regenerate_html_requires_reports_create(self):
+        """POST /{id}/regenerate-html: 无 reports:create 权限 → 403。"""
+        with patch("backend.core.rbac.get_user_permissions", return_value=[]):
+            client = _build_client(_ViewerUser())
+            res = client.post(f"/api/v1/reports/{self.report_id}/regenerate-html")
+        self.assertEqual(res.status_code, 403, res.text)
+
+    def test_L6_rebuild_spec_requires_reports_create(self):
+        """POST /{id}/rebuild-spec: 无 reports:create 权限 → 403。"""
+        with patch("backend.core.rbac.get_user_permissions", return_value=[]):
+            client = _build_client(_ViewerUser())
+            res = client.post(f"/api/v1/reports/{self.report_id}/rebuild-spec")
+        self.assertEqual(res.status_code, 403, res.text)
+
+    def test_L7_rbac_init_has_all_reports_permissions(self):
+        """init_rbac.py 中 reports:* 权限完整（read/create/delete），且角色分配正确。"""
+        from backend.scripts.init_rbac import PERMISSIONS, ROLES
+        perm_keys = {f"{r}:{a}" for r, a, _ in PERMISSIONS}
+        self.assertIn("reports:read", perm_keys)
+        self.assertIn("reports:create", perm_keys)
+        self.assertIn("reports:delete", perm_keys)
+        # analyst 有 read+create，无 delete
+        analyst = set(ROLES["analyst"]["permissions"])
+        self.assertIn("reports:read", analyst)
+        self.assertIn("reports:create", analyst)
+        self.assertNotIn("reports:delete", analyst)
+        # admin 有全部
+        admin = set(ROLES["admin"]["permissions"])
+        self.assertIn("reports:read", admin)
+        self.assertIn("reports:create", admin)
+        self.assertIn("reports:delete", admin)
+        # viewer 无任何 reports:* 权限
+        viewer = set(ROLES["viewer"]["permissions"])
+        rpts = {p for p in viewer if p.startswith("reports:")}
+        self.assertEqual(rpts, set(), f"viewer 不应有报表权限: {rpts}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

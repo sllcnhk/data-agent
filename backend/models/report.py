@@ -225,7 +225,7 @@ class Report(Base):
 
     def increment_view_count(self):
         """增加浏览次数"""
-        self.view_count += 1
+        self.view_count = (self.view_count or 0) + 1
         self.last_viewed_at = datetime.utcnow()
         self.updated_at = datetime.utcnow()
 

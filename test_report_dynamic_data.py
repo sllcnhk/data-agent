@@ -331,10 +331,125 @@ class TestG4DataEndpoint(unittest.TestCase):
         result = render_sql(sql, {"date_start": "2024-01-01", "date_end": "2024-12-31"})
         self.assertEqual(result, "SELECT '2024-01-01' AS ds, '2024-12-31' AS de")
 
+    def test_G4_5_legacy_chart_spec_is_normalized_and_executed(self):
+        """legacy DSL（dataset/xField/yField）应在 /data 端点被规范化并成功取数。"""
+        token = "test-token-g4-legacy"
+        report = MagicMock()
+        report.id = uuid.UUID("aaaaaaaa-0000-0000-0000-000000000005")
+        report.refresh_token = token
+        report.charts = [{
+            "id": "c1",
+            "type": "bar",
+            "dataset": {
+                "source": "clickhouse",
+                "server": "clickhouse-sg",
+                "query": "SELECT toString(today()) AS s_day, 'SG' AS env, 1 AS connected_calls",
+            },
+            "xField": "s_day",
+            "yField": "connected_calls",
+            "seriesField": "env",
+        }]
+        report.filters = []
+        report.llm_summary = ""
+        report.increment_view_count = MagicMock()
+        client = self._make_client_with_report(report)
 
-# ═════════════════════════════════════════════════════════════════════════════
-# G5 — HTML 生成验证
-# ═════════════════════════════════════════════════════════════════════════════
+        with patch("api.reports._run_query", new=AsyncMock(return_value=[
+            {"s_day": "2026-04-16", "env": "SG", "connected_calls": 1}
+        ])):
+            resp = client.get(
+                f"/api/v1/reports/{report.id}/data",
+                params={"token": token},
+            )
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["success"])
+        self.assertIn("c1", body["data"])
+        self.assertEqual(body["errors"], {})
+        self.assertEqual(body["data"]["c1"][0]["connected_calls"], 1)
+
+    def test_G4_6_invalid_chart_spec_returns_explicit_error(self):
+        """缺少 sql/connection_env 的图表不应静默跳过，应返回明确 errors。"""
+        token = "test-token-g4-invalid"
+        report = MagicMock()
+        report.id = uuid.UUID("aaaaaaaa-0000-0000-0000-000000000006")
+        report.refresh_token = token
+        report.charts = [{
+            "id": "c1",
+            "chart_type": "bar",
+            "title": "Broken Chart",
+        }]
+        report.filters = []
+        report.llm_summary = ""
+        report.increment_view_count = MagicMock()
+        client = self._make_client_with_report(report)
+
+        resp = client.get(
+            f"/api/v1/reports/{report.id}/data",
+            params={"token": token},
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["success"])
+        self.assertEqual(body["data"], {})
+        self.assertIn("c1", body["errors"])
+        self.assertIn("sql", body["errors"]["c1"])
+        self.assertIn("connection_env", body["errors"]["c1"])
+
+    def test_G4_7_openai_like_report_gets_auto_filter_and_real_summary(self):
+        """OpenAI-style recent-30-days trend + fake summary table should auto-fix to date_range + ai_analysis."""
+        token = "test-token-g4-openai"
+        report = MagicMock()
+        report.id = uuid.UUID("aaaaaaaa-0000-0000-0000-000000000007")
+        report.refresh_token = token
+        report.name = "recent_30d_connected_call_report"
+        report.description = ""
+        report.theme = "light"
+        report.charts = [
+            {
+                "id": "c1",
+                "chart_type": "bar",
+                "title": "recent_30d_connected_call_daily_stack",
+                "sql": "SELECT s_day, SaaS AS env, sum(call_num) AS connected_calls FROM t PREWHERE s_day >= today() - 29 AND s_day <= today() GROUP BY s_day, env",
+                "connection_env": "sg",
+                "x_field": "s_day",
+                "y_field": "connected_calls",
+                "series_field": "env",
+            },
+            {
+                "id": "c3",
+                "chart_type": "table",
+                "title": "summary_table",
+                "description": "summary generated from chart results",
+                "sql": "SELECT 'stat_window' AS item, '30d' AS value UNION ALL SELECT 'risk', 'check_data'",
+                "connection_env": "sg",
+            },
+        ]
+        report.filters = [{"id": "f1", "type": "note", "content": "stats note"}]
+        report.llm_summary = ""
+        report.summary_status = "skipped"
+        report.extra_metadata = {"include_summary": False}
+        report.increment_view_count = MagicMock()
+        report.report_file_path = None
+        client = self._make_client_with_report(report)
+
+        with patch("api.reports._get_default_llm_adapter", new=AsyncMock(return_value=MagicMock())):
+            with patch("api.reports._run_query", new=AsyncMock(return_value=[{"s_day": "2026-04-16", "env": "SG", "connected_calls": 1}])):
+                with patch("api.reports.generate_llm_summary", new=AsyncMock(return_value="auto summary generated")):
+                    resp = client.get(
+                        f"/api/v1/reports/{report.id}/data",
+                        params={"token": token},
+                    )
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["success"])
+        self.assertEqual(body["params_used"]["date_start"], (date.today() - timedelta(days=30)).isoformat())
+        self.assertEqual(body["params_used"]["date_end"], date.today().isoformat())
+        self.assertEqual(body["llm_summary"], "auto summary generated")
+
 
 class TestG5HTMLGeneration(unittest.TestCase):
     """build_report_html: 保存模式 vs 预览模式的 JS 注入验证。"""
@@ -436,6 +551,37 @@ class TestG5HTMLGeneration(unittest.TestCase):
         if refresh_all_idx >= 0:
             refresh_fn = html[refresh_all_idx:refresh_all_idx + 200]
             self.assertNotIn("refresh-data", refresh_fn)
+
+    def test_G5_7_legacy_chart_keys_are_normalized_in_report_spec(self):
+        """legacy chart key 生成 HTML 时应落成标准 REPORT_SPEC 字段。"""
+        from backend.services.report_builder_service import build_report_html
+        spec = {
+            "title": "Legacy HTML",
+            "charts": [{
+                "id": "c1",
+                "type": "bar",
+                "dataset": {
+                    "source": "clickhouse",
+                    "server": "clickhouse-sg",
+                    "query": "SELECT 1 AS cnt, '2026-04-16' AS dt",
+                },
+                "xField": "dt",
+                "yField": "cnt",
+            }],
+            "filters": [],
+        }
+        html = build_report_html(
+            spec=spec,
+            report_id="saved-legacy",
+            refresh_token="tok123",
+            api_base_url="http://localhost:8000/api/v1",
+        )
+        self.assertIn('"chart_type": "bar"', html)
+        self.assertIn('"sql": "SELECT 1 AS cnt, \'2026-04-16\' AS dt"', html)
+        # "clickhouse-sg" 在 normalize_chart_spec 中被自动剥离前缀为 "sg"
+        self.assertIn('"connection_env": "sg"', html)
+        self.assertIn('"x_field": "dt"', html)
+        self.assertIn('"y_fields": ["cnt"]', html)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -608,3 +754,18 @@ class TestG7Regression(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestG6PromptGuardrailsSource(unittest.TestCase):
+    """?? copilot prompt ???????????"""
+
+    def test_G6_5_reports_prompt_mentions_standard_spec_fields(self):
+        text = Path("backend/api/reports.py").read_text(encoding="utf-8")
+        self.assertIn("???????????chart_type/sql/connection_env/x_field/y_fields/series_field", text)
+        self.assertIn("type/dataset/xField/yField/seriesField", text)
+
+    def test_G6_6_reports_prompt_mentions_date_range_and_summary_rules(self):
+        text = Path("backend/api/reports.py").read_text(encoding="utf-8")
+        self.assertIn("?N?/??/????????? date_range", text)
+        self.assertIn("include_summary=true ? ai_analysis", text)
+        self.assertIn("?? table + UNION ALL", text)

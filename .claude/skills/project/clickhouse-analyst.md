@@ -48,6 +48,11 @@ ClickHouse 外呼业务数据分析专家，熟悉多区域 SaaS 平台（SG/IDN
           └─ 否 → 纯文字分析 / 数据表格 → 可选 MD 文件或直接回复
 ```
 
+**AI 分析总结触发关键词**：
+- 中文：总结 / 归纳 / 分析 / 趋势 / 异常 / 洞察 / 建议 / 发现
+- 英文：summary / analysis / trend / anomaly / insight / recommendation / findings
+- 当报表请求中出现以上关键词时，应在 `charts` 数组末尾添加 `ai_analysis` 图表
+
 **强制规则：**
 1. 只要请求中出现任何图表类型词，必须调用 `report__create` 创建动态报表，**禁止生成 `.md` 图表报告**
 2. `report__create` 返回 report_id 即表示报表已创建完成，无需再写文件，无需额外操作
@@ -112,11 +117,29 @@ report__create({
 
 **⚠️ binds 格式**：必须是 dict `{"start": "date_start", "end": "date_end"}`，**不能**是 list `["date_start", "date_end"]`。
 
+**⚠️ binds 与 SQL 变量名必须一致（严格规则，适用于所有模型）**：
+`binds.start` 的值必须与 SQL 中 `{{ }}` 内的变量名**完全相同**。
+
+```json
+// ✅ 正确：binds.start = "date_start"，SQL 中用 {{ date_start }}
+{
+  "binds": { "start": "date_start", "end": "date_end" },
+  "sql": "WHERE s_day >= '{{ date_start }}' AND s_day < '{{ date_end }}'"
+}
+
+// ❌ 错误：binds.start = "c1"（图表 ID！），SQL 中用 {{ date_start }} → 不匹配 → 日期为空 → Code 38
+{
+  "binds": { "start": "c1", "end": "c2" },
+  "sql": "WHERE s_day >= '{{ date_start }}' AND s_day < '{{ date_end }}'"
+}
+```
+
 **❌ 禁止事项：**
 - 禁止查询大量数据后嵌入 JS 数组（会导致数据截断、报表静态化）
 - 禁止用 `filesystem__write_file` 写 HTML 图表报表
-- 禁止在 spec.charts[].sql 里写死时间范围（要用 `{{ date_start }}`）
+- 禁止在 spec.charts[].sql 里写死时间范围（要用 `{{ date_start }}`），**`today() - N` 形式亦属硬编码**
 - 禁止因为"查不到数据"就改成 MD 格式
+- **禁止将图表 ID（如 `"c1"`、`"c2"`）用作 binds.start/end 的变量名**
 
 ---
 
@@ -134,6 +157,57 @@ report__create({
 
 - 所有环境主数据库名：`crm`
 - 遍历所有环境时，依次对每个环境执行相同查询逻辑
+
+---
+
+## 一-B、测试企业排除规则（强制）
+
+只要分析口径涉及企业维度、账单归属、企业名称、Create_User、Unique_ID_Latest_Create 等企业属性，必须先关联 `Dim_Enterprise`，再过滤测试企业：
+
+### 1. 汇集库 `integrated_data` 查询
+
+```sql
+LEFT JOIN (
+    SELECT
+        Environment,
+        Enterprise_ID,
+        Enterprise_Name,
+        Create_User,
+        Unique_ID_Latest_Create,
+        Name_Test_Flag AS test_flag
+    FROM integrated_data.Dim_Enterprise ent FINAL
+    WHERE ent.statistic_is_delete = 0
+) ent
+    ON ent.Environment = bb.SaaS
+   AND ent.Enterprise_ID = bb.enterprise_id
+
+WHERE ent.test_flag = 0
+```
+
+### 2. 各环境本地库 `data_statistics` 查询
+
+```sql
+LEFT JOIN (
+    SELECT
+        Environment,
+        Enterprise_ID,
+        Enterprise_Name,
+        Create_User,
+        Unique_ID_Latest_Create,
+        Name_Test_Flag AS test_flag
+    FROM data_statistics.Dim_Enterprise ent FINAL
+    WHERE ent.statistic_is_delete = 0
+) ent
+    ON ent.Enterprise_ID = bb.enterprise_id
+
+WHERE ent.test_flag = 0
+```
+
+**执行要求：**
+- `Name_Test_Flag` 一律映射为别名 `test_flag`
+- 汇集库必须按 `Environment + Enterprise_ID` 关联
+- 单环境库默认按 `Enterprise_ID` 关联
+- 企业分析默认排除测试 enterprise；若用户明确要求看测试企业，才可移除该过滤
 
 ---
 
@@ -453,7 +527,7 @@ window.REPORT_SPEC = REPORT_SPEC;
 
 **规则**：
 - `id` 必须与对应 `echarts.init(document.getElementById('chart-bar-1'))` 的 DOM id 完全一致
-- `chart_type` 取值：`bar` / `line` / `pie` / `scatter` / `area` / `gauge` / `radar`
+- `chart_type` 取值：`bar` / `line` / `pie` / `scatter` / `area` / `gauge` / `radar` / `ai_analysis`
 - `sql` **必须使用 Jinja2 参数变量** `{{ date_start }}` / `{{ date_end }}` 等，**禁止硬编码日期**
 - `connection_env` 填写 ClickHouse 环境标识（`sg` / `idn` / `br` 等）；`connection_type` 默认 `"clickhouse"`
 - 每个 ECharts 图表必须对应 `charts` 数组中的一个元素
@@ -465,6 +539,53 @@ window.REPORT_SPEC = REPORT_SPEC;
 - `y_fields`：SQL 结果中作为 Y 轴的列名数组（如 `["cnt"]`、`["connected_calls", "am_calls"]`）
 - `series_field`：SQL 结果中作为分组维度的列名（如 `"connection_env"`），有多环境/多维度分组时必填，单系列留空或省略
 - **缺少这三个字段将导致图表在动态数据加载后无法正确渲染（X 轴显示 undefined）**
+
+---
+
+### 🤖 ai_analysis 图表类型（AI 数据分析总结）
+
+**定义**：`ai_analysis` 是一种特殊图表类型，用于在报表中显示由 LLM（大语言模型）自动生成的数据分析和洞察。
+
+**触发条件**：用户请求中包含"总结"、"归纳"、"分析"、"趋势"、"异常"、"洞察"、"summary"、"insight"、"analysis"、"recommendation"等关键词时，应在报表末尾添加此图表。
+
+**chart_type**: `"ai_analysis"`
+
+**字段要求**：
+- `id`: 图表唯一标识（建议如 `"summary_1"`, `"ai_insight_1"`）
+- `chart_type`: 必须为 `"ai_analysis"`
+- `title`: 图表标题（如 `"数据趋势分析与洞察"`）
+- `width`: 建议设为 `"full"`（全宽显示）
+- **无需** `sql`、`connection_env`、`x_field`、`y_fields`、`series_field` 等字段
+- **无需** `echarts_override`
+
+**示例**：
+```json
+{
+  "id": "summary_1",
+  "chart_type": "ai_analysis",
+  "title": "数据趋势分析与洞察",
+  "width": "full"
+}
+```
+
+**工作机制**：
+1. 报表加载时，先查询并渲染所有常规图表（从 ClickHouse 获取数据）
+2. 所有图表数据就绪后，前端自动调用 `POST /api/v1/reports/{id}/analyze?token=xxx`
+3. 后端收集所有图表数据，调用 LLM（优先级：Claude → OpenAI → Gemini → Qianwen → Doubao）
+4. LLM 返回结构化分析：
+   - **趋势分析**（trend）：识别上升/下降/波动趋势，量化变化幅度
+   - **异常检测**（anomaly）：找出明显偏离正常范围的数据点，推测原因
+   - **业务洞察**（insight）：结合 SaaS 外呼业务解读数据含义
+   - **总结建议**（conclusion）：给出 1-3 条可执行的业务建议
+5. 前端在 AI 分析卡片中以分区块形式展示（带图标和颜色编码）
+
+**建议位置**：`charts` 数组最后一个元素（作为报表总结）
+
+**注意事项**：
+- 不需要在 `sql` 中硬编码数据分析逻辑，LLM 会根据实际查询结果动态分析
+- 分析等待时间通常 5-15 秒，前端会显示"AI 正在分析数据…"加载提示
+- 若 LLM 不可用（API key 未配置或全部超时），卡片显示"分析失败"，不影响其他图表
+- 分析内容基于报表的**实际查询结果**（而非对话中的静态数据），因此每次筛选条件变化都会重新分析
 
 ---
 
@@ -512,9 +633,14 @@ WHERE call_start_time >= '{{ date_start }}'
   {% if enterprise_id %}AND enterprise_id = '{{ enterprise_id }}'{% endif %}
 ```
 
-### 注意事项
+### ⚠️ 参数化 SQL 强制规则（所有模型必须遵守）
 
 1. **必须有筛选器**：生成报表时至少包含一个 `date_range` 类型的筛选器，并配置 `binds`
-2. **变量名一致**：`binds.start` / `binds.end` 的值必须与 SQL 中 `{{ }}` 内的变量名完全一致
-3. **AI 生成预览时**：先调用 `render_sql(template, default_params)` 预填默认参数再查询 ClickHouse
-4. **禁止硬编码**：SQL 中不得出现 `WHERE date >= '2025-01-01'` 形式的固定日期
+2. **变量名严格一致**：`binds.start` / `binds.end` 的值必须与 SQL 中 `{{ }}` 内的变量名**字符完全相同**
+   - 正确：`"binds": {"start": "date_start", "end": "date_end"}` ↔ SQL 用 `{{ date_start }}`、`{{ date_end }}`
+   - **错误**：`"binds": {"start": "c1", "end": "c2"}` ↔ SQL 用 `{{ date_start }}` → **变量名不匹配，日期渲染为空 → ClickHouse Code 38**
+3. **禁止硬编码**：SQL 中不得出现以下形式的固定日期：
+   - 绝对日期：`WHERE date >= '2025-01-01'`
+   - 相对日期：`WHERE s_day >= today() - 30`（`today() - N` 也是硬编码！）
+   - **应替换为**：`WHERE s_day >= toDate('{{ date_start }}') AND s_day <= toDate('{{ date_end }}')`
+4. **禁止用图表 ID 作参数名**：`binds.start`/`binds.end` 必须是有意义的 SQL 变量名（`date_start`、`date_end`），**不能是图表 ID**（`c1`、`c2` 等）
