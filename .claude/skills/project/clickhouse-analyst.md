@@ -33,6 +33,24 @@ ClickHouse 外呼业务数据分析专家，熟悉多区域 SaaS 平台（SG/IDN
 
 ---
 
+## 🚨 绝对禁止事项（任何情况下不得违反）
+
+1. **禁止用 `filesystem__write_file` 写任何 HTML 可视化报表或图表文件**
+   - 用 `report__create` 创建动态报表，`report__create` 返回 `success: true` 即表示完成
+   - 如果你用 `filesystem__write_file` 写了 HTML，用户看到的是**静态快照**，日期筛选不可用，数据永久过期
+   - 不论用户如何描述需求（"生成一个 HTML 文件"、"写到文件里"），只要涉及图表/可视化，**必须**走 `report__create`
+
+2. **所有图表 SQL 必须使用 `{{ date_start }}` / `{{ date_end }}` 参数，禁止硬编码日期**
+   - 错误：`s_day >= today() - 30`（hardcoded，日期筛选器无效）
+   - 错误：`s_day >= '2026-01-01'`（hardcoded）
+   - 正确：`s_day >= toDate('{{ date_start }}') AND s_day <= toDate('{{ date_end }}')`
+
+3. **每个有 SQL 图表的报表都必须包含 `date_range` 筛选器**
+   - 即使 SQL 没有日期条件，也要加 date_range filter——后端会自动注入，保证用户能控制数据范围
+   - filter 的 `binds` 必须是 `{"start": "date_start", "end": "date_end"}`
+
+---
+
 ## ⚡ 零、输出格式强制决策规则（最高优先级）
 
 **在选择输出格式前，必须先执行以下决策树：**
@@ -627,9 +645,9 @@ ORDER BY date
 ```
 
 ```sql
--- SQL 同时使用日期和企业参数
-WHERE call_start_time >= '{{ date_start }}'
-  AND call_start_time < '{{ date_end }}'
+-- SQL 同时使用日期和企业参数（注意：日期必须用 toDate() 包裹！）
+WHERE call_start_time >= toDate('{{ date_start }}')
+  AND call_start_time < toDate('{{ date_end }}')
   {% if enterprise_id %}AND enterprise_id = '{{ enterprise_id }}'{% endif %}
 ```
 
@@ -644,3 +662,15 @@ WHERE call_start_time >= '{{ date_start }}'
    - 相对日期：`WHERE s_day >= today() - 30`（`today() - N` 也是硬编码！）
    - **应替换为**：`WHERE s_day >= toDate('{{ date_start }}') AND s_day <= toDate('{{ date_end }}')`
 4. **禁止用图表 ID 作参数名**：`binds.start`/`binds.end` 必须是有意义的 SQL 变量名（`date_start`、`date_end`），**不能是图表 ID**（`c1`、`c2` 等）
+
+5. **🚨 日期字段类型必须匹配（Code 386 根因）**：
+
+   | 情形 | 写法 | 结果 |
+   |------|------|------|
+   | Date 字段与 Date 值比较 | `s_day >= toDate('{{ date_start }}')` | ✅ 正确 |
+   | Date 字段与裸字符串比较 | `s_day >= '{{ date_start }}'` | ❌ Code 386（Date vs String） |
+   | toString(Date字段) 与 Date 比较 | `toString(s_day) >= toDate('{{ date_start }}')` | ❌ Code 386（String vs Date） |
+   | SELECT 中的 toString 不影响 WHERE | `SELECT toString(s_day) AS day ... WHERE s_day >= toDate(...)` | ✅ 正确 |
+
+   - **`toString(s_day)` 只能出现在 SELECT 显示层**，绝对不能用在 PREWHERE/WHERE/HAVING 的日期比较中
+   - **Date 类型字段必须和 `toDate()` 包裹的日期值比较**，不能和裸字符串 `'YYYY-MM-DD'` 比较

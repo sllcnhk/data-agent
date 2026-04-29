@@ -24,18 +24,20 @@ logger = logging.getLogger(__name__)
 
 def render_sql(template: str, params: Dict[str, Any]) -> str:
     """
-    用 Jinja2 SandboxedEnvironment 渲染 SQL 模板。
+    用 Jinja2 SandboxedEnvironment 渲染 SQL 模板，并对结果进行类型安全后处理。
 
     - 未定义变量 → 空字符串（不抛错，SQL 仍可执行）
     - 沙盒环境阻止 __class__ / __import__ 等模板注入攻击
     - 非 Jinja2 模板（无 {{ }}）直接原样返回，零开销
+    - 渲染完成后自动修复日期类型兼容问题（T-C2）：
+        Date字段 >= 'YYYY-MM-DD' → Date字段 >= toDate('YYYY-MM-DD')
 
     示例：
         render_sql(
-            "WHERE dt >= '{{ date_start }}' AND dt < '{{ date_end }}'",
+            "WHERE s_day >= toDate('{{ date_start }}') AND s_day <= toDate('{{ date_end }}')",
             {"date_start": "2025-01-01", "date_end": "2025-12-31"}
         )
-        → "WHERE dt >= '2025-01-01' AND dt < '2025-12-31'"
+        → "WHERE s_day >= toDate('2025-01-01') AND s_day <= toDate('2025-12-31')"
     """
     if "{{" not in template:
         return template  # 快速路径：非模板 SQL 不处理
@@ -59,7 +61,21 @@ def render_sql(template: str, params: Dict[str, Any]) -> str:
                 return _SilentUndefined()
 
         env = SandboxedEnvironment(undefined=_SilentUndefined)
-        return env.from_string(template).render(**params)
+        rendered = env.from_string(template).render(**params)
+
+        # T-C2: 后处理 — 修复渲染后裸字符串日期与 Date 字段比较
+        # 处理 AI 常见错误：s_day >= '2026-01-01' 而非 s_day >= toDate('2026-01-01')
+        # 使用延迟导入避免循环依赖
+        try:
+            from backend.report_spec_utils import _RENDERED_DATE_STRING_RE
+            rendered = _RENDERED_DATE_STRING_RE.sub(
+                lambda m: f"{m.group(1)}toDate('{m.group(2)}')",
+                rendered,
+            )
+        except Exception:
+            pass  # 后处理失败不影响主流程
+
+        return rendered
 
     except Exception as exc:
         logger.warning("[ReportParams] render_sql 失败，返回原模板: %s", exc)

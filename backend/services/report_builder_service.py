@@ -394,7 +394,11 @@ window.addEventListener('DOMContentLoaded', () => {
 
   if (REPORT_ID && REPORT_ID !== 'preview') {
     // 保存模式：动态加载数据
-    _loadData(_DEFAULT_PARAMS);
+    // 使用 _currentParams() 而非 _DEFAULT_PARAMS，确保日期筛选器的初始值由
+    // 页面加载时的 dayjs() 计算（动态）而非 HTML 生成时的 Python 计算（静态）。
+    // filter 初始化脚本（<script> 在 filter-bar 内）早于 DOMContentLoaded 执行，
+    // 因此 _filterValues 在此已含正确日期。
+    _loadData(_currentParams());
   } else {
     // 预览模式：直接渲染 baked-in 数据
     for (const [id, rows] of Object.entries(REPORT_DATA)) {

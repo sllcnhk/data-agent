@@ -26,6 +26,26 @@ scope: global-integrated
 
 ---
 
+## 🚨 绝对禁止事项（报表生成唯一正确路径）
+
+**图表/可视化请求只能走 `report__create`，严禁用 `filesystem__write_file` 写 HTML。**
+
+| 操作 | 是否允许 |
+|------|--------|
+| `report__create` 创建动态报表 | ✅ 唯一正确方式 |
+| `filesystem__write_file` 写 HTML 图表报表 | ❌ 绝对禁止 |
+| SQL 中硬编码日期（`today()-N`、`'2026-01-01'` 等）| ❌ 绝对禁止 |
+| 查询 ClickHouse 后将结果数组嵌入 JS/HTML | ❌ 绝对禁止（数据静态化） |
+| `date_range` 筛选器缺失 | ❌ 绝对禁止（用户无法调整时间范围）|
+
+**如果你用 `filesystem__write_file` 写了 HTML：**
+- 用户看到的是永久过期的静态快照
+- 日期筛选器不工作
+- 数据永远不会更新
+- 该报表将被系统标记为无效
+
+---
+
 ## 一、库架构说明
 
 | 特征 | 说明 |
@@ -212,6 +232,24 @@ WHERE s_day >= toStartOfMonth(toDate('{{ date_start }}'))
 - `binds.start = "date_start"` → SQL 必须用 `{{ date_start }}`（字符完全一致）
 - `binds.end = "date_end"` → SQL 必须用 `{{ date_end }}`
 - **严禁**将图表 ID（`c1`、`c2`）写入 binds.start/end（会导致日期为空 → Code 38）
+
+**🚨 Code 386 防范（Date vs String 类型不匹配）**：
+
+```sql
+-- ✅ 正确：toDate() 明确转换，Date vs Date
+PREWHERE s_day >= toDate('{{ date_start }}') AND s_day <= toDate('{{ date_end }}')
+
+-- ❌ 错误：裸字符串 vs Date → ClickHouse Code 386
+PREWHERE s_day >= '{{ date_start }}' AND s_day <= '{{ date_end }}'
+
+-- ❌ 错误：toString(Date字段) 在 WHERE/PREWHERE 中比较 → Code 386
+PREWHERE toString(s_day) >= toDate('{{ date_start }}')
+
+-- ✅ 正确：toString() 仅在 SELECT 中用于显示，WHERE 仍用原始字段
+SELECT toString(s_day) AS call_date, ...
+FROM integrated_data.Fact_Daily_Call
+PREWHERE s_day >= toDate('{{ date_start }}') AND s_day <= toDate('{{ date_end }}')
+```
 
 ---
 

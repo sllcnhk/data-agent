@@ -52,6 +52,27 @@ _HARDCODED_DATE_LOWER_RE = re.compile(
 # 保留旧名兼容（T-B 系列测试引用了 _HARDCODED_DATE_RANGE_RE）
 _HARDCODED_DATE_RANGE_RE = _HARDCODED_DATE_RANGE_FULL_RE
 
+# T-C1: 模式 3 — 字符串引号直接包裹 Jinja2 日期变量，未加 toDate() 转换
+# 例：field >= '{{ date_start }}'  →  field >= toDate('{{ date_start }}')
+# 此模式导致 ClickHouse Code 386（Date 字段与 String 字面量类型不兼容）
+_DATE_TEMPLATE_STRING_RE = re.compile(
+    r"([><=!]+\s*)'(\s*\{\{\s*(?:date_start|date_end|start_date|end_date|dt_start|dt_end)\s*\}\}\s*)'",
+    flags=re.IGNORECASE,
+)
+
+# T-C2: 模式 4 — 渲染后的固定日期字符串与 Date 字段比较（Date >= 'YYYY-MM-DD'）
+# 在 render_sql 之后的后处理中使用，确保已渲染参数也被 toDate() 包裹
+_RENDERED_DATE_STRING_RE = re.compile(
+    r"([><=!]+\s*)'(\d{4}-\d{2}-\d{2})'",
+)
+
+# T-C3: 模式 5 — toString(date_field) 出现在比较操作中（String vs Date → Code 386）
+# 例：toString(s_day) >= toDate('...')  →  s_day >= toDate('...')
+_TOSTRING_DATE_COMPARE_RE = re.compile(
+    r"toString\s*\(\s*(?P<field>[A-Za-z_][\w\.]*)\s*\)\s*(?P<op>[><=!]+)\s*(?P<rhs>toDate\([^)]+\)|'\d{4}-\d{2}-\d{2}')",
+    flags=re.IGNORECASE,
+)
+
 
 def _default_ai_summary_chart(chart_id: str = "summary_ai", title: str = "AI 数据分析总结") -> Dict[str, Any]:
     return {
@@ -262,8 +283,24 @@ def _time_signal_from_chart(chart: Dict[str, Any]) -> bool:
 
 
 def report_needs_date_range_filter(spec: Dict[str, Any]) -> bool:
+    """
+    判断报表是否需要日期范围筛选器。
+
+    策略（由宽到严）：
+    1. 只要有任意图表包含 SQL 查询（非 ai_analysis），就强制注入日期筛选器。
+       — 历史上只按时间信号判断，导致 AI 生成的 SQL 缺少 today()-N 关键字时
+         漏掉日期筛选器，最终产生静态硬编码报表。
+    2. ai_analysis 类型的图表不计入（无 SQL）。
+    """
     charts = spec.get("charts") or []
-    return any(_time_signal_from_chart(chart) for chart in charts if isinstance(chart, dict))
+    for chart in charts:
+        if not isinstance(chart, dict):
+            continue
+        if chart.get("chart_type") == "ai_analysis":
+            continue
+        if chart.get("sql") or chart.get("dataset", {}).get("query"):
+            return True
+    return False
 
 
 def get_date_range_filter(filters: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -304,16 +341,55 @@ def ensure_date_range_filter(spec: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _fix_date_type_in_sql(sql: str) -> str:
+    """
+    T-C: 修复 SQL 中日期类型不兼容的比较模式（不改变参数化逻辑，只做类型安全修复）。
+
+    处理顺序（优先级从高到低）：
+    1. toString(date_field) op toDate/string  →  date_field op toDate/string
+       避免 String vs Date 类型不匹配（ClickHouse Code 386）
+    2. op '{{ date_var }}'  →  op toDate('{{ date_var }}')
+       Jinja2 变量直接被字符串引号包裹，未通过 toDate() 转换
+
+    注意：
+    - 已含 toDate('{{ var }}') 的不处理（快速路径）
+    - 同时处理已渲染的固定日期字符串（'2026-01-01'）
+    """
+    if not isinstance(sql, str) or not sql.strip():
+        return sql
+
+    # 步骤 1：修复 toString(field) 与 Date/字符串日期的比较
+    def _fix_tostring(m):
+        field = m.group("field")
+        op = m.group("op")
+        rhs = m.group("rhs")
+        # 如果右侧是字符串日期（非 toDate），需要确保 field 也是 Date 类型
+        if not rhs.lower().startswith("todate("):
+            rhs = f"toDate({rhs})"
+        return f"{field} {op} {rhs}"
+
+    sql = _TOSTRING_DATE_COMPARE_RE.sub(_fix_tostring, sql)
+
+    # 步骤 2：修复 field >= '{{ date_var }}' → field >= toDate('{{ date_var }}')
+    sql = _DATE_TEMPLATE_STRING_RE.sub(lambda m: f"{m.group(1)}toDate('{m.group(2)}')", sql)
+
+    return sql
+
+
 def _parameterize_sql_date_range(sql: str) -> str:
     """
-    T-A2: 将 SQL 中硬编码的 today()-N 日期条件替换为 Jinja2 参数。
+    T-A2/T-C: 将 SQL 中硬编码的 today()-N 日期条件替换为 Jinja2 参数，
+    并修复所有日期类型不安全的比较模式。
 
-    两步处理：
-    1. 优先匹配双边界 (>= today()-N AND field <= today())，整体替换
-    2. 若无双边界，再匹配仅下界 (>= today()-N)，补全上界参数
-       ——常见于 AI 只写了起始条件（如 PREWHERE s_day >= today()-30 AND call_code_type IN (...)）
+    处理步骤：
+    1. 若 SQL 中无 {{ }}，尝试将 today()-N 替换为参数占位符
+       a. 双边界（>= today()-N AND field <= today()）整体替换
+       b. 仅下界（>= today()-N）补全上界
+    2. 修复类型不兼容问题（T-C）：
+       - toString(field) 比较 → 改用原始 field
+       - '{{ date_var }}' 裸字符串 → toDate('{{ date_var }}')
     """
-    if not isinstance(sql, str) or "{{" in sql:
+    if not isinstance(sql, str) or not sql.strip():
         return sql
 
     def _replace_both(match) -> str:
@@ -323,17 +399,27 @@ def _parameterize_sql_date_range(sql: str) -> str:
             f"AND {field} <= toDate('{{{{ {_DATE_FILTER_BIND_END} }}}}')"
         )
 
-    # 步骤 1：双边界替换
-    result = _HARDCODED_DATE_RANGE_FULL_RE.sub(_replace_both, sql)
-    if result != sql:
-        return result
+    # 步骤 1：today()-N 硬编码参数化（只在无模板变量时执行）
+    if "{{" not in sql:
+        result = _HARDCODED_DATE_RANGE_FULL_RE.sub(_replace_both, sql)
+        if result == sql:
+            result = _HARDCODED_DATE_LOWER_RE.sub(_replace_both, sql)
+        sql = result
 
-    # 步骤 2：仅下界替换（补全上界）
-    result = _HARDCODED_DATE_LOWER_RE.sub(_replace_both, sql)
-    return result
+    # 步骤 2：类型安全修复（无论是否已参数化，始终执行）
+    sql = _fix_date_type_in_sql(sql)
+
+    return sql
 
 
 def parameterize_time_range_charts(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    将所有带 SQL 的图表中硬编码的 today()-N 日期条件替换为 Jinja2 参数占位符。
+
+    策略调整（与 report_needs_date_range_filter 保持一致）：
+    只要报表已有 date_range filter，所有非 ai_analysis 图表的 SQL 都尝试参数化，
+    不再局限于包含时间信号的图表——避免遗漏没有 today() 关键字但仍需要参数化的 SQL。
+    """
     out = copy.deepcopy(spec or {})
     if not get_date_range_filter(out.get("filters") or []):
         return out
@@ -347,7 +433,8 @@ def parameterize_time_range_charts(spec: Dict[str, Any]) -> Dict[str, Any]:
         if normalized.get("chart_type") == "ai_analysis":
             charts.append(normalized)
             continue
-        if _time_signal_from_chart(normalized):
+        # 所有有 SQL 的图表都尝试参数化（原：仅时间信号图表）
+        if normalized.get("sql"):
             normalized["sql"] = _parameterize_sql_date_range(normalized.get("sql", ""))
         charts.append(normalized)
     out["charts"] = charts
