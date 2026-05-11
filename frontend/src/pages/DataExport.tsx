@@ -907,10 +907,14 @@ const DataExport: React.FC = () => {
                         ORDER BY cursor LIMIT N</code> 推进，代替 LIMIT/OFFSET。
                         大数据集大幅提速 + 消除窗口非确定性。要求列单调可排序
                         （主键 / 时间戳）；<b>不适用于 GROUP BY / DISTINCT 等聚合 SQL</b>。
+                        <br />
+                        <b>填写 SELECT 子句中的别名</b>（系统包装为子查询，外层只看到别名）。
+                        支持字母/数字/下划线/<b>空格/中文</b>；如别名是 <code>`Call ID`</code>，
+                        填 <code>Call ID</code> 即可（系统自动反引号包裹）。
                       </span>
                     }
                   >
-                    <Input placeholder="如：id、event_time" maxLength={64} />
+                    <Input placeholder="如：id、event_time、Call ID、订单_id" maxLength={64} />
                   </Form.Item>
                 </>
               ) : null

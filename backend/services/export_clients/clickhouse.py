@@ -573,12 +573,18 @@ class ClickHouseExportClient(BaseExportClient):
           batch_size    — 每窗口最大行数(LIMIT 值)
           extra_settings — 同 stream_batches.extra_settings
         """
-        # 防御:cursor_column 仍校验一次(防被绕过)
+        # 防御:cursor_column 仍校验一次(防被绕过)。
+        # 策略与 chunker 一致:strip 反引号 + 允许字母/数字/下划线/空格/中文,
+        # 拼接 SQL 时统一反引号包裹。
         import re
-        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", cursor_column):
+        cursor_column = cursor_column.strip().strip("`").strip()
+        if not re.match(r"^[A-Za-z_一-鿿][A-Za-z0-9_ 一-鿿]*$", cursor_column):
             raise ValueError(
-                f"cursor_column 含非法字符（仅允许字母/数字/下划线）: {cursor_column!r}"
+                f"cursor_column 含非法字符(允许:字母/数字/下划线/空格/中文): {cursor_column!r}"
             )
+        # 反引号包裹版本用于 SQL 拼接(防空格/中文列名解析失败);
+        # 裸字符串版本用于 col_names.index() 查找(TSV header 返回的列名不含反引号)
+        cursor_quoted = f"`{cursor_column}`"
 
         stripped = sql.rstrip().rstrip(";")
         last_cursor: Optional[str] = None
@@ -588,15 +594,15 @@ class ClickHouseExportClient(BaseExportClient):
             if last_cursor is None:
                 window_sql = (
                     f"SELECT * FROM ({stripped}) AS _ks_q"
-                    f" ORDER BY {cursor_column}"
+                    f" ORDER BY {cursor_quoted}"
                     f" LIMIT {batch_size}"
                 )
                 extra_params: Dict[str, str] = {}
             else:
                 window_sql = (
                     f"SELECT * FROM ({stripped}) AS _ks_q"
-                    f" WHERE {cursor_column} > {{cursor_val:String}}"
-                    f" ORDER BY {cursor_column}"
+                    f" WHERE {cursor_quoted} > {{cursor_val:String}}"
+                    f" ORDER BY {cursor_quoted}"
                     f" LIMIT {batch_size}"
                 )
                 extra_params = {"param_cursor_val": last_cursor}

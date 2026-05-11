@@ -93,7 +93,10 @@ class ChunkConfigSchema(BaseModel):
             "游标列名(可选,启用键集分页代替 LIMIT/OFFSET)。提供后,流式断开自动回退"
             "时使用 WHERE cursor > last_value ORDER BY cursor LIMIT N 推进;对大数据集"
             "大幅提速且消除 LIMIT/OFFSET 非确定性。要求列可排序且趋势单调(主键 / 时间戳)。"
-            "不适用于 GROUP BY/DISTINCT 等聚合 SQL。仅允许字母/数字/下划线。"
+            "不适用于 GROUP BY/DISTINCT 等聚合 SQL。"
+            "**填用户 SELECT 子句中的别名**(因为系统包装为 SELECT * FROM (your_sql) AS _ks_q,"
+            "外层只看到别名)。允许字母/数字/下划线/空格/中文(自动反引号包裹);"
+            "可带反引号(`Call ID`)系统会自动 strip。"
         ),
     )
 

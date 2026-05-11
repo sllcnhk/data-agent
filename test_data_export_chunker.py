@@ -793,3 +793,65 @@ class TestValidateChunkConfigNewFields:
         }
         ncfg = validate_chunk_config(cfg, sql)
         assert ncfg.min_subdivide_unit == "hour"
+
+    # ─ v2.14.1: cursor_column 校验放宽 — 支持空格/中文/反引号包裹 ─
+
+    def test_d24_cursor_column_with_space_accepted(self):
+        """D24: cursor_column='Call ID'(含空格,即用户 SELECT 别名)→ 接受"""
+        sql = "SELECT * FROM t WHERE ts BETWEEN '{{date_start}}' AND '{{date_end}}'"
+        cfg = {
+            "date_start": "2026-01-01", "date_end": "2026-01-05",
+            "chunk_days": 5, "cursor_column": "Call ID",
+        }
+        ncfg = validate_chunk_config(cfg, sql)
+        assert ncfg.cursor_column == "Call ID"
+
+    def test_d25_cursor_column_backtick_stripped(self):
+        """D25: cursor_column='`Call ID`'(带反引号)→ 自动 strip 反引号 → 'Call ID'"""
+        sql = "SELECT * FROM t WHERE ts BETWEEN '{{date_start}}' AND '{{date_end}}'"
+        cfg = {
+            "date_start": "2026-01-01", "date_end": "2026-01-05",
+            "chunk_days": 5, "cursor_column": "`Call ID`",
+        }
+        ncfg = validate_chunk_config(cfg, sql)
+        assert ncfg.cursor_column == "Call ID"
+
+    def test_d26_cursor_column_chinese_accepted(self):
+        """D26: 中文列名 '订单_id' 接受"""
+        sql = "SELECT * FROM t WHERE ts BETWEEN '{{date_start}}' AND '{{date_end}}'"
+        cfg = {
+            "date_start": "2026-01-01", "date_end": "2026-01-05",
+            "chunk_days": 5, "cursor_column": "订单_id",
+        }
+        ncfg = validate_chunk_config(cfg, sql)
+        assert ncfg.cursor_column == "订单_id"
+
+    def test_d27_cursor_column_digit_start_rejected(self):
+        """D27: 数字起首 '1id' 仍拒(SQL 标识符规则)"""
+        sql = "SELECT * FROM t WHERE ts BETWEEN '{{date_start}}' AND '{{date_end}}'"
+        cfg = {
+            "date_start": "2026-01-01", "date_end": "2026-01-05",
+            "chunk_days": 5, "cursor_column": "1id",
+        }
+        with pytest.raises(ValueError, match="cursor_column"):
+            validate_chunk_config(cfg, sql)
+
+    def test_d28_cursor_column_semicolon_rejected(self):
+        """D28: 注入尝试 'id; DROP TABLE' 仍拒(分号不在白名单)"""
+        sql = "SELECT * FROM t WHERE ts BETWEEN '{{date_start}}' AND '{{date_end}}'"
+        cfg = {
+            "date_start": "2026-01-01", "date_end": "2026-01-05",
+            "chunk_days": 5, "cursor_column": "id; DROP TABLE",
+        }
+        with pytest.raises(ValueError, match="cursor_column"):
+            validate_chunk_config(cfg, sql)
+
+    def test_d29_cursor_column_pure_backticks_normalized_to_none(self):
+        """D29: cursor_column='``'(纯反引号)strip 后为空 → 视作未提供(None)"""
+        sql = "SELECT * FROM t WHERE ts BETWEEN '{{date_start}}' AND '{{date_end}}'"
+        cfg = {
+            "date_start": "2026-01-01", "date_end": "2026-01-05",
+            "chunk_days": 5, "cursor_column": "``",
+        }
+        ncfg = validate_chunk_config(cfg, sql)
+        assert ncfg.cursor_column is None

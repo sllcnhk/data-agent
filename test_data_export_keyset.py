@@ -84,9 +84,10 @@ class TestStreamBatchesKeyset:
 
         assert len(batches) == 1
         assert batches[0] == [("1", "alice")]
-        # 第一个 SQL:含 ORDER BY,无 WHERE
+        # 第一个 SQL:含 ORDER BY,无 WHERE。cursor 列统一用反引号包裹(v2.14.1
+        # 支持含空格/中文的别名列名)
         first_sql = captured_sqls[0]
-        assert "ORDER BY id" in first_sql
+        assert "ORDER BY `id`" in first_sql
         assert "LIMIT 100" in first_sql
         assert "WHERE" not in first_sql
         # 第一次 params 不含 cursor_val
@@ -124,9 +125,9 @@ class TestStreamBatchesKeyset:
 
         # 收到 2 个窗口的数据
         assert sum(len(b) for b in batches) == 3
-        # 第二次 SQL 应含 WHERE id > {cursor_val:String}
+        # 第二次 SQL 应含 WHERE `id` > {cursor_val:String}(反引号包裹)
         second_sql = captured_sqls[1]
-        assert "WHERE id > {cursor_val:String}" in second_sql
+        assert "WHERE `id` > {cursor_val:String}" in second_sql
         assert captured_params[1]["param_cursor_val"] == "2"
 
     def test_g3_empty_first_window_terminates(self):
@@ -176,6 +177,60 @@ class TestStreamBatchesKeyset:
                 list(client.stream_batches_keyset(
                     "SELECT id FROM t", cursor_column="id", batch_size=100,
                 ))
+
+    def test_g7_cursor_column_with_space_uses_backtick_in_sql(self):
+        """G7(v2.14.1): cursor_column='Call ID'(含空格,用户 SELECT 别名)→ SQL
+        必须用反引号包裹 \`Call ID\`,且 col_names.index 用裸字符串 'Call ID' 查找成功"""
+        client = _new_client()
+        captured_sqls: List[str] = []
+
+        def _fake_post(url, data=None, params=None, **kw):
+            captured_sqls.append(data.decode("utf-8"))
+            n = len(captured_sqls)
+            if n == 1:
+                return _make_tsv_response(
+                    ["Call ID", "Name"], ["String", "String"],
+                    [("CALL_1", "alice"), ("CALL_2", "bob")],
+                )
+            if n == 2:
+                return _make_tsv_response(
+                    ["Call ID", "Name"], ["String", "String"],
+                    [("CALL_3", "carol")],
+                )
+            return _make_tsv_response(["Call ID", "Name"], ["String", "String"], [])
+
+        with patch.object(requests.sessions.Session, "post", side_effect=_fake_post):
+            batches = list(client.stream_batches_keyset(
+                "SELECT cr.call_record_id as `Call ID`, cr.name as Name FROM t",
+                cursor_column="Call ID", batch_size=100,
+            ))
+
+        # 数据正常推进
+        all_rows = [r for b in batches for r in b]
+        assert len(all_rows) == 3
+        # 首窗口 SQL 含 ORDER BY `Call ID`(反引号包裹含空格列名)
+        assert "ORDER BY `Call ID`" in captured_sqls[0]
+        # 后续窗口含 WHERE `Call ID` >(同样反引号包裹)
+        assert "WHERE `Call ID` > {cursor_val:String}" in captured_sqls[1]
+
+    def test_g8_cursor_column_backtick_input_stripped(self):
+        """G8(v2.14.1): cursor_column='`id`'(用户带反引号填)→ strip 后等价于 'id'"""
+        client = _new_client()
+        captured_sqls: List[str] = []
+
+        def _fake_post(url, data=None, params=None, **kw):
+            captured_sqls.append(data.decode("utf-8"))
+            n = len(captured_sqls)
+            if n == 1:
+                return _make_tsv_response(["id"], ["Int64"], [("1",)])
+            return _make_tsv_response(["id"], ["Int64"], [])
+
+        with patch.object(requests.sessions.Session, "post", side_effect=_fake_post):
+            list(client.stream_batches_keyset(
+                "SELECT id FROM t", cursor_column="`id`", batch_size=100,
+            ))
+
+        assert "ORDER BY `id`" in captured_sqls[0]
 
     def test_g6_cursor_column_not_in_select_raises(self):
         """G6: SELECT * 结果不含 cursor_column 列 → RuntimeError(用户 SQL SELECT 子集)"""

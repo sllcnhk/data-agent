@@ -36,8 +36,16 @@ _PLACEHOLDER_END = "{{date_end}}"
 _FILENAME_UNSAFE_RE = re.compile(r"[^\w\-一-鿿]+", re.UNICODE)
 
 # 标识符（列名）安全字符 — ClickHouse 标识符规则：[a-zA-Z_][a-zA-Z0-9_]*
-# 严格白名单防 SQL 注入
+# 严格白名单防 SQL 注入。用于 date_column(注入到 wrapper SQL 时不加反引号)
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# 游标列名(cursor_column)放宽规则:
+#   场景:用户 SQL 包装为 `SELECT * FROM (...) AS _ks_q ORDER BY <cursor>`,
+#         外层 `_ks_q` 暴露的是用户 SELECT 别名(常含空格 / 中文,如 `Call ID`)。
+#   策略:接受字母/数字/下划线 + 空格 + 中文(CJK 统一汉字);拼接 SQL 时统一用
+#         反引号包裹 \`{cursor_column}\`,所以列名本身**不能含反引号**(防止注入)。
+#   起首字符:字母 / 下划线 / 中文(防止纯数字起首破坏 SQL 标识符规则)。
+_CURSOR_IDENT_RE = re.compile(r"^[A-Za-z_一-鿿][A-Za-z0-9_ 一-鿿]*$")
 
 # chunk_days 取值上下限（与 UI 约束一致）
 MIN_CHUNK_DAYS = 1
@@ -448,15 +456,20 @@ def validate_chunk_config(raw: dict, sql: str) -> NormalizedChunkConfig:
             f"min_subdivide_unit 必须是 {_VALID_SUBDIVIDE_UNITS} 之一,收到 {min_subdivide_unit!r}"
         )
 
-    # cursor_column:用户 opt-in,默认 None;非空时同 date_column 一样走标识符白名单
+    # cursor_column:用户 opt-in,默认 None。规则:
+    #   - 用户可填裸列名(`Call ID`)或带反引号(\`Call ID\`),自动 strip 反引号 + 首尾空白
+    #   - 校验放宽到 _CURSOR_IDENT_RE(允许空格 + 中文 + 字母/数字/下划线)
+    #   - 拼接 SQL 时统一加反引号(在 stream_batches_keyset 内),所以列名本身不能含反引号
     cursor_column = raw.get("cursor_column") or None
     if cursor_column is not None:
         if not isinstance(cursor_column, str):
             raise ValueError("cursor_column 必须是字符串")
-        cursor_column = cursor_column.strip() or None
-    if cursor_column is not None and not _IDENT_RE.match(cursor_column):
+        # 自动剥用户可能填的反引号 + 首尾空白
+        cursor_column = cursor_column.strip().strip("`").strip() or None
+    if cursor_column is not None and not _CURSOR_IDENT_RE.match(cursor_column):
         raise ValueError(
-            f"cursor_column 含非法字符（仅允许字母/数字/下划线）: {cursor_column!r}"
+            f"cursor_column 含非法字符(允许:字母/数字/下划线/空格/中文,"
+            f"不允许反引号本身;须以字母/下划线/中文起首): {cursor_column!r}"
         )
 
     mode: InjectMode = "placeholder" if use_placeholder else "wrapper"

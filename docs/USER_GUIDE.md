@@ -2426,6 +2426,19 @@ EXPORT_INPLACE_RETRY_MAX=1                # 单块失败后原位重试次数（
 - 时间戳列也可（高并发同微秒插入可能漏极少数行，对导出场景一般可接受）
 - **避免 NULL**：含 NULL 的 cursor 列推进语义不可靠
 
+**重要 — 填别名(v2.14.1 起支持空格/中文)**：
+
+系统把用户 SQL 包装成 `SELECT * FROM (your_sql) AS _ks_q ORDER BY <cursor>`,外层 `_ks_q` 暴露的**只是 SELECT 输出的别名**,不是原表的 `table.column`。所以:
+
+| 用户 SQL 写法 | cursor_column 应填 | 备注 |
+|---------------|--------------------|------|
+| `cr.call_record_id as call_record_id` | `call_record_id` | 最简单,推荐 |
+| `` cr.call_record_id as `Call ID` `` | `Call ID` 或 `` `Call ID` `` | **含空格的别名**,v2.14.1 起原生支持;系统自动反引号包裹 |
+| `cr.order_id as 订单_id` | `订单_id` | 中文别名,同上 |
+| `cr.call_record_id`(无别名) | `call_record_id` | ClickHouse 默认别名 = 最右段 |
+
+**禁止字符**:反引号本身(系统会自动包裹,用户填的反引号会被 strip)、分号、引号等 SQL 注入字符;**起首必须字母/下划线/中文**(数字起首拒)。
+
 **死循环保护**：若某窗口最末 cursor 值 == 上一窗口（cursor 列含重复值且 SQL ORDER BY 不稳定），客户端 fast-fail 抛 `RuntimeError("keyset cursor 死循环")`，避免无穷重发同 query。
 
 **前端操作**：导出 Modal 切换「按日期分块」→ 高级区文本框「游标列名」→ 填入主键列名（如 `id` / `order_id` / `event_time`）。
