@@ -136,7 +136,8 @@ class TestConnectionsAndPreview:
         """A6: limit 参数传入后端"""
         captured = {}
 
-        def fake_preview(sql, env, connection_type="clickhouse", limit=100):
+        # 接受 **kwargs 兼容后续可能新增的可选参数（如 v2.13 的 preview_date）
+        def fake_preview(sql, env, connection_type="clickhouse", limit=100, **kwargs):
             captured["limit"] = limit
             return {"columns": [], "rows": [], "row_count": 0}
 

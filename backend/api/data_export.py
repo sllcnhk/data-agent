@@ -3,18 +3,19 @@
 
 GET  /data-export/connections                  可写连接列表
 POST /data-export/preview                      SQL 预览（前 100 行）
-POST /data-export/execute                      提交导出任务（后台执行）
+POST /data-export/execute                      提交导出任务（后台执行；含 chunk_config 启用按日期分块）
 GET  /data-export/jobs/{job_id}                查询任务状态
 POST /data-export/jobs/{job_id}/cancel         取消任务
-DELETE /data-export/jobs/{job_id}              删除任务记录（同时删除本地文件）
+DELETE /data-export/jobs/{job_id}              删除任务记录（同时删除本地文件/目录）
 GET  /data-export/jobs                         历史任务列表（时间倒序，分页）
-GET  /data-export/jobs/{job_id}/download       下载导出文件
+GET  /data-export/jobs/{job_id}/download       下载导出文件（分块模式必带 file_index）
 
 所有端点均需 data:export 权限（superadmin 专属）。
 """
 import asyncio
 import logging
 import os
+import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -56,6 +57,27 @@ class PreviewRequest(BaseModel):
     connection_env: str = Field(..., description="目标连接环境名")
     connection_type: str = Field(default="clickhouse", description="连接类型")
     limit: int = Field(default=PREVIEW_LIMIT, ge=1, le=500)
+    preview_date: Optional[str] = Field(
+        default=None,
+        description=(
+            "样本日期（ISO YYYY-MM-DD）；仅当 SQL 含 {{date_start}}/{{date_end}} "
+            "占位符时使用，留空默认昨日"
+        ),
+    )
+
+
+class ChunkConfigSchema(BaseModel):
+    """按日期分块导出配置"""
+    date_column: Optional[str] = Field(
+        default=None,
+        description=(
+            "日期列名（包装模式必填）。SQL 含 {{date_start}}/{{date_end}} "
+            "占位符时可省略。仅允许字母/数字/下划线。"
+        ),
+    )
+    date_start: str = Field(..., description="起始日期（含），ISO YYYY-MM-DD")
+    date_end: str = Field(..., description="结束日期（含），ISO YYYY-MM-DD")
+    chunk_days: int = Field(default=10, ge=1, le=90, description="单块天数 [1-90]")
 
 
 class ExecuteExportRequest(BaseModel):
@@ -64,6 +86,10 @@ class ExecuteExportRequest(BaseModel):
     connection_type: str = Field(default="clickhouse", description="连接类型")
     job_name: str = Field(default="", description="任务名称（用于文件名，留空则自动生成）")
     batch_size: int = Field(default=DEFAULT_BATCH_SIZE, ge=1000, le=200_000)
+    chunk_config: Optional[ChunkConfigSchema] = Field(
+        default=None,
+        description="按日期分块配置；提供则启用 date_chunked 模式（多文件输出）",
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -108,6 +134,7 @@ async def preview(
                 env=req.connection_env,
                 connection_type=req.connection_type,
                 limit=req.limit,
+                preview_date=req.preview_date,
             ),
         )
         return {"success": True, "data": result}
@@ -128,26 +155,63 @@ async def execute_export(
 ):
     """
     提交导出任务：创建 ExportJob 记录，后台启动 run_export_job 协程。
+
+    单文件模式（不传 chunk_config）：
+        输出 customer_data/{username}/exports/{name}_{ts}.xlsx
+
+    分块模式（传 chunk_config）：
+        输出目录 customer_data/{username}/exports/{job_id}/
+        目录下每个日期块产出一个 xlsx 文件，文件清单写入 job.output_files
+
     Returns job_id 供前端轮询。
     """
     from backend.models.export_job import ExportJob
+    # 提早校验 chunk_config（在创建 Job 之前抛 400，避免脏数据）
+    from backend.services.data_export_chunker import validate_chunk_config
 
     username = getattr(current_user, "username", "default")
     user_id = str(getattr(current_user, "id", "default"))
 
-    # 生成文件名
+    # 生成基础文件名（单文件模式与分块模式都基于此）
     safe_name = req.job_name.strip() if req.job_name.strip() else "export"
-    # 去掉不安全字符
     safe_name = "".join(c for c in safe_name if c.isalnum() or c in "-_ ")[:50]
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    output_filename = f"{safe_name}_{timestamp}.xlsx"
 
-    # 输出路径：customer_data/{username}/exports/{filename}
+    is_chunked = req.chunk_config is not None
+    if is_chunked:
+        # 提早校验 — 失败直接 400
+        try:
+            validate_chunk_config(
+                req.chunk_config.dict(), sql=req.query_sql,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"chunk_config 校验失败: {exc}")
+
+    # 输出路径
     export_dir = _CUSTOMER_DATA_ROOT / username / "exports"
     export_dir.mkdir(parents=True, exist_ok=True)
-    output_path = export_dir / output_filename
 
-    # 创建 ExportJob 记录
+    if is_chunked:
+        # 分块模式：每个 Job 单独一个目录（用 job_name + 时间戳避免冲突）
+        sub_dir_name = f"{safe_name}_{timestamp}"
+        chunked_output_dir = export_dir / sub_dir_name
+        # 目录创建延后到 service 层（service 层 mkdir）
+        output_filename = sub_dir_name              # 目录名（兼容现有 list 显示）
+        output_path_for_job = str(chunked_output_dir)
+    else:
+        output_filename = f"{safe_name}_{timestamp}.xlsx"
+        output_path_for_job = str(export_dir / output_filename)
+
+    # 配置快照
+    config_snapshot: Dict[str, Any] = {
+        "query_sql": req.query_sql,
+        "connection_env": req.connection_env,
+        "connection_type": req.connection_type,
+        "batch_size": req.batch_size,
+    }
+    if is_chunked:
+        config_snapshot["chunk_config"] = req.chunk_config.dict()
+
     job = ExportJob(
         user_id=user_id,
         username=username,
@@ -157,13 +221,11 @@ async def execute_export(
         connection_type=req.connection_type,
         status="pending",
         output_filename=output_filename,
-        file_path=str(output_path),
-        config_snapshot={
-            "query_sql": req.query_sql,
-            "connection_env": req.connection_env,
-            "connection_type": req.connection_type,
-            "batch_size": req.batch_size,
-        },
+        file_path=output_path_for_job,
+        export_mode="date_chunked" if is_chunked else "single",
+        chunk_config=req.chunk_config.dict() if is_chunked else None,
+        output_files=None,  # 分块模式由 service 层填充
+        config_snapshot=config_snapshot,
     )
     db.add(job)
     db.commit()
@@ -172,14 +234,27 @@ async def execute_export(
     job_id = str(job.id)
 
     # 后台启动导出协程
-    config = {
-        "query_sql": req.query_sql,
-        "connection_env": req.connection_env,
-        "connection_type": req.connection_type,
-        "batch_size": req.batch_size,
-        "output_path": str(output_path),
-        "output_filename": output_filename,
-    }
+    if is_chunked:
+        config: Dict[str, Any] = {
+            "query_sql": req.query_sql,
+            "connection_env": req.connection_env,
+            "connection_type": req.connection_type,
+            "batch_size": req.batch_size,
+            "export_mode": "date_chunked",
+            "chunk_config": req.chunk_config.dict(),
+            "output_dir": output_path_for_job,
+            "job_name": safe_name,
+        }
+    else:
+        config = {
+            "query_sql": req.query_sql,
+            "connection_env": req.connection_env,
+            "connection_type": req.connection_type,
+            "batch_size": req.batch_size,
+            "export_mode": "single",
+            "output_path": output_path_for_job,
+            "output_filename": output_filename,
+        }
     task = asyncio.create_task(run_export_job(job_id, config))
 
     def _on_done(t: asyncio.Task):
@@ -189,11 +264,20 @@ async def execute_export(
 
     task.add_done_callback(_on_done)
 
-    logger.info("[DataExport] Job %s created by %s, env=%s", job_id, username, req.connection_env)
+    logger.info(
+        "[DataExport] Job %s created by %s, env=%s, mode=%s",
+        job_id, username, req.connection_env,
+        "date_chunked" if is_chunked else "single",
+    )
 
     return {
         "success": True,
-        "data": {"job_id": job_id, "status": "pending", "output_filename": output_filename},
+        "data": {
+            "job_id": job_id,
+            "status": "pending",
+            "output_filename": output_filename,
+            "export_mode": "date_chunked" if is_chunked else "single",
+        },
     }
 
 
@@ -282,14 +366,19 @@ async def delete_job(
             detail=f"无法删除状态为 '{job.status}' 的任务，请先取消后再删除",
         )
 
-    # 删除本地文件
+    # 删除本地文件 / 目录
     if job.file_path:
+        target = Path(job.file_path)
         try:
-            os.unlink(job.file_path)
+            if target.is_dir():
+                # 分块模式：递归删整个目录（含所有子文件）
+                shutil.rmtree(target, ignore_errors=False)
+            elif target.exists():
+                target.unlink()
         except FileNotFoundError:
             pass
         except Exception as e:
-            logger.warning("[DataExport] Failed to delete file %s: %s", job.file_path, e)
+            logger.warning("[DataExport] Failed to delete %s: %s", job.file_path, e)
 
     db.delete(job)
     db.commit()
@@ -338,18 +427,59 @@ async def list_jobs(
 @router.get("/jobs/{job_id}/download")
 async def download_job(
     job_id: str,
+    file_index: Optional[int] = Query(
+        default=None, ge=0,
+        description="分块模式下指定第 N 个文件（从 0 起）；单文件模式忽略",
+    ),
     current_user=Depends(require_permission("data", "export")),
     db: Session = Depends(get_db),
 ):
     """
-    下载已完成的导出文件。
-    返回 FileResponse，浏览器触发另存为对话框。
+    下载导出文件。
+      - 单文件模式：返回 job.file_path 对应文件
+      - 分块模式：必须传 file_index 指向 output_files[i]，否则 400
     """
     from backend.models.export_job import ExportJob
 
     job = db.query(ExportJob).filter(ExportJob.id == job_id).first()
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"任务不存在: {job_id}")
+
+    export_mode = getattr(job, "export_mode", None) or "single"
+
+    # 分块模式：必须有 file_index，且块状态须为 completed
+    if export_mode == "date_chunked":
+        files = job.output_files or []
+        if file_index is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="分块模式必须提供 file_index 查询参数（从 0 起）",
+            )
+        if file_index < 0 or file_index >= len(files):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"file_index {file_index} 超出范围（共 {len(files)} 个文件）",
+            )
+        entry = files[file_index]
+        if entry.get("status") != "completed":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"该分块文件状态为 '{entry.get('status')}'，无法下载",
+            )
+        fpath = entry.get("file_path")
+        if not fpath or not Path(fpath).exists():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="分块文件不存在（可能已被清理）",
+            )
+        filename = entry.get("filename") or Path(fpath).name
+        return FileResponse(
+            path=fpath,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=filename,
+        )
+
+    # 单文件模式
     if job.status != "completed":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

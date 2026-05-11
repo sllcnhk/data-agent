@@ -16,13 +16,117 @@ ClickHouse 导出客户端
     · 这是应用层覆盖，仅影响本次请求，不修改服务器配置
 """
 import logging
+import os
+import socket
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from backend.services.export_clients.base import BaseExportClient, ColumnInfo
 
 logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TCP Keepalive HTTPAdapter — OS 层心跳，防御网络/NAT/LB 切断长连接
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# HTTP-level 心跳（send_progress_in_http_headers）只在服务端有数据要送时才发头，
+# 若服务端长时间内部计算无任何输出，HTTP 心跳也不发出 → LB 仍可能切断。
+#
+# TCP keepalive 是 OS 层机制：内核周期发送空 TCP 包，即使应用层完全静默，
+# NAT/LB 也能看到 TCP 活动，避免空闲超时切断。
+#
+# 平台兼容：
+#   - Linux: TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT 全部可用
+#   - macOS: TCP_KEEPIDLE 别名为 TCP_KEEPALIVE，TCP_KEEPINTVL/TCP_KEEPCNT 也可用
+#   - Windows: 仅 SO_KEEPALIVE 可用，间隔由系统注册表控制（默认 2 小时太长）
+
+class _TCPKeepAliveAdapter(HTTPAdapter):
+    """带 OS 层 TCP keepalive 的 HTTPAdapter，防止长连接因空闲被中间链路切断"""
+
+    def init_poolmanager(self, *args, **kwargs):
+        keepidle = int(os.getenv("CH_EXPORT_TCP_KEEPIDLE", "30"))
+        keepintvl = int(os.getenv("CH_EXPORT_TCP_KEEPINTVL", "10"))
+        keepcnt = int(os.getenv("CH_EXPORT_TCP_KEEPCNT", "6"))
+
+        socket_options = [
+            (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1),
+            (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+        ]
+        # Linux / macOS 平台的精细 keepalive 控制（Windows 跳过）
+        for opt_name, val in (
+            ("TCP_KEEPIDLE", keepidle),
+            ("TCP_KEEPINTVL", keepintvl),
+            ("TCP_KEEPCNT", keepcnt),
+        ):
+            opt = getattr(socket, opt_name, None)
+            if opt is not None:
+                socket_options.append((socket.IPPROTO_TCP, opt, val))
+
+        kwargs["socket_options"] = socket_options
+        super().init_poolmanager(*args, **kwargs)
+
+
+def _build_keepalive_session() -> requests.Session:
+    """构造带 TCP keepalive 的 requests.Session"""
+    session = requests.Session()
+    adapter = _TCPKeepAliveAdapter()
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+# 模块级单例 Session（线程安全；requests Session 内部是线程安全的）
+# 用于 stream_batches / count_rows / get_columns 的 HTTP 请求
+_export_session: Optional[requests.Session] = None
+
+
+def _get_export_session() -> requests.Session:
+    """惰性初始化全局 Session（首次调用时构造）"""
+    global _export_session
+    if _export_session is None:
+        if os.getenv("CH_EXPORT_TCP_KEEPALIVE", "1") == "0":
+            # 关闭 keepalive 时回退到标准 Session
+            _export_session = requests.Session()
+        else:
+            _export_session = _build_keepalive_session()
+    return _export_session
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 默认导出查询的 HTTP 保活/流式设置
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 解决跨境/云上 LB/NAT/代理在长查询服务端处理期间因「连接空闲」切断流式响应的问题。
+#
+# 典型故障模式（v2.13 实测）：
+#   - 用户 SQL 含 decrypt/JSONExtract/arrayMap 等高 CPU 操作
+#   - ClickHouse 服务端先内部计算数分钟，HTTP 连接期间无字节流动
+#   - 中间链路（云 LB / NAT / 反向代理）默认 ~5 分钟空闲超时切断连接
+#   - 客户端读到 ChunkedEncodingError("Response ended prematurely") 或 IncompleteRead
+#
+# 解决方案（ClickHouse 原生支持）：
+#   send_progress_in_http_headers=1      → 服务端周期发送 X-ClickHouse-Progress HTTP 头
+#                                          作为应用层心跳，让 LB/NAT 认为连接活跃
+#   http_headers_progress_interval_ms=10000 → 心跳间隔 10 秒（默认 100ms 太频繁）
+#   wait_end_of_query=0                  → 不等服务端缓冲完所有结果再发，立即流式发送
+#
+# 用户可通过 stream_batches 的 extra_settings 参数覆盖这些默认值（后传入优先级更高）。
+# 也可通过环境变量 CH_EXPORT_HTTP_KEEPALIVE=0 在某些不兼容的场景关闭（保留逃生口）。
+
+def _build_default_streaming_settings() -> Dict[str, str]:
+    """构造默认流式查询设置（值为 str，因为 HTTP URL 参数都是字符串）"""
+    if os.getenv("CH_EXPORT_HTTP_KEEPALIVE", "1") == "0":
+        return {}
+    return {
+        "send_progress_in_http_headers": "1",
+        "http_headers_progress_interval_ms": os.getenv(
+            "CH_EXPORT_PROGRESS_INTERVAL_MS", "10000",
+        ),
+        "wait_end_of_query": "0",
+    }
 
 
 def _parse_tsv_cell(raw: str):
@@ -50,6 +154,50 @@ def is_ch_timeout_estimate_error(exc: Exception) -> bool:
     """
     msg = str(exc)
     return "Code: 160" in msg or "ESTIMATED_EXECUTION_TIMEOUT_EXCEEDED" in msg
+
+
+def is_transient_stream_error(exc: Exception) -> bool:
+    """
+    判断是否为「流式响应中途断开」类瞬时错误，可通过 LIMIT/OFFSET 回退恢复。
+
+    触发场景：
+      - 跨境网络抖动切断长连接
+      - ClickHouse 服务端 OOM/abort 主动关闭流
+      - 中间代理/LB 的空闲连接超时
+      - urllib3.exceptions.ProtocolError / requests.exceptions.ChunkedEncodingError
+      - http.client.IncompleteRead
+
+    回退策略：每个 LIMIT/OFFSET 窗口是独立 HTTP 请求，短小、独立连接，
+    重试时大概率成功。
+    """
+    # 走 try/except 避免运行时还要 import requests/urllib3
+    try:
+        import requests.exceptions as _re
+        import urllib3.exceptions as _u3e
+        from http.client import IncompleteRead
+
+        if isinstance(exc, (_re.ChunkedEncodingError,
+                            _re.ConnectionError,
+                            _u3e.ProtocolError,
+                            IncompleteRead)):
+            return True
+    except ImportError:
+        pass
+
+    # 兜底：通过错误消息匹配
+    msg = str(exc)
+    fingerprints = (
+        "Connection broken",
+        "IncompleteRead",
+        "ProtocolError",
+        "ChunkedEncodingError",
+        "Connection aborted",
+        "Connection reset",
+        "Response ended prematurely",  # urllib3 ProtocolError 在 chunked 编码末尾断开时的消息
+        "Read timed out",
+        "Remote end closed connection",
+    )
+    return any(fp in msg for fp in fingerprints)
 
 
 class ClickHouseExportClient(BaseExportClient):
@@ -97,7 +245,7 @@ class ClickHouseExportClient(BaseExportClient):
 
         params = self._base_params()
         try:
-            resp = requests.post(
+            resp = _get_export_session().post(
                 self._base_url,
                 data=probe_sql.encode("utf-8"),
                 params=params,
@@ -133,10 +281,11 @@ class ClickHouseExportClient(BaseExportClient):
         count_sql = f"SELECT count() FROM ({stripped}) AS _cnt_q"
         params = {
             **self._base_params(),
+            **_build_default_streaming_settings(),  # 保活心跳：count() 在大表上也可能跑很久
             "max_execution_time": timeout,
         }
         try:
-            resp = requests.post(
+            resp = _get_export_session().post(
                 self._base_url,
                 data=count_sql.encode("utf-8"),
                 params=params,
@@ -167,10 +316,17 @@ class ClickHouseExportClient(BaseExportClient):
         """
         以 HTTP 流式方式执行 SQL，逐批 yield 数据行。
 
+        默认注入的保活设置（防止跨境/云上 LB 切断流式响应）：
+          - send_progress_in_http_headers=1         应用层心跳
+          - http_headers_progress_interval_ms=10000 心跳间隔
+          - wait_end_of_query=0                     立即流式发送
+        可通过 extra_settings 覆盖；也可通过环境变量 CH_EXPORT_HTTP_KEEPALIVE=0 全局关闭。
+
         参数：
           extra_settings  — 附加到 HTTP URL 参数的 ClickHouse per-query 设置，
                             例如 {"max_execution_time": 300}。
                             这是应用层操作，不修改服务器配置，仅对本次请求生效。
+                            优先级高于默认保活设置。
 
         内存特性：
           - 任意时刻内存中只有 ≤ batch_size 行
@@ -180,11 +336,14 @@ class ClickHouseExportClient(BaseExportClient):
         stream_sql = stripped + " FORMAT TabSeparatedWithNamesAndTypes"
 
         params = self._base_params()
+        # 1. 先注入默认保活设置
+        params.update(_build_default_streaming_settings())
+        # 2. 调用方传入的 extra_settings 优先级更高，可覆盖默认
         if extra_settings:
             params.update(extra_settings)
 
         try:
-            resp = requests.post(
+            resp = _get_export_session().post(
                 self._base_url,
                 data=stream_sql.encode("utf-8"),
                 params=params,

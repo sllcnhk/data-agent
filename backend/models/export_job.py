@@ -58,6 +58,18 @@ class ExportJob(Base):
     # 配置快照（JSON）：记录提交时的配置，方便追溯
     config_snapshot = Column(JSONB, nullable=True, comment="提交时的导出配置快照")
 
+    # ── 按日期分块导出（v2.13）─────────────────────────────────────────────────
+    # export_mode: "single"（默认，单文件）| "date_chunked"（按日期分块多文件）
+    export_mode = Column(
+        String(20), nullable=False, default="single",
+        comment="导出模式：single 单文件 / date_chunked 按日期分块多文件",
+    )
+    # chunk_config: {date_column, date_start, date_end, chunk_days, mode: placeholder|wrapper}
+    chunk_config = Column(JSONB, nullable=True, comment="日期分块配置（仅 date_chunked 模式）")
+    # output_files: 分块模式下的子文件清单
+    # [{index, date_start, date_end, filename, file_path, file_size, rows, sheets, status}]
+    output_files = Column(JSONB, nullable=True, comment="分块模式输出文件清单")
+
     # 错误信息
     error_message = Column(Text, nullable=True, comment="终止错误信息")
 
@@ -102,4 +114,8 @@ class ExportJob(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
+            # 分块导出（v2.13）
+            "export_mode": getattr(self, "export_mode", None) or "single",
+            "chunk_config": self.chunk_config,
+            "output_files": self.output_files,
         }

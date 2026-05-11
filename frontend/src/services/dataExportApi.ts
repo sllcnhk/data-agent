@@ -46,6 +46,8 @@ export interface QueryPreviewResult {
   columns: ColumnMeta[];
   rows: any[][];
   row_count: number;
+  /** 占位符模式时实际使用的样本日期（ISO YYYY-MM-DD）；非占位符模式为 null */
+  preview_date?: string | null;
 }
 
 export type ExportJobStatus =
@@ -55,6 +57,31 @@ export type ExportJobStatus =
   | 'failed'
   | 'cancelling'
   | 'cancelled';
+
+export type ExportMode = 'single' | 'date_chunked';
+
+export interface ChunkConfig {
+  /** 日期列名，包装模式必填；占位符模式可省 */
+  date_column?: string | null;
+  /** 起始日期（含），ISO YYYY-MM-DD */
+  date_start: string;
+  /** 结束日期（含），ISO YYYY-MM-DD */
+  date_end: string;
+  /** 单块天数 [1, 90] */
+  chunk_days: number;
+}
+
+export interface ExportFileEntry {
+  index: number;
+  date_start: string;
+  date_end: string;
+  filename: string;
+  file_path: string;
+  file_size: number | null;
+  rows: number;
+  sheets: number;
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+}
 
 export interface ExportJob {
   job_id: string;
@@ -78,6 +105,10 @@ export interface ExportJob {
   created_at: string | null;
   started_at: string | null;
   finished_at: string | null;
+  // 分块导出（v2.13）
+  export_mode: ExportMode;
+  chunk_config: ChunkConfig | null;
+  output_files: ExportFileEntry[] | null;
 }
 
 export interface ExportJobListResult {
@@ -93,6 +124,8 @@ export interface ExecuteExportRequest {
   connection_type?: string;
   job_name?: string;
   batch_size?: number;
+  /** 提供则启用按日期分块导出（多文件） */
+  chunk_config?: ChunkConfig;
 }
 
 
@@ -105,16 +138,28 @@ export const dataExportApi = {
     return res.data?.data ?? [];
   },
 
-  /** 执行 SQL 预览，返回列信息和前 N 行 */
+  /**
+   * 执行 SQL 预览，返回列信息和前 N 行。
+   *
+   * 如果 SQL 含 {{date_start}}/{{date_end}} 占位符（用于按日期分块导出），
+   * previewDate 指定占位符替换的样本日期（ISO YYYY-MM-DD）；不传默认昨日。
+   */
   previewQuery: async (
     querySql: string,
     connectionEnv: string,
     connectionType = 'clickhouse',
     limit = 100,
+    previewDate?: string,
   ): Promise<QueryPreviewResult> => {
     const res = await apiClient.post(
       '/data-export/preview',
-      { query_sql: querySql, connection_env: connectionEnv, connection_type: connectionType, limit },
+      {
+        query_sql: querySql,
+        connection_env: connectionEnv,
+        connection_type: connectionType,
+        limit,
+        preview_date: previewDate,
+      },
       { timeout: 30000 },
     );
     return res.data?.data;
@@ -158,11 +203,15 @@ export const dataExportApi = {
    * 通过 axios 发起请求，自动携带 Authorization Bearer token，
    * 避免原生 <a href> 导航绕过认证拦截器导致 401。
    * 大文件给 2 分钟超时（默认 30s 不够）。
+   *
+   * 分块模式必须传 fileIndex 指向 output_files[i]；单文件模式忽略此参数。
    */
-  downloadFile: async (jobId: string): Promise<Blob> => {
+  downloadFile: async (jobId: string, fileIndex?: number): Promise<Blob> => {
+    const params = fileIndex !== undefined ? { file_index: fileIndex } : undefined;
     const res = await apiClient.get(`/data-export/jobs/${jobId}/download`, {
       responseType: 'blob',
       timeout: 120000,
+      params,
     });
     return res.data as Blob;
   },

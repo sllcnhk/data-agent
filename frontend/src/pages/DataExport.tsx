@@ -12,6 +12,7 @@ import {
   Button,
   Card,
   Col,
+  DatePicker,
   Divider,
   Form,
   Input,
@@ -21,6 +22,7 @@ import {
   Pagination,
   Popconfirm,
   Progress,
+  Radio,
   Row,
   Select,
   Space,
@@ -30,12 +32,14 @@ import {
   Tooltip,
   Typography,
 } from 'antd';
+import type { Dayjs } from 'dayjs';
 import {
   CheckCircleOutlined,
   CloseCircleOutlined,
   DeleteOutlined,
   DownloadOutlined,
   ExportOutlined,
+  FileExcelOutlined,
   LoadingOutlined,
   ReloadOutlined,
   SearchOutlined,
@@ -44,7 +48,9 @@ import {
 } from '@ant-design/icons';
 import {
   dataExportApi,
+  ChunkConfig,
   Connection,
+  ExportFileEntry,
   ExportJob,
   ExportJobListResult,
   QueryPreviewResult,
@@ -84,7 +90,98 @@ function formatBytes(bytes: number | null): string {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+const FILE_STATUS_TAG: Record<string, { color: string; label: string }> = {
+  pending: { color: 'default', label: '等待' },
+  running: { color: 'processing', label: '导出中' },
+  completed: { color: 'success', label: '已完成' },
+  failed: { color: 'error', label: '失败' },
+  cancelled: { color: 'default', label: '已取消' },
+};
+
+// 任务展开行：分块文件清单
+const ChunkFileList: React.FC<{
+  job: ExportJob;
+  downloadingIds: Set<string>;
+  onDownload: (file: ExportFileEntry) => void;
+}> = ({ job, downloadingIds, onDownload }) => {
+  const files = job.output_files ?? [];
+  const cols = [
+    { title: '#', dataIndex: 'index', key: 'index', width: 50 },
+    {
+      title: '日期范围',
+      key: 'range',
+      width: 200,
+      render: (_: any, f: ExportFileEntry) => `${f.date_start} ~ ${f.date_end}`,
+    },
+    { title: '文件名', dataIndex: 'filename', key: 'filename', ellipsis: true },
+    {
+      title: '行数',
+      dataIndex: 'rows',
+      key: 'rows',
+      width: 100,
+      render: (v: number) => (v ?? 0).toLocaleString(),
+    },
+    { title: 'Sheet 数', dataIndex: 'sheets', key: 'sheets', width: 80 },
+    {
+      title: '大小',
+      dataIndex: 'file_size',
+      key: 'file_size',
+      width: 90,
+      render: (v: number | null) => formatBytes(v),
+    },
+    {
+      title: '状态',
+      dataIndex: 'status',
+      key: 'status',
+      width: 90,
+      render: (s: string) => {
+        const cfg = FILE_STATUS_TAG[s] ?? { color: 'default', label: s };
+        return <Tag color={cfg.color}>{cfg.label}</Tag>;
+      },
+    },
+    {
+      title: '操作',
+      key: 'actions',
+      width: 90,
+      render: (_: any, f: ExportFileEntry) => {
+        if (f.status !== 'completed') return null;
+        const dlKey = `${job.job_id}#${f.index}`;
+        return (
+          <Button
+            type="link"
+            size="small"
+            icon={<DownloadOutlined />}
+            loading={downloadingIds.has(dlKey)}
+            onClick={() => onDownload(f)}
+          >
+            下载
+          </Button>
+        );
+      },
+    },
+  ];
+  return (
+    <Table
+      size="small"
+      pagination={false}
+      rowKey="index"
+      dataSource={files}
+      columns={cols as any}
+    />
+  );
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
+
+// 检测 SQL 中是否含日期占位符（与后端 has_placeholders 一致）
+const sqlHasDatePlaceholders = (sql: string): boolean =>
+  sql.includes('{{date_start}}') && sql.includes('{{date_end}}');
+
+const sqlHasPartialPlaceholders = (sql: string): boolean => {
+  const hasStart = sql.includes('{{date_start}}');
+  const hasEnd = sql.includes('{{date_end}}');
+  return hasStart !== hasEnd;
+};
 
 const DataExport: React.FC = () => {
   // ── 连接 & 查询输入 ─────────────────────────────────────────────────────────
@@ -93,6 +190,9 @@ const DataExport: React.FC = () => {
   const [sql, setSql] = useState<string>('');
   const [loadingConns, setLoadingConns] = useState(false);
   const [previewing, setPreviewing] = useState(false);
+
+  // 占位符模式下的预览样本日期（默认昨日）
+  const [previewSampleDate, setPreviewSampleDate] = useState<Dayjs | null>(null);
 
   // ── 预览结果 ────────────────────────────────────────────────────────────────
   const [preview, setPreview] = useState<QueryPreviewResult | null>(null);
@@ -110,6 +210,9 @@ const DataExport: React.FC = () => {
   const [listLoading, setListLoading] = useState(false);
   const [downloadingIds, setDownloadingIds] = useState<Set<string>>(new Set());
   const pollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // ── 错误详情 Modal ──────────────────────────────────────────────────────────
+  const [errorModalJob, setErrorModalJob] = useState<ExportJob | null>(null);
 
   // ── 加载连接列表 ─────────────────────────────────────────────────────────────
   const loadConnections = useCallback(async () => {
@@ -175,11 +278,20 @@ const DataExport: React.FC = () => {
       message.warning('请选择数据库连接');
       return;
     }
+    if (sqlHasPartialPlaceholders(sql)) {
+      message.error('SQL 中 {{date_start}} 与 {{date_end}} 必须成对出现');
+      return;
+    }
     setPreviewing(true);
     setPreviewError('');
     setPreview(null);
     try {
-      const result = await dataExportApi.previewQuery(sql, selectedEnv);
+      const sampleDate = previewSampleDate
+        ? previewSampleDate.format('YYYY-MM-DD')
+        : undefined;
+      const result = await dataExportApi.previewQuery(
+        sql, selectedEnv, 'clickhouse', 100, sampleDate,
+      );
       setPreview(result);
     } catch (e: any) {
       const msg = e?.response?.data?.detail ?? e.message ?? '查询失败';
@@ -194,13 +306,32 @@ const DataExport: React.FC = () => {
     const values = await exportForm.validateFields();
     setExporting(true);
     try {
+      const isChunked = values.export_mode === 'date_chunked';
+      let chunk_config: ChunkConfig | undefined;
+      if (isChunked) {
+        const range = values.date_range as [Dayjs, Dayjs] | undefined;
+        if (!range || range.length !== 2) {
+          message.error('请选择日期范围');
+          setExporting(false);
+          return;
+        }
+        chunk_config = {
+          date_column: values.date_column?.trim() || null,
+          date_start: range[0].format('YYYY-MM-DD'),
+          date_end: range[1].format('YYYY-MM-DD'),
+          chunk_days: values.chunk_days || 10,
+        };
+      }
       const result = await dataExportApi.executeExport({
         query_sql: sql,
         connection_env: selectedEnv,
         job_name: values.job_name || '',
         batch_size: values.batch_size || 50000,
+        chunk_config,
       });
-      message.success(`导出任务已提交，文件名: ${result.output_filename}`);
+      message.success(
+        `导出任务已提交（${isChunked ? '按日期分块' : '单文件'}）：${result.output_filename}`,
+      );
       setExportModalOpen(false);
       exportForm.resetFields();
       await loadJobList(1);
@@ -237,14 +368,20 @@ const DataExport: React.FC = () => {
   // ── 下载文件 ─────────────────────────────────────────────────────────────────
   // 使用 axios blob 下载，确保 Authorization Bearer token 随请求发送。
   // 原生 <a href> 导航不经过 axios 拦截器，会触发 401 → 浏览器报"无法从网站上提取文件"。
-  const handleDownload = async (job: ExportJob) => {
-    setDownloadingIds(prev => new Set(prev).add(job.job_id));
+  // 分块模式下需指定 file 子项；单文件模式 file 为 undefined。
+  const handleDownload = async (job: ExportJob, file?: ExportFileEntry) => {
+    const dlKey = file ? `${job.job_id}#${file.index}` : job.job_id;
+    setDownloadingIds(prev => new Set(prev).add(dlKey));
     try {
-      const blob = await dataExportApi.downloadFile(job.job_id);
+      const blob = await dataExportApi.downloadFile(job.job_id, file?.index);
       const objectUrl = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = objectUrl;
-      a.download = job.output_filename ?? `export_${job.job_id}.xlsx`;
+      a.download =
+        file?.filename ??
+        (job.export_mode === 'date_chunked'
+          ? `export_${job.job_id}_${file?.index ?? 0}.xlsx`
+          : job.output_filename ?? `export_${job.job_id}.xlsx`);
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -266,7 +403,7 @@ const DataExport: React.FC = () => {
     } finally {
       setDownloadingIds(prev => {
         const next = new Set(prev);
-        next.delete(job.job_id);
+        next.delete(dlKey);
         return next;
       });
     }
@@ -329,9 +466,32 @@ const DataExport: React.FC = () => {
         }
         if (r.status === 'failed') {
           return (
-            <Tooltip title={r.error_message}>
-              <Text type="danger">失败</Text>
-            </Tooltip>
+            <Space direction="vertical" size={0} style={{ width: '100%' }}>
+              <Button
+                type="link"
+                size="small"
+                danger
+                style={{ padding: 0, height: 'auto', textAlign: 'left' }}
+                onClick={() => setErrorModalJob(r)}
+              >
+                <Text type="danger">失败 · 查看详情</Text>
+              </Button>
+              {r.error_message && (
+                <Text
+                  type="secondary"
+                  style={{
+                    fontSize: 11,
+                    display: '-webkit-box',
+                    WebkitLineClamp: 2,
+                    WebkitBoxOrient: 'vertical',
+                    overflow: 'hidden',
+                  }}
+                  title={r.error_message}
+                >
+                  {r.error_message.split('[技术细节]')[0].trim()}
+                </Text>
+              )}
+            </Space>
           );
         }
         if (r.status === 'cancelled' || r.status === 'cancelling') {
@@ -379,7 +539,7 @@ const DataExport: React.FC = () => {
       fixed: 'right' as const,
       render: (_: any, r: ExportJob) => (
         <Space size="small">
-          {r.status === 'completed' && (
+          {r.status === 'completed' && r.export_mode !== 'date_chunked' && (
             <Tooltip title={downloadingIds.has(r.job_id) ? '下载中…' : '下载'}>
               <Button
                 type="link"
@@ -388,6 +548,13 @@ const DataExport: React.FC = () => {
                 loading={downloadingIds.has(r.job_id)}
                 onClick={() => handleDownload(r)}
               />
+            </Tooltip>
+          )}
+          {r.status === 'completed' && r.export_mode === 'date_chunked' && (
+            <Tooltip title="展开行查看分块文件下载">
+              <Tag color="blue" icon={<FileExcelOutlined />}>
+                {r.output_files?.filter((f) => f.status === 'completed').length ?? 0} 个文件
+              </Tag>
             </Tooltip>
           )}
           {(r.status === 'pending' || r.status === 'running') && (
@@ -470,6 +637,41 @@ const DataExport: React.FC = () => {
           }}
         />
 
+        {sqlHasDatePlaceholders(sql) && (
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message="检测到日期占位符 {{date_start}} / {{date_end}}"
+            description={
+              <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  预览时占位符会被替换为下方「样本日期」（留空默认昨日），
+                  让带占位符的 SQL 也能查询预览。导出时按实际日期范围替换为每个块的起止日期。
+                </Text>
+                <Space>
+                  <Text>预览样本日期：</Text>
+                  <DatePicker
+                    value={previewSampleDate}
+                    onChange={setPreviewSampleDate}
+                    placeholder="留空默认昨日"
+                    allowClear
+                  />
+                </Space>
+              </Space>
+            }
+          />
+        )}
+        {sqlHasPartialPlaceholders(sql) && (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message="占位符须成对"
+            description="SQL 中 {{date_start}} 与 {{date_end}} 必须同时出现，仅写一个会导致预览/导出失败"
+          />
+        )}
+
         <Row justify="end">
           <Space>
             <Button
@@ -506,6 +708,7 @@ const DataExport: React.FC = () => {
               <Text strong>查询预览</Text>
               <Text type="secondary">
                 显示前 {preview.row_count} 行 · {preview.columns.length} 列
+                {preview.preview_date && ` · 占位符替换为 ${preview.preview_date}`}
               </Text>
             </Space>
           }
@@ -514,7 +717,13 @@ const DataExport: React.FC = () => {
               type="primary"
               icon={<ExportOutlined />}
               onClick={() => {
-                exportForm.setFieldsValue({ job_name: '', batch_size: 50000 });
+                exportForm.resetFields();
+                exportForm.setFieldsValue({
+                  export_mode: 'single',
+                  job_name: '',
+                  batch_size: 50000,
+                  chunk_days: 10,
+                });
                 setExportModalOpen(true);
               }}
             >
@@ -556,6 +765,17 @@ const DataExport: React.FC = () => {
           scroll={{ x: 900 }}
           size="small"
           locale={{ emptyText: '暂无导出记录' }}
+          expandable={{
+            rowExpandable: (r) =>
+              r.export_mode === 'date_chunked' && (r.output_files?.length ?? 0) > 0,
+            expandedRowRender: (r) => (
+              <ChunkFileList
+                job={r}
+                downloadingIds={downloadingIds}
+                onDownload={(file) => handleDownload(r, file)}
+              />
+            ),
+          }}
         />
         {jobList && jobList.total > listPageSize && (
           <div style={{ marginTop: 12, textAlign: 'right' }}>
@@ -583,38 +803,191 @@ const DataExport: React.FC = () => {
         confirmLoading={exporting}
         okText="开始导出"
         cancelText="取消"
-        width={480}
+        width={560}
       >
-        <Form form={exportForm} layout="vertical">
+        <Form
+          form={exportForm}
+          layout="vertical"
+          initialValues={{
+            export_mode: 'single',
+            chunk_days: 10,
+            batch_size: 50000,
+          }}
+        >
+          <Form.Item name="export_mode" label="导出模式">
+            <Radio.Group>
+              <Radio.Button value="single">单文件</Radio.Button>
+              <Radio.Button value="date_chunked">按日期分块（多文件）</Radio.Button>
+            </Radio.Group>
+          </Form.Item>
+
           <Form.Item
             name="job_name"
             label="文件名（可选）"
-            extra="留空则自动生成，最终文件名为 {名称}_{时间戳}.xlsx"
+            extra="留空自动生成；分块模式下用作子文件前缀"
           >
             <Input placeholder="如：用户行为分析_2024Q1" maxLength={50} />
           </Form.Item>
+
+          {/* 分块模式专用字段 */}
+          <Form.Item
+            noStyle
+            shouldUpdate={(prev, cur) => prev.export_mode !== cur.export_mode}
+          >
+            {({ getFieldValue }) =>
+              getFieldValue('export_mode') === 'date_chunked' ? (
+                <>
+                  <Divider style={{ margin: '8px 0 16px' }}>分块配置</Divider>
+                  <Form.Item
+                    name="date_range"
+                    label="日期范围（含起止日）"
+                    rules={[{ required: true, message: '请选择日期范围' }]}
+                  >
+                    <DatePicker.RangePicker style={{ width: '100%' }} />
+                  </Form.Item>
+                  <Form.Item
+                    name="chunk_days"
+                    label="单块天数"
+                    rules={[{ required: true, type: 'number', min: 1, max: 90 }]}
+                    extra="每个 Excel 文件覆盖的天数，范围 1-90"
+                  >
+                    <InputNumber min={1} max={90} step={1} style={{ width: '100%' }} />
+                  </Form.Item>
+                  <Form.Item
+                    name="date_column"
+                    label="日期列名（包装模式必填）"
+                    extra={
+                      <span>
+                        若 SQL 中已写 <code>{'{{date_start}}'}</code> /{' '}
+                        <code>{'{{date_end}}'}</code> 占位符，则可省略此项（推荐：性能最佳）。
+                        否则填写表中的日期列名（仅字母/数字/下划线）。
+                      </span>
+                    }
+                  >
+                    <Input placeholder="如：event_date" maxLength={64} />
+                  </Form.Item>
+                </>
+              ) : null
+            }
+          </Form.Item>
+
           <Form.Item
             name="batch_size"
             label="批次大小（高级）"
             extra="每批从数据库读取的行数，影响内存与速度，默认 50,000 行"
-            initialValue={50000}
           >
             <InputNumber min={1000} max={200000} step={1000} style={{ width: '100%' }} />
           </Form.Item>
+
           <Alert
             type="info"
             showIcon
-            message={`SQL → Excel 导出说明`}
+            message="导出说明"
             description={
               <ul style={{ margin: 0, paddingLeft: 16 }}>
-                <li>每超过 100 万行自动插入新 Sheet，每个 Sheet 均含标题行</li>
+                <li>每超过 100 万行自动插入新 Sheet，每 Sheet 均含标题行</li>
                 <li>Int64 / UInt64 等大整数列自动转为字符串，避免科学计数法</li>
-                <li>导出过程可随时取消，已完成批次不可回退</li>
-                <li>导出完成后可在历史列表下载，文件长期保存在服务器</li>
+                <li>分块模式：每块单独生成一个 Excel 文件；优先使用 SQL 占位符以获得最佳查询性能</li>
+                <li>导出过程可随时取消，已完成块/文件保留可下载</li>
               </ul>
             }
           />
         </Form>
+      </Modal>
+
+      {/* ── 错误详情 Modal ─────────────────────────────────────────────────── */}
+      <Modal
+        title={
+          <Space>
+            <CloseCircleOutlined style={{ color: '#ff4d4f' }} />
+            <span>导出失败详情</span>
+          </Space>
+        }
+        open={errorModalJob !== null}
+        onCancel={() => setErrorModalJob(null)}
+        footer={[
+          <Button
+            key="copy"
+            onClick={() => {
+              if (errorModalJob?.error_message) {
+                navigator.clipboard
+                  .writeText(errorModalJob.error_message)
+                  .then(() => message.success('错误信息已复制到剪贴板'))
+                  .catch(() => message.error('复制失败'));
+              }
+            }}
+          >
+            复制错误信息
+          </Button>,
+          <Button key="close" type="primary" onClick={() => setErrorModalJob(null)}>
+            关闭
+          </Button>,
+        ]}
+        width={680}
+      >
+        {errorModalJob && (
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <Row gutter={[16, 8]}>
+              <Col span={8}><Text type="secondary">任务名称：</Text></Col>
+              <Col span={16}>
+                <Text>{errorModalJob.job_name || errorModalJob.output_filename || '-'}</Text>
+              </Col>
+              <Col span={8}><Text type="secondary">导出模式：</Text></Col>
+              <Col span={16}>
+                <Tag>{errorModalJob.export_mode === 'date_chunked' ? '按日期分块' : '单文件'}</Tag>
+              </Col>
+              <Col span={8}><Text type="secondary">连接：</Text></Col>
+              <Col span={16}><Text>{errorModalJob.connection_env}</Text></Col>
+              <Col span={8}><Text type="secondary">已导出行数：</Text></Col>
+              <Col span={16}>
+                <Text>{(errorModalJob.exported_rows ?? 0).toLocaleString()}</Text>
+                {errorModalJob.export_mode === 'date_chunked' && (
+                  <Text type="secondary" style={{ marginLeft: 8 }}>
+                    （已完成 {errorModalJob.done_batches}/{errorModalJob.total_batches ?? '?'} 块）
+                  </Text>
+                )}
+              </Col>
+              <Col span={8}><Text type="secondary">创建时间：</Text></Col>
+              <Col span={16}>
+                <Text>
+                  {errorModalJob.created_at
+                    ? new Date(errorModalJob.created_at).toLocaleString('zh-CN', { hour12: false })
+                    : '-'}
+                </Text>
+              </Col>
+            </Row>
+            <Divider style={{ margin: '8px 0' }} />
+            <div>
+              <Text strong>错误信息：</Text>
+              <Input.TextArea
+                value={errorModalJob.error_message ?? '（无）'}
+                readOnly
+                autoSize={{ minRows: 4, maxRows: 12 }}
+                style={{ fontFamily: 'monospace', fontSize: 12, marginTop: 8 }}
+              />
+            </div>
+            {errorModalJob.export_mode === 'date_chunked'
+              && errorModalJob.output_files
+              && errorModalJob.output_files.some(f => f.status === 'completed') && (
+              <Alert
+                type="info"
+                showIcon
+                message="部分块已完成，可单独下载"
+                description={
+                  <span>
+                    虽然整体任务失败，但已有
+                    {' '}
+                    <b>
+                      {errorModalJob.output_files.filter(f => f.status === 'completed').length}
+                    </b>
+                    {' '}
+                    个块完成。关闭此对话框后展开任务行可逐个下载。
+                  </span>
+                }
+              />
+            )}
+          </Space>
+        )}
       </Modal>
     </div>
   );

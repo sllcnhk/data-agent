@@ -56,7 +56,7 @@ class TestClickHouseExportClientGetColumns:
         header = "id\tname\tage\n"
         types  = "Int64\tString\tUInt32\n"
         client = self._make_client()
-        with patch("requests.post", return_value=self._mock_resp(header + types)):
+        with patch("requests.sessions.Session.post", return_value=self._mock_resp(header + types)):
             result = client.get_columns("SELECT * FROM t")
         assert result == [
             ColumnInfo("id", "Int64"),
@@ -67,14 +67,14 @@ class TestClickHouseExportClientGetColumns:
     def test_a2_empty_result_returns_empty_list(self):
         """A2: 空响应返回空列表"""
         client = self._make_client()
-        with patch("requests.post", return_value=self._mock_resp("")):
+        with patch("requests.sessions.Session.post", return_value=self._mock_resp("")):
             result = client.get_columns("SELECT 1")
         assert result == []
 
     def test_a3_http_error_raises_runtime(self):
         """A3: HTTP 非 200 抛 RuntimeError"""
         client = self._make_client()
-        with patch("requests.post", return_value=self._mock_resp("err", 400)):
+        with patch("requests.sessions.Session.post", return_value=self._mock_resp("err", 400)):
             with pytest.raises(RuntimeError, match="400"):
                 client.get_columns("SELECT bad query")
 
@@ -82,7 +82,7 @@ class TestClickHouseExportClientGetColumns:
         """A4: 连接失败抛 ConnectionError"""
         import requests as _req
         client = self._make_client()
-        with patch("requests.post", side_effect=_req.ConnectionError("refused")):
+        with patch("requests.sessions.Session.post", side_effect=_req.ConnectionError("refused")):
             with pytest.raises(ConnectionError):
                 client.get_columns("SELECT 1")
 
@@ -107,7 +107,7 @@ class TestClickHouseExportClientStreamBatches:
         resp = self._streaming_response(header + data)
 
         client = self._make_client()
-        with patch("requests.post", return_value=resp):
+        with patch("requests.sessions.Session.post", return_value=resp):
             batches = list(client.stream_batches("SELECT 1", batch_size=3))
 
         assert len(batches) == 3         # ceil(7/3) = 3
@@ -120,7 +120,7 @@ class TestClickHouseExportClientStreamBatches:
         """A6: 无数据行时不 yield"""
         resp = self._streaming_response(["col\n", "Int64\n"])
         client = self._make_client()
-        with patch("requests.post", return_value=resp):
+        with patch("requests.sessions.Session.post", return_value=resp):
             batches = list(client.stream_batches("SELECT 1", batch_size=100))
         assert batches == []
 
@@ -128,7 +128,7 @@ class TestClickHouseExportClientStreamBatches:
         """A7: \\N 解析为 None"""
         resp = self._streaming_response(["a", "String", r"\N"])
         client = self._make_client()
-        with patch("requests.post", return_value=resp):
+        with patch("requests.sessions.Session.post", return_value=resp):
             batches = list(client.stream_batches("SELECT 1", batch_size=100))
         assert batches == [([(None,)])]
 
@@ -136,7 +136,7 @@ class TestClickHouseExportClientStreamBatches:
         """A8: \\t \\n 转义正确还原"""
         resp = self._streaming_response(["a", "String", "hello\\tworld"])
         client = self._make_client()
-        with patch("requests.post", return_value=resp):
+        with patch("requests.sessions.Session.post", return_value=resp):
             batches = list(client.stream_batches("SELECT 1", batch_size=100))
         assert batches[0][0][0] == "hello\tworld"
 
@@ -147,7 +147,7 @@ class TestClickHouseExportClientStreamBatches:
         resp.status_code = 500
         resp.content = b"Internal error"
         client = self._make_client()
-        with patch("requests.post", return_value=resp):
+        with patch("requests.sessions.Session.post", return_value=resp):
             with pytest.raises(RuntimeError, match="500"):
                 list(client.stream_batches("SELECT 1"))
 
