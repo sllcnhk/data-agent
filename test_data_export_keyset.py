@@ -232,6 +232,32 @@ class TestStreamBatchesKeyset:
 
         assert "ORDER BY `id`" in captured_sqls[0]
 
+    def test_g9_null_cursor_at_window_end_gives_actionable_error(self):
+        """G9(v2.14.2): cursor 列末行 NULL → 抛 RuntimeError 含**可执行修复建议**
+        (用户最常踩的坑:cursor 列是 Nullable;ClickHouse ASC NULL 排最后 → 末行 NULL)"""
+        client = _new_client()
+
+        def _fake_post(url, data=None, params=None, **kw):
+            # 模拟首窗口:几个正常行 + 末行 cursor 为 NULL (\N)
+            return _make_tsv_response(
+                ["call_record_id", "name"], ["Nullable(Int64)", "String"],
+                [("1001", "alice"), ("1002", "bob"), (None, "charlie")],
+            )
+
+        with patch.object(requests.sessions.Session, "post", side_effect=_fake_post):
+            with pytest.raises(RuntimeError) as exc_info:
+                list(client.stream_batches_keyset(
+                    "SELECT call_record_id, name FROM t",
+                    cursor_column="call_record_id", batch_size=100,
+                ))
+        msg = str(exc_info.value)
+        # 错误消息必须含"NULL" + 用户能执行的建议关键词
+        assert "NULL" in msg or "null" in msg.lower()
+        assert "IS NOT NULL" in msg, f"应建议 SQL 加 IS NOT NULL,实际: {msg}"
+        # 应提到换列 / 回退 LIMIT/OFFSET
+        assert "主键" in msg or "时间戳" in msg
+        assert "LIMIT/OFFSET" in msg
+
     def test_g6_cursor_column_not_in_select_raises(self):
         """G6: SELECT * 结果不含 cursor_column 列 → RuntimeError(用户 SQL SELECT 子集)"""
         client = _new_client()

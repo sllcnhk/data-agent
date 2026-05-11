@@ -646,7 +646,17 @@ class ClickHouseExportClient(BaseExportClient):
             # cursor 列含 NULL 或排序非确定的责任由用户承担(文档警告)。
             new_cursor = rows_in_window[-1][cursor_col_idx] if cursor_col_idx is not None else None
             if new_cursor is None:
-                raise RuntimeError("keyset cursor 解析失败:末行 cursor 列值为 None")
+                # NULL cursor 是 keyset 致命问题:WHERE cursor > NULL 永远 false,
+                # 推进不动 + 漏 NULL 行。给用户清晰可执行的建议。
+                raise RuntimeError(
+                    f"keyset 分页失败:cursor 列 '{cursor_column}' 在窗口末行为 NULL。"
+                    f"ClickHouse 默认 ORDER BY ASC 将 NULL 排到最后,导致 WHERE cursor > last "
+                    f"无法继续推进。解决方案(任选其一):"
+                    f"① SQL WHERE 加 `{cursor_column} IS NOT NULL` 显式过滤 NULL 行(确认数据丢弃可接受;"
+                    f"先跑 SELECT count() FROM (your_sql) WHERE {cursor_column} IS NULL 看丢多少);"
+                    f"② 换一个保证 NOT NULL 的列作 cursor(主键 / 时间戳 + 唯一 ID);"
+                    f"③ 前端「游标列名」清空,回退 LIMIT/OFFSET(注意:可能有少量重复/漏行)。"
+                )
             if last_cursor is not None and str(new_cursor) == str(last_cursor):
                 raise RuntimeError(
                     f"keyset cursor 死循环(last==new=={new_cursor!r})"

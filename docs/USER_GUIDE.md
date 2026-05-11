@@ -2424,7 +2424,11 @@ EXPORT_INPLACE_RETRY_MAX=1                # 单块失败后原位重试次数（
 **选列建议**：
 - 优先选**主键**（确保唯一 + 单调）
 - 时间戳列也可（高并发同微秒插入可能漏极少数行，对导出场景一般可接受）
-- **避免 NULL**：含 NULL 的 cursor 列推进语义不可靠
+- **避免 NULL（重要,常见踩坑）**:`Nullable(Int64)` 主键在异常调用 / 初始化失败的行可能为 NULL。ClickHouse 默认 `ORDER BY cursor ASC` 把 NULL 排最末 → 窗口末行 cursor=NULL → `WHERE cursor > NULL` 永远 false → keyset 推进失败。出错时报 "**keyset 分页失败:cursor 列 ... 在窗口末行为 NULL**",修法:
+  - 在 SQL `WHERE` 加 ` AND cursor_col IS NOT NULL`(确认 NULL 行可丢弃)
+  - 或先跑 `SELECT count() FROM (your_sql) WHERE cursor_col IS NULL` 看丢多少
+  - 或换一个保证 NOT NULL 的列(`contact_id` / 时间戳 + 唯一 ID 等)
+  - 或前端「游标列名」清空,回退 LIMIT/OFFSET(可能少量重叠/漏行)
 
 **重要 — 填别名(v2.14.1 起支持空格/中文)**：
 
