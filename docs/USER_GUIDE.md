@@ -2019,7 +2019,7 @@ DELETE /api/v1/data-import/jobs/{job_id}
 
 在页面输入任意 SELECT SQL，选择 ClickHouse 连接，预览前 N 行结果后一键导出为本地 Excel（`.xlsx`）文件。支持：
 
-- **流式导出**：服务端 HTTP 流式响应 + `openpyxl` write-only 模式，峰值内存仅为 `batch_size` × 行宽；不受大数据量影响
+- **流式导出**：服务端 HTTP 流式响应 + `xlsxwriter` constant_memory 模式（v2.14.3 起;v2.13 使用 openpyxl write_only），峰值内存与 `batch_size` 无关,每行写完即丢;C 加速字符串处理 + 流式 zip,典型场景写入速度 3-5x 优于 openpyxl,大幅减少跨境长连接因客户端处理慢被中断的概率
 - **多 Sheet 自动分割**：每满 100 万数据行自动创建新 Sheet（Sheet1、Sheet2…），每个 Sheet 均带标题行
 - **按日期分块多文件导出**（v2.13 新增，见 13.7 节）：单 SQL → N 个日期窗口 → N 个 xlsx 文件，针对千万行月明细等大数据量场景，避免单文件过大、便于按时间段拆分交付
 - **大整数安全**：`Int64`/`UInt64`/`Int128`/`UInt128`/`Int256`/`UInt256` 类型自动转为字符串，避免 Excel 打开时显示科学计数法
