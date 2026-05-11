@@ -792,6 +792,45 @@ SKILL_SEMANTIC_THRESHOLD=0.45  # 低于此分数的语义命中不注入
 SKILL_SEMANTIC_CACHE_TTL=86400 # 路由缓存 24 小时
 ```
 
+### 可选：数据导出可靠性（SQL → Excel）
+
+针对**跨境 / 云上长查询断流** + **千万行重型 SQL** 导出场景的多层防御参数。所有项均有合理默认值,生产环境通常**无需手动调整**;以下变量在中转网关空闲超时极短(如 < 5 分钟)或导出 SQL 含 `decrypt` / `JSONExtract` 等高 CPU 操作时酌情调优。
+
+```ini
+# ── HTTP 层心跳（服务端,默认启用）─────────────────────────
+CH_EXPORT_HTTP_KEEPALIVE=1                # 1=启用 send_progress_in_http_headers（默认）；0=关闭（极端兼容场景）
+CH_EXPORT_PROGRESS_INTERVAL_MS=10000      # X-ClickHouse-Progress 头间隔，默认 10s；LB 超时 < 60s 时调到 5000
+
+# ── TCP 层心跳（OS 内核;v2.14 Windows 上已真正生效）───────
+CH_EXPORT_TCP_KEEPALIVE=1                 # 1=启用（默认）；0=回退到普通 requests.Session
+CH_EXPORT_TCP_KEEPIDLE=30                 # 空闲多少秒开始 keepalive，默认 30
+CH_EXPORT_TCP_KEEPINTVL=10                # keepalive 包间隔（秒），默认 10
+CH_EXPORT_TCP_KEEPCNT=6                   # 失败次数阈值，默认 6（Linux/macOS）。Windows 由系统固定 10 次,此变量被忽略
+
+# ── 查询层 ─────────────────────────────────────────────────
+EXPORT_QUERY_MAX_EXECUTION_TIME=300       # ClickHouse max_execution_time（秒），默认 300;跨境/重型 SQL 可调到 600~1800
+EXPORT_CHUNK_SIZE=200000                  # LIMIT/OFFSET 回退每窗口行数，默认 200000
+
+# ── v2.14 新增：失败重试 ───────────────────────────────────
+EXPORT_INPLACE_RETRY_MAX=1                # 单块失败后原位重试次数,默认 1（瞬时抖动友好）。0=禁用重试直接进入分裂分支
+```
+
+**Windows 部署关键点(v2.14 修复)**:
+- v2.13 在 win32 上仅设置基础 `SO_KEEPALIVE`,间隔由注册表 `KeepAliveTime`(默认 2 小时)控制 → 等同于无效
+- v2.14 通过 `urllib3.HTTPConnection` 子类化在 `connect()` 后调用 `socket.ioctl(SIO_KEEPALIVE_VALS, (1, idle_ms, intvl_ms))`,真正按 `CH_EXPORT_TCP_KEEPIDLE/INTVL`(秒→毫秒×1000)配置 keepalive 间隔
+- Windows 上 `CH_EXPORT_TCP_KEEPCNT` 无效(系统固定 10 次失败);若需要更激进的探测,缩短 `CH_EXPORT_TCP_KEEPINTVL`
+
+**典型生产配置组合**:
+
+| 场景 | 推荐值 |
+|------|--------|
+| 同区域内网 ClickHouse,无中间网关 | 默认值即可 |
+| 跨境 / 云 LB(空闲超时 ~5min) | `CH_EXPORT_PROGRESS_INTERVAL_MS=5000` + `CH_EXPORT_TCP_KEEPIDLE=15` |
+| 千万行 + decrypt/JSONExtract 重型 SQL | `EXPORT_QUERY_MAX_EXECUTION_TIME=900` + `EXPORT_INPLACE_RETRY_MAX=2` |
+| LB 极其严格(< 60s 切断) | 上述全部调最小 + 把导出 `chunk_days` 配置到 1~3 天 + 启用 sub-day 细分(运行时由用户在 UI 选择) |
+
+> v2.14 提供两个 opt-in 用户配置(`chunk_config.min_subdivide_unit` + `chunk_config.cursor_column`),通过前端 Modal 由用户按导出任务设置,**无环境变量等价物**(因为是 per-job 决策,非全局)。详见 USER_GUIDE.md 13.7.8 节。
+
 ### 可选：CORS
 
 ```ini

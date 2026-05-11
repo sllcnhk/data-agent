@@ -78,6 +78,24 @@ class ChunkConfigSchema(BaseModel):
     date_start: str = Field(..., description="起始日期（含），ISO YYYY-MM-DD")
     date_end: str = Field(..., description="结束日期（含），ISO YYYY-MM-DD")
     chunk_days: int = Field(default=10, ge=1, le=90, description="单块天数 [1-90]")
+    min_subdivide_unit: Optional[str] = Field(
+        default="day",
+        description=(
+            "块失败自动对半再细分的最小粒度:day(默认,不下钻到 sub-day)/hour/minute。"
+            "选 hour/minute 时,1 天块失败可继续拆成 12h+12h→6h+6h... 直到 1 小时或 1 分钟。"
+            "仅当过滤列为 DateTime 类型时启用 hour/minute 才有效;Date 列下 sub-day 字面量"
+            "会被 ClickHouse 截到 Date,导致无效细分。"
+        ),
+    )
+    cursor_column: Optional[str] = Field(
+        default=None,
+        description=(
+            "游标列名(可选,启用键集分页代替 LIMIT/OFFSET)。提供后,流式断开自动回退"
+            "时使用 WHERE cursor > last_value ORDER BY cursor LIMIT N 推进;对大数据集"
+            "大幅提速且消除 LIMIT/OFFSET 非确定性。要求列可排序且趋势单调(主键 / 时间戳)。"
+            "不适用于 GROUP BY/DISTINCT 等聚合 SQL。仅允许字母/数字/下划线。"
+        ),
+    )
 
 
 class ExecuteExportRequest(BaseModel):

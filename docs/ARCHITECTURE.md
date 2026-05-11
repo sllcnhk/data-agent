@@ -929,6 +929,72 @@ cancelling ──(协程检测到)──► cancelled
 
 ---
 
+### 4.18.1 SQL → Excel 数据导出可靠性增强（v2.14，2026-05-11）
+
+针对**跨境/云上长查询断流 + 千万行重型 SQL 导出**场景,v2.14 在 v2.13 五层防御基础上增强四项独立能力。
+
+**改动文件清单**:
+| 文件 | 改动 |
+|------|------|
+| `backend/services/export_clients/clickhouse.py` | Task C: `_WinKeepAliveHTTPConnection/Pool` 子类化 urllib3,win32 平台用 `SIO_KEEPALIVE_VALS` ioctl 在 `connect()` 后设置;Task B: `stream_batches_keyset()` + `_iter_keyset_window()` 实现键集分页;`is_transient_stream_error()` 沿 `__cause__/__context__` 探测包装层下的瞬时错误 |
+| `backend/services/data_export_chunker.py` | Task A: `subdivide_range(start, end, min_unit)` 通用化对半分裂(支持 date 和 datetime 端点);`inject_date_filter` + `build_chunk_filename` 接受 `Union[date, datetime]`;`NormalizedChunkConfig` 加 `min_subdivide_unit` + `cursor_column` 字段;老 `subdivide_date_range` 保留为薄包装 |
+| `backend/services/data_export_service.py` | Task A: `_run_chunked_export_sync` 用 `_parse_iso_endpoint` 解析 entry,`can_subdivide` 用 `subdivide_range` 返回长度判定;Task B: `_run_single_export(..., cursor_column=)` 选路;Task D: 失败先 `_sleep_with_cancel_check(backoff)` 原位重试 1 次再分裂;`_humanize_error` 沿异常链聚合 message |
+| `backend/api/data_export.py` | `ChunkConfigSchema` 加 `min_subdivide_unit: Optional[str] = "day"` + `cursor_column: Optional[str] = None`;**无新增端点**(沿用现有 `/execute` 等 8 个端点 + `data:export` 权限) |
+| `frontend/src/services/dataExportApi.ts` | `ChunkConfig` 加 `min_subdivide_unit?: 'day'\|'hour'\|'minute'` + `cursor_column?: string` |
+| `frontend/src/pages/DataExport.tsx` | 分块表单加 Select(最小再细分粒度)+ Input(游标列名);`ChunkFileList` 渲染含 `T` 的 datetime ISO 时把 `T` 替换为空格 |
+
+**四项能力一图概览**:
+
+```
+原 1 天块(chunk_days=1)流式断开
+  │
+  ▼
+[Task D] _retry_count < 1?  ──yes──► 5s 退避(可取消) → 重试同一块
+  │ 用尽
+  ▼
+[Task A] subdivide_range(date, date, min_unit="hour")
+  │  return [(00:00, 11:59:59), (12:00, 23:59:59)]
+  │ (min_unit="day" 时返回 [(date, date)] → 不可分 → fail)
+  ▼
+两个 sub-day 子块各自调 _run_single_export(chunk_sql, cursor_column=...)
+  │
+  ▼
+[Task B] use_chunked=True 时:
+  cursor_column 提供 → stream_batches_keyset(sql, cursor_column, batch_size)
+                       (ORDER BY cursor LIMIT N → WHERE cursor > last)
+  cursor_column 未提供 → stream_batches_chunked(sql, ...)  (LIMIT/OFFSET,老路径)
+
+[Task C] 全程 OS 层 TCP keepalive 在 Win/Linux/macOS 各自生效
+  Win32: connect() 后 sock.ioctl(SIO_KEEPALIVE_VALS, (1, 30*1000, 10*1000))
+  *nix:  setsockopt TCP_KEEPIDLE=30 / TCP_KEEPINTVL=10 / TCP_KEEPCNT=6
+```
+
+**子块文件名格式**:
+- date 端点 → `{job}_{YYYYMMDD}_to_{YYYYMMDD}.xlsx`(v2.13 不变)
+- datetime 端点(sub-day 拆分后产生)→ `{job}_{YYYYMMDDTHHMMSS}_to_{YYYYMMDDTHHMMSS}.xlsx`(`T` 分隔,字典序与时间序一致;Windows 文件系统兼容,不含 `:`)
+
+**output_files JSONB entry 新增内部字段**:
+- `_depth: int` — 自动分裂递归深度(用于停止条件 + 调试)
+- `_retry_count: int` — 在原位重试次数(Task D)
+
+前端展示忽略下划线开头字段;`MAX_SUBDIVISION_DEPTH = 10` 兼容日级 4 层 + 时间级 6 层。
+
+**异常链探测(v2.14 修隐性 bug)**:
+- v2.13 的 `is_transient_stream_error(exc)` 只看 `exc` 自身的 type/message
+- `_run_single_export` 内部把 `count_rows` 异常包装为 `RuntimeError("分批模式预扫描行数失败:...") from cnt_err`
+- v2.13 包装异常的 `str()` 不含 `ChunkedEncodingError` 等指纹 → 外层 retry 不识别 → 整体 fail
+- v2.14 沿 `__cause__` / `__context__` 递归探测,识别底层 transient
+
+**RBAC 范围(v2.14 验证)**:
+- 无新增 API 端点(`ChunkConfigSchema` 字段扩展不需要新端点)
+- 无新增前端菜单(全部字段在现有 `/data-export` 页 Modal 内)
+- 沿用现有 `data:export` 权限装饰所有相关端点
+- `init_rbac.py` 权限矩阵无需变更
+
+测试覆盖:`test_data_export_keepalive.py` 11 + `test_data_export_chunker.py` 81 + `test_data_export_chunked.py`(KN/L 段)+ `test_data_export_keyset.py` 9 + `test_data_export_v214_e2e.py` 20(M/N/O/P/Q/R/S/T/U 九段)= **70 个 v2.14 新测试**,全量回归 332 通过零失败。
+
+---
+
 ### 4.19 Skill 用户使用权限隔离（T1–T6）（2026-04-08）
 
 **设计动机**：超级管理员在 `user/superadmin/` 创建的用户技能，原本对所有其他用户在对话时同样可见（`build_skill_prompt` 未按用户过滤 user-tier skill）。T1–T6 通过 `owner` 字段 + 可见性过滤，将 Tier 3 用户技能的**读访问**也完整隔离到各用户自己名下，与写入隔离对称。

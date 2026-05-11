@@ -748,3 +748,364 @@ def teardown_module(_):
         db.close()
     except Exception:
         pass
+
+
+# =============================================================================
+# K-new · Task A 集成 — min_subdivide_unit 控制 sub-day 自动细分
+# =============================================================================
+
+class TestSubDaySubdivision:
+
+    def test_kn1_subday_hour_unit_recovers_failed_single_day(self, tmp_path):
+        """K-new1: min_subdivide_unit='hour' + 1 天块第一次流式断开 → 自动拆成
+        两个 sub-day 子块(12h+12h),后续两次重试成功 → Job completed。
+        老 entry 被替换,output_files 中 date_start/date_end 含 'T'。"""
+        from backend.config.database import SessionLocal
+        from backend.models.export_job import ExportJob
+        import backend.services.data_export_service as svc
+        from requests.exceptions import ChunkedEncodingError
+
+        db = SessionLocal()
+        out_dir = tmp_path / "kn1_output"
+        # 单天 chunk(1 day, chunk_days=1),包含 min_subdivide_unit=hour
+        job = ExportJob(
+            user_id="uid",
+            username=f"{_PREFIX}kn1",
+            query_sql="SELECT id, name FROM t WHERE ts >= '{{date_start}}' AND ts <= '{{date_end}}'",
+            connection_env="test", status="pending",
+            export_mode="date_chunked",
+            chunk_config={
+                "date_start": "2025-04-01", "date_end": "2025-04-01",
+                "chunk_days": 1, "min_subdivide_unit": "hour",
+            },
+            output_filename=out_dir.name,
+            file_path=str(out_dir),
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = str(job.id)
+        db.close()
+
+        # 用注入的 SQL 字面量区分原始 1 天块 vs sub-day 子块:
+        # - 原始: ts >= '2025-04-01'(无时间字面量)→ 抛
+        # - sub-day: ts >= '2025-04-01 00:00:00'(含 ':')→ 成功
+        def _is_subday(sql: str) -> bool:
+            return "00:00:00" in sql or "23:59:59" in sql or "11:59:59" in sql or "12:00:00" in sql
+
+        def _mk_client(*args, **kw):
+            mc = Mock()
+            mc.get_columns.return_value = _make_columns()
+
+            def _stream(sql, *a, **kwargs):
+                if _is_subday(sql):
+                    yield _make_batch(3, base=0)
+                    return
+                raise ChunkedEncodingError("simulated stream disconnect")
+
+            # count_rows 不抛(否则 _run_single_export 会包装成 RuntimeError 丢失指纹)
+            mc.count_rows.return_value = 3
+            mc.stream_batches.side_effect = _stream
+            mc.stream_batches_chunked.side_effect = _stream
+            return mc
+
+        config = {
+            "query_sql": "SELECT id, name FROM t WHERE ts >= '{{date_start}}' AND ts <= '{{date_end}}'",
+            "connection_env": "test", "connection_type": "clickhouse",
+            "batch_size": 1000, "export_mode": "date_chunked",
+            "chunk_config": {
+                "date_start": "2025-04-01", "date_end": "2025-04-01",
+                "chunk_days": 1, "min_subdivide_unit": "hour",
+            },
+            "output_dir": str(out_dir), "job_name": "kn1job",
+        }
+
+        with patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
+            _run_async(svc.run_export_job(job_id, config))
+
+        db = SessionLocal()
+        try:
+            j = db.query(ExportJob).filter(ExportJob.id == job_id).first()
+            assert j.status == "completed", f"expected completed, got {j.status}, err={j.error_message}"
+            files = j.output_files
+            # 自动细分后:原 1 个块被替换成 2 个 sub-day 子块
+            assert len(files) == 2, f"expected 2 sub-day entries, got {len(files)}: {files}"
+            for f in files:
+                assert f["status"] == "completed"
+                # sub-day entry 的 date_start/date_end 应是 datetime ISO('T' 分隔)
+                assert "T" in f["date_start"], f"expected datetime ISO, got {f['date_start']}"
+                assert "T" in f["date_end"]
+                # 文件应实际写入
+                assert Path(f["file_path"]).exists(), f"file missing: {f['file_path']}"
+        finally:
+            db.close()
+
+    @staticmethod
+    def _patch_sleep_for_kn():
+        """KN/L 段共用:让 in-place retry 的退避秒数瞬时跳过"""
+        return patch("time.sleep", lambda s: None)
+
+    def test_kn2_default_day_unit_fails_fast_on_single_day(self, tmp_path):
+        """K-new2: min_subdivide_unit 默认 'day'(老行为兜底),1 天块失败后
+        fail-fast,不下钻到 sub-day → Job failed,output_files 老 entry 标 failed。"""
+        from backend.config.database import SessionLocal
+        from backend.models.export_job import ExportJob
+        import backend.services.data_export_service as svc
+        from requests.exceptions import ChunkedEncodingError
+
+        db = SessionLocal()
+        out_dir = tmp_path / "kn2_output"
+        job = ExportJob(
+            user_id="uid",
+            username=f"{_PREFIX}kn2",
+            query_sql="SELECT id, name FROM t WHERE ts >= '{{date_start}}' AND ts <= '{{date_end}}'",
+            connection_env="test", status="pending",
+            export_mode="date_chunked",
+            chunk_config={
+                "date_start": "2025-04-01", "date_end": "2025-04-01",
+                "chunk_days": 1,  # 不传 min_subdivide_unit → 默认 day
+            },
+            output_filename=out_dir.name,
+            file_path=str(out_dir),
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = str(job.id)
+        db.close()
+
+        def _mk_client(*args, **kw):
+            mc = Mock()
+            mc.get_columns.return_value = _make_columns()
+            def _stream(sql, **kwargs):
+                # 每次都抛 → 1 天块 + day unit → 不可再分 → 应直接 failed
+                raise ChunkedEncodingError("simulated stream disconnect")
+                yield  # noqa: pragma generator marker
+            mc.stream_batches.side_effect = _stream
+            # Code 160 fallback 路径(stream_batches_chunked)也注入失败,避免误回退
+            mc.count_rows.return_value = 100
+            mc.stream_batches_chunked.side_effect = _stream
+            return mc
+
+        config = {
+            "query_sql": "SELECT id, name FROM t WHERE ts >= '{{date_start}}' AND ts <= '{{date_end}}'",
+            "connection_env": "test", "connection_type": "clickhouse",
+            "batch_size": 1000, "export_mode": "date_chunked",
+            "chunk_config": {
+                "date_start": "2025-04-01", "date_end": "2025-04-01",
+                "chunk_days": 1,
+            },
+            "output_dir": str(out_dir), "job_name": "kn2job",
+        }
+
+        with patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
+            _run_async(svc.run_export_job(job_id, config))
+
+        db = SessionLocal()
+        try:
+            j = db.query(ExportJob).filter(ExportJob.id == job_id).first()
+            assert j.status == "failed", f"expected failed, got {j.status}"
+            files = j.output_files
+            # 仍是 1 个 entry(无 sub-day 分裂),标 failed
+            assert len(files) == 1
+            assert files[0]["status"] == "failed"
+            # date_start/date_end 仍是 date-only(无 'T')
+            assert "T" not in files[0]["date_start"]
+        finally:
+            db.close()
+
+
+# =============================================================================
+# L · Task D — 失败先原位重试 1 次再分裂(瞬时网络抖动友好)
+# =============================================================================
+
+class TestInplaceRetryBeforeSubdivide:
+
+    def test_l1_retry_succeeds_no_subdivide(self, tmp_path):
+        """L1: 第一块 _run_single_export 第一次整体抛 transient → 外层重试 →
+        第二次成功 → 不分裂。验证 Task D 重试机制本身,直接 patch _run_single_export
+        避免被内部 fallback 路径吞掉异常。"""
+        from backend.config.database import SessionLocal
+        from backend.models.export_job import ExportJob
+        import backend.services.data_export_service as svc
+        from requests.exceptions import ChunkedEncodingError
+
+        db = SessionLocal()
+        out_dir = tmp_path / "l1_output"
+        job_id = _make_chunked_job(db, f"{_PREFIX}l1", out_dir)
+        db.close()
+
+        per_chunk_call: Dict[str, int] = {}
+        real_run_single = svc._run_single_export
+
+        def _flaky_run_single(*args, **kwargs):
+            label = kwargs.get("chunk_label", "?")
+            per_chunk_call[label] = per_chunk_call.get(label, 0) + 1
+            # 每个 chunk 的第 1 次调用抛 transient,第 2 次以后正常完成
+            if per_chunk_call[label] == 1:
+                raise ChunkedEncodingError("simulated transient on first attempt")
+            return {
+                "exported_rows": 2, "total_sheets": 1,
+                "done_batches": 1, "total_sql_chunks": None,
+                "file_size": 100, "cancelled": False,
+            }
+
+        # 还需 _build_export_client + get_columns(get_columns 在列预检 + 单 chunk 内部仍调)
+        def _mk_client(*args, **kw):
+            mc = Mock()
+            mc.get_columns.return_value = _make_columns()
+            return mc
+
+        # 让 Path(chunk_path).stat() 不抛 — 但是 _run_single_export 被 patch 后
+        # 不会真写文件;chunk_path 是合法目录下的非存在文件,Path(...).exists() = False
+        # 走 chunk_size_bytes = None 分支即可,无需 patch.
+
+        config = {
+            "query_sql": "SELECT id, name FROM t WHERE d >= '{{date_start}}' AND d <= '{{date_end}}'",
+            "connection_env": "test", "connection_type": "clickhouse",
+            "batch_size": 1000, "export_mode": "date_chunked",
+            "chunk_config": {"date_start": "2025-04-01", "date_end": "2025-04-30", "chunk_days": 10},
+            "output_dir": str(out_dir), "job_name": "l1job",
+        }
+
+        with patch("time.sleep", lambda s: None), \
+             patch("backend.services.data_export_service._run_single_export", side_effect=_flaky_run_single), \
+             patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
+            _run_async(svc.run_export_job(job_id, config))
+
+        db = SessionLocal()
+        try:
+            j = db.query(ExportJob).filter(ExportJob.id == job_id).first()
+            assert j.status == "completed", f"got {j.status}, err={j.error_message}"
+            files = j.output_files
+            # 没有分裂:仍是 3 个原始块(30 天/10 天)
+            assert len(files) == 3, f"expected 3 entries, got {len(files)}"
+            # 每个块都有 _retry_count == 1
+            for f in files:
+                assert f.get("_retry_count", 0) == 1, f"expected _retry_count=1, got {f}"
+                assert f["status"] == "completed"
+        finally:
+            db.close()
+
+    def test_l2_retry_exhausted_falls_back_to_subdivide(self, tmp_path):
+        """L2: 重试也失败 → 进入分裂分支(MAX_INPLACE_RETRY 用尽)"""
+        from backend.config.database import SessionLocal
+        from backend.models.export_job import ExportJob
+        import backend.services.data_export_service as svc
+        from requests.exceptions import ChunkedEncodingError
+
+        db = SessionLocal()
+        out_dir = tmp_path / "l2_output"
+        # 用 chunk_days=2 让单块 2 天可被分裂为 1+1
+        job = ExportJob(
+            user_id="uid", username=f"{_PREFIX}l2",
+            query_sql="SELECT id, name FROM t WHERE d >= '{{date_start}}' AND d <= '{{date_end}}'",
+            connection_env="test", status="pending",
+            export_mode="date_chunked",
+            chunk_config={
+                "date_start": "2025-04-01", "date_end": "2025-04-02",
+                "chunk_days": 2,
+            },
+            output_filename=out_dir.name,
+            file_path=str(out_dir),
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = str(job.id)
+        db.close()
+
+        # 整 2 天块持续抛,1 天子块也持续抛 → 最终 fail
+        def _mk_client(*args, **kw):
+            mc = Mock()
+            mc.get_columns.return_value = _make_columns()
+            def _stream(sql, **kwargs):
+                raise ChunkedEncodingError("persistent")
+                yield
+            mc.stream_batches.side_effect = _stream
+            mc.count_rows.return_value = 1
+            mc.stream_batches_chunked.side_effect = _stream
+            return mc
+
+        config = {
+            "query_sql": "SELECT id, name FROM t WHERE d >= '{{date_start}}' AND d <= '{{date_end}}'",
+            "connection_env": "test", "connection_type": "clickhouse",
+            "batch_size": 1000, "export_mode": "date_chunked",
+            "chunk_config": {
+                "date_start": "2025-04-01", "date_end": "2025-04-02",
+                "chunk_days": 2,
+            },
+            "output_dir": str(out_dir), "job_name": "l2job",
+        }
+
+        with patch("time.sleep", lambda s: None), \
+             patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
+            _run_async(svc.run_export_job(job_id, config))
+
+        db = SessionLocal()
+        try:
+            j = db.query(ExportJob).filter(ExportJob.id == job_id).first()
+            # 最终 fail(子块也失败 + day unit 不下钻 sub-day)
+            assert j.status == "failed", f"got {j.status}"
+            files = j.output_files
+            # 至少发生过一次分裂:files 数 > 1(原 1 块 → 1+1)
+            assert len(files) >= 2, f"expected subdivide to produce ≥2 entries, got {len(files)}: {files}"
+            # 第一个失败 entry 应有 _retry_count == MAX_INPLACE_RETRY(用尽)
+            assert files[0].get("status") == "failed"
+        finally:
+            db.close()
+
+    def test_l3_retry_interrupted_by_cancel(self, tmp_path):
+        """L3: 重试退避期间检测到 cancelling → 立即 cancelled,不再重试"""
+        from backend.config.database import SessionLocal
+        from backend.models.export_job import ExportJob
+        import backend.services.data_export_service as svc
+        from requests.exceptions import ChunkedEncodingError
+
+        db = SessionLocal()
+        out_dir = tmp_path / "l3_output"
+        job_id = _make_chunked_job(db, f"{_PREFIX}l3", out_dir)
+        db.close()
+
+        def _mk_client(*args, **kw):
+            mc = Mock()
+            mc.get_columns.return_value = _make_columns()
+            def _stream(sql, **kwargs):
+                # 第 1 次抛 transient → 触发重试 → 退避期间被取消
+                raise ChunkedEncodingError("transient")
+                yield
+            mc.stream_batches.side_effect = _stream
+            mc.count_rows.return_value = 1
+            mc.stream_batches_chunked.side_effect = _stream
+            return mc
+
+        # 重试退避期间 _is_cancelling 返回 True(模拟用户取消)
+        cancel_called = {"n": 0}
+
+        def _is_cancelling_stub(jid):
+            cancel_called["n"] += 1
+            # 第一次调用(_run_chunked_export_sync 的块前检查)返回 False
+            # 后续(_sleep_with_cancel_check 内每秒检查)返回 True
+            return cancel_called["n"] > 1
+
+        config = {
+            "query_sql": "SELECT id, name FROM t WHERE d >= '{{date_start}}' AND d <= '{{date_end}}'",
+            "connection_env": "test", "connection_type": "clickhouse",
+            "batch_size": 1000, "export_mode": "date_chunked",
+            "chunk_config": {"date_start": "2025-04-01", "date_end": "2025-04-30", "chunk_days": 10},
+            "output_dir": str(out_dir), "job_name": "l3job",
+        }
+
+        # 不 patch time.sleep,让 _sleep_with_cancel_check 真的每秒检查
+        # 但每次 sleep(1) 立即返回(无延迟)
+        with patch("time.sleep", lambda s: None), \
+             patch("backend.services.data_export_service._is_cancelling", side_effect=_is_cancelling_stub), \
+             patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
+            _run_async(svc.run_export_job(job_id, config))
+
+        db = SessionLocal()
+        try:
+            j = db.query(ExportJob).filter(ExportJob.id == job_id).first()
+            assert j.status == "cancelled", f"got {j.status}, err={j.error_message}"
+        finally:
+            db.close()

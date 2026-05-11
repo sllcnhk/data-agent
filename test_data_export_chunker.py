@@ -546,3 +546,250 @@ class TestSubdivideDateRange:
         """E8: 字符串日期参数被拒绝"""
         with pytest.raises(ValueError, match="必须是 date 类型"):
             subdivide_date_range("2026-01-01", date(2026, 1, 5))  # type: ignore
+
+
+# =============================================================================
+# F · subdivide_range（v2.14 通用化对半分裂,支持 date + datetime + min_unit）
+# =============================================================================
+
+from backend.services.data_export_chunker import subdivide_range  # noqa: E402
+
+
+class TestSubdivideRange:
+
+    def test_f1_date_days_gt_1_default_unit_day(self):
+        """F1: 两端 date,days > 1,min_unit=day → 与老 subdivide_date_range 一致"""
+        result = subdivide_range(date(2026, 1, 1), date(2026, 1, 5), min_unit="day")
+        assert result == [
+            (date(2026, 1, 1), date(2026, 1, 2)),
+            (date(2026, 1, 3), date(2026, 1, 5)),
+        ]
+
+    def test_f2_date_day1_min_unit_day_no_split(self):
+        """F2: 1 天块 + min_unit=day → 不可再分(老行为兜底)"""
+        result = subdivide_range(date(2026, 1, 1), date(2026, 1, 1), min_unit="day")
+        assert result == [(date(2026, 1, 1), date(2026, 1, 1))]
+
+    def test_f3_date_day1_min_unit_hour_promotes_to_datetime(self):
+        """F3: 1 天块 + min_unit=hour → 升级为 datetime [00:00:00, 23:59:59] 后对半"""
+        result = subdivide_range(date(2026, 1, 1), date(2026, 1, 1), min_unit="hour")
+        assert len(result) == 2
+        # 第一半起点是 00:00:00,第二半终点是 23:59:59
+        s1, e1 = result[0]
+        s2, e2 = result[1]
+        assert isinstance(s1, datetime) and isinstance(e2, datetime)
+        assert s1 == datetime(2026, 1, 1, 0, 0, 0)
+        assert e2 == datetime(2026, 1, 1, 23, 59, 59)
+        # 中点应该在 12:00 左右(允许 ±2s 偏差因 floor 对秒取整)
+        assert abs((e1 - datetime(2026, 1, 1, 11, 59, 59)).total_seconds()) <= 2
+        # 两半连续,无 gap
+        assert s2 == e1 + (e2 - e2.replace(microsecond=0)) + \
+            (datetime(2026, 1, 1, 0, 0, 1) - datetime(2026, 1, 1, 0, 0, 0))
+
+    def test_f4_datetime_12h_hour_unit_splits(self):
+        """F4: datetime 12h 块 + min_unit=hour → 拆成两半(各 ~6h,远大于 1h floor)"""
+        result = subdivide_range(
+            datetime(2026, 1, 1, 0, 0, 0),
+            datetime(2026, 1, 1, 11, 59, 59),
+            min_unit="hour",
+        )
+        assert len(result) == 2
+
+    def test_f5_datetime_1h_hour_unit_no_split(self):
+        """F5: datetime 1h 块 + min_unit=hour → 不可再分(两半 < 1h floor)"""
+        result = subdivide_range(
+            datetime(2026, 1, 1, 0, 0, 0),
+            datetime(2026, 1, 1, 0, 59, 59),
+            min_unit="hour",
+        )
+        assert len(result) == 1
+        assert result[0] == (
+            datetime(2026, 1, 1, 0, 0, 0),
+            datetime(2026, 1, 1, 0, 59, 59),
+        )
+
+    def test_f6_datetime_1h_minute_unit_splits(self):
+        """F6: datetime 1h 块 + min_unit=minute → 拆成 ~30min+30min"""
+        result = subdivide_range(
+            datetime(2026, 1, 1, 0, 0, 0),
+            datetime(2026, 1, 1, 0, 59, 59),
+            min_unit="minute",
+        )
+        assert len(result) == 2
+
+    def test_f7_recursive_subdivision_floors_at_unit(self):
+        """F7: 反复细分,1 天 + min_unit=hour 最终止于 [1h, 2h) 区间的子块
+        说明:floor=1h 的语义是「拆完两半各 < 1h 时停拆」,所以收敛后子块在 1h~2h"""
+        ranges = [(datetime(2026, 1, 1, 0, 0, 0), datetime(2026, 1, 1, 23, 59, 59))]
+        for _ in range(10):
+            new_ranges = []
+            for s, e in ranges:
+                sub = subdivide_range(s, e, min_unit="hour")
+                new_ranges.extend(sub)
+            if len(new_ranges) == len(ranges):
+                break
+            ranges = new_ranges
+        # 不变量:每个子块 total_seconds < 2 * floor(2*3600=7200s)
+        # 否则它仍可继续拆。允许一点秒余量(原始 23:59:59 → 拆出来时有 +1s 边界)
+        for s, e in ranges:
+            assert (e - s).total_seconds() < 7200 + 60
+
+    def test_f8_legacy_subdivide_date_range_equivalent(self):
+        """F8: 老 subdivide_date_range == subdivide_range(min_unit=day)"""
+        cases = [
+            (date(2026, 1, 1), date(2026, 1, 5)),  # 5 天
+            (date(2026, 1, 1), date(2026, 1, 2)),  # 2 天
+            (date(2026, 1, 1), date(2026, 1, 1)),  # 1 天
+        ]
+        for s, e in cases:
+            assert subdivide_date_range(s, e) == subdivide_range(s, e, min_unit="day")
+
+    def test_f9_invalid_min_unit_raises(self):
+        """F9: min_unit 非法值 → ValueError"""
+        with pytest.raises(ValueError, match="min_unit"):
+            subdivide_range(date(2026, 1, 1), date(2026, 1, 5), min_unit="second")  # type: ignore
+
+    def test_f10_mixed_types_rejected(self):
+        """F10: 一端 date 一端 datetime → ValueError"""
+        with pytest.raises(ValueError, match="类型必须一致"):
+            subdivide_range(date(2026, 1, 1), datetime(2026, 1, 1, 12, 0, 0), min_unit="hour")
+
+
+# =============================================================================
+# B 段补 · inject_date_filter datetime 支持
+# =============================================================================
+
+class TestInjectDateFilterDatetime:
+
+    def test_b13_datetime_placeholder_mode(self):
+        """B13: datetime 输入 placeholder 模式 → 字面量为 'YYYY-MM-DD HH:MM:SS'"""
+        sql = "SELECT * FROM t WHERE ts >= '{{date_start}}' AND ts <= '{{date_end}}'"
+        result, mode = inject_date_filter(
+            sql, None,
+            datetime(2026, 1, 1, 0, 0, 0),
+            datetime(2026, 1, 1, 11, 59, 59),
+        )
+        assert mode == "placeholder"
+        assert "'2026-01-01 00:00:00'" in result
+        assert "'2026-01-01 11:59:59'" in result
+        assert "{{date_start}}" not in result
+
+    def test_b14_datetime_wrapper_mode(self):
+        """B14: datetime 输入 wrapper 模式 → BETWEEN datetime 字面量"""
+        sql = "SELECT * FROM t"
+        result, mode = inject_date_filter(
+            sql, "event_time",
+            datetime(2026, 1, 1, 0, 0, 0),
+            datetime(2026, 1, 1, 11, 59, 59),
+        )
+        assert mode == "wrapper"
+        assert "event_time >= '2026-01-01 00:00:00'" in result
+        assert "event_time <= '2026-01-01 11:59:59'" in result
+
+    def test_b15_mixed_types_rejected(self):
+        """B15: chunk_start=date, chunk_end=datetime → ValueError(类型不一致)"""
+        sql = "SELECT * FROM t WHERE ts BETWEEN '{{date_start}}' AND '{{date_end}}'"
+        with pytest.raises(ValueError, match="类型必须一致"):
+            inject_date_filter(
+                sql, None,
+                date(2026, 1, 1),
+                datetime(2026, 1, 1, 11, 59, 59),
+            )
+
+
+# =============================================================================
+# C 段补 · build_chunk_filename datetime 支持
+# =============================================================================
+
+class TestBuildChunkFilenameDatetime:
+
+    def test_c8_datetime_filename_contains_timestamp(self):
+        """C8: datetime 输入 → 文件名含 YYYYMMDDTHHMMSS"""
+        fn = build_chunk_filename(
+            "job",
+            datetime(2026, 1, 1, 0, 0, 0),
+            datetime(2026, 1, 1, 11, 59, 59),
+        )
+        assert "20260101T000000" in fn
+        assert "20260101T115959" in fn
+        assert fn.endswith(".xlsx")
+
+    def test_c9_datetime_different_timestamps(self):
+        """C9: 不同 datetime 端点 → 文件名两端时间戳不同"""
+        fn = build_chunk_filename(
+            "job",
+            datetime(2026, 1, 1, 0, 0, 0),
+            datetime(2026, 1, 1, 1, 30, 0),
+        )
+        assert "_20260101T000000_to_20260101T013000.xlsx" in fn
+
+
+# =============================================================================
+# D 段补 · validate_chunk_config 新字段(min_subdivide_unit + cursor_column)
+# =============================================================================
+
+class TestValidateChunkConfigNewFields:
+
+    def test_d17_default_min_subdivide_unit(self):
+        """D17: 不传 min_subdivide_unit → 默认 'day'(老行为)"""
+        sql = "SELECT * FROM t WHERE ts BETWEEN '{{date_start}}' AND '{{date_end}}'"
+        cfg = {"date_start": "2026-01-01", "date_end": "2026-01-05", "chunk_days": 1}
+        ncfg = validate_chunk_config(cfg, sql)
+        assert ncfg.min_subdivide_unit == "day"
+
+    def test_d18_invalid_min_subdivide_unit_rejected(self):
+        """D18: min_subdivide_unit 非法值 → ValueError"""
+        sql = "SELECT * FROM t WHERE ts BETWEEN '{{date_start}}' AND '{{date_end}}'"
+        cfg = {
+            "date_start": "2026-01-01", "date_end": "2026-01-05",
+            "chunk_days": 1, "min_subdivide_unit": "second",
+        }
+        with pytest.raises(ValueError, match="min_subdivide_unit"):
+            validate_chunk_config(cfg, sql)
+
+    def test_d19_default_cursor_column_none(self):
+        """D19: 不传 cursor_column → None"""
+        sql = "SELECT * FROM t WHERE ts BETWEEN '{{date_start}}' AND '{{date_end}}'"
+        cfg = {"date_start": "2026-01-01", "date_end": "2026-01-05", "chunk_days": 1}
+        ncfg = validate_chunk_config(cfg, sql)
+        assert ncfg.cursor_column is None
+
+    def test_d20_cursor_column_valid_ident(self):
+        """D20: cursor_column 合法标识符 → 解析为字段值"""
+        sql = "SELECT * FROM t WHERE ts BETWEEN '{{date_start}}' AND '{{date_end}}'"
+        cfg = {
+            "date_start": "2026-01-01", "date_end": "2026-01-05",
+            "chunk_days": 1, "cursor_column": "event_id",
+        }
+        ncfg = validate_chunk_config(cfg, sql)
+        assert ncfg.cursor_column == "event_id"
+
+    def test_d21_cursor_column_invalid_ident_rejected(self):
+        """D21: cursor_column 含非法字符(空格/连字符)→ ValueError"""
+        sql = "SELECT * FROM t WHERE ts BETWEEN '{{date_start}}' AND '{{date_end}}'"
+        cfg = {
+            "date_start": "2026-01-01", "date_end": "2026-01-05",
+            "chunk_days": 1, "cursor_column": "evil col; DROP TABLE",
+        }
+        with pytest.raises(ValueError, match="cursor_column"):
+            validate_chunk_config(cfg, sql)
+
+    def test_d22_cursor_column_empty_string_normalized_to_none(self):
+        """D22: cursor_column 空字符串/纯空白 → 视作未提供(None)"""
+        sql = "SELECT * FROM t WHERE ts BETWEEN '{{date_start}}' AND '{{date_end}}'"
+        cfg = {
+            "date_start": "2026-01-01", "date_end": "2026-01-05",
+            "chunk_days": 1, "cursor_column": "   ",
+        }
+        ncfg = validate_chunk_config(cfg, sql)
+        assert ncfg.cursor_column is None
+
+    def test_d23_min_subdivide_unit_persists(self):
+        """D23: 传 min_subdivide_unit='hour' → 透传到 NormalizedChunkConfig"""
+        sql = "SELECT * FROM t WHERE ts BETWEEN '{{date_start}}' AND '{{date_end}}'"
+        cfg = {
+            "date_start": "2026-01-01", "date_end": "2026-01-05",
+            "chunk_days": 1, "min_subdivide_unit": "hour",
+        }
+        ncfg = validate_chunk_config(cfg, sql)
+        assert ncfg.min_subdivide_unit == "hour"

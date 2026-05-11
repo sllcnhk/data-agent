@@ -69,6 +69,19 @@ export interface ChunkConfig {
   date_end: string;
   /** 单块天数 [1, 90] */
   chunk_days: number;
+  /**
+   * 块失败自动对半再细分的最小粒度。day=不下钻到 sub-day(默认,老行为);
+   * hour/minute=允许在 1 天块失败后继续拆 12h+12h→6h+6h...
+   * 仅当过滤列为 DateTime 类型时启用 hour/minute 才有效。
+   */
+  min_subdivide_unit?: 'day' | 'hour' | 'minute';
+  /**
+   * 游标列名(可选,启用键集分页代替 LIMIT/OFFSET)。
+   * 提供后,流式断开自动回退时用 WHERE cursor > last ORDER BY cursor LIMIT N 推进。
+   * 大数据集大幅提速 + 消除 LIMIT/OFFSET 非确定性。
+   * 要求列单调可排序(主键 / 时间戳);不适用于 GROUP BY/DISTINCT 聚合。
+   */
+  cursor_column?: string | null;
 }
 
 export interface ExportFileEntry {

@@ -202,8 +202,19 @@ def _humanize_error(exc: Exception) -> str:
     用于 ExportJob.error_message — 前端直接展示给最终用户。
 
     保留原始 exception 字符串作为「技术细节」段，便于排查。
+
+    v2.14:沿 __cause__/__context__ 异常链聚合 message,识别包装层底下的
+    原始错误指纹(如 `RuntimeError("分批模式...") from ChunkedEncodingError`)。
     """
-    raw = str(exc)
+    # 沿异常链拼接所有 message,供下方 fingerprint 匹配
+    msgs: List[str] = []
+    cur: Optional[BaseException] = exc
+    seen = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        msgs.append(str(cur))
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+    raw = " | ".join(msgs)
     # 流式断开 — 最常见的瞬时错误
     if any(fp in raw for fp in (
         "Connection broken", "IncompleteRead", "ProtocolError",
@@ -287,6 +298,7 @@ def _run_single_export(
     progress_total: Optional[int] = None,
     chunk_label: Optional[str] = None,
     on_cancel: Optional[Any] = None,
+    cursor_column: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     执行单个 SQL 的 ClickHouse → Excel 流式导出。
@@ -301,7 +313,9 @@ def _run_single_export(
         }
 
     分块模式下使用 progress_offset / progress_total 让进度条以全 Job 维度更新。
-    若发生 ClickHouse Code 160 错误，自动切换到 LIMIT/OFFSET 分批模式重试一次。
+    流式失败自动回退到 fallback 路径:
+      - cursor_column 提供 → keyset 分页(stream_batches_keyset),正确性 + 性能双优;
+      - 否则 → LIMIT/OFFSET (stream_batches_chunked),老行为兜底。
     """
     import openpyxl
     from backend.config.settings import settings as app_settings
@@ -345,33 +359,50 @@ def _run_single_export(
         _update_job(job_id, current_sheet=_format_sheet_label(sheet_num))
 
         if use_chunked:
-            try:
-                total_rows = export_client.count_rows(
-                    sql, timeout=app_settings.export_query_max_execution_time,
+            if cursor_column:
+                # keyset 分页:不需要 count_rows / chunk_size,直接逐窗口推进
+                logger.info(
+                    "[ExportJob %s] Fallback mode: keyset pagination on cursor=%s "
+                    "(replaces LIMIT/OFFSET for correctness + speed)",
+                    job_id, cursor_column,
                 )
-            except Exception as cnt_err:
-                raise RuntimeError(f"分批模式预扫描行数失败: {cnt_err}") from cnt_err
+                batch_source = export_client.stream_batches_keyset(
+                    sql,
+                    cursor_column=cursor_column,
+                    batch_size=batch_size,
+                    extra_settings=export_settings,
+                )
+                # 进度分母对 keyset 不易预先知道,沿用现有进度条逻辑(无 total_sql_chunks)
+                total_sql_chunks = 1
+            else:
+                try:
+                    total_rows = export_client.count_rows(
+                        sql, timeout=app_settings.export_query_max_execution_time,
+                    )
+                except Exception as cnt_err:
+                    raise RuntimeError(f"分批模式预扫描行数失败: {cnt_err}") from cnt_err
 
-            total_sql_chunks = max(1, math.ceil(total_rows / app_settings.export_chunk_size))
-            logger.info(
-                "[ExportJob %s] Chunked mode: total_rows=%d → %d SQL chunks (chunk_size=%d)",
-                job_id, total_rows, total_sql_chunks, app_settings.export_chunk_size,
-            )
-            # 分批模式下保留 progress_total 优先级（分块导出已设置全 Job 进度分母）
-            update_kw: Dict[str, Any] = {}
-            if progress_total is None:
-                update_kw["total_rows"] = total_rows
-                update_kw["total_batches"] = total_sql_chunks
-            if update_kw:
-                _update_job(job_id, **update_kw)
+                total_sql_chunks = max(1, math.ceil(total_rows / app_settings.export_chunk_size))
+                logger.info(
+                    "[ExportJob %s] Fallback mode: LIMIT/OFFSET total_rows=%d → %d "
+                    "SQL chunks (chunk_size=%d). 警告:无 cursor_column,后期窗口可能"
+                    "存在 OFFSET 重扫开销 + ClickHouse 并行扫描下可能非确定性。",
+                    job_id, total_rows, total_sql_chunks, app_settings.export_chunk_size,
+                )
+                update_kw: Dict[str, Any] = {}
+                if progress_total is None:
+                    update_kw["total_rows"] = total_rows
+                    update_kw["total_batches"] = total_sql_chunks
+                if update_kw:
+                    _update_job(job_id, **update_kw)
 
-            batch_source = export_client.stream_batches_chunked(
-                sql,
-                chunk_size=app_settings.export_chunk_size,
-                total_rows=total_rows,
-                batch_size=batch_size,
-                extra_settings=export_settings,
-            )
+                batch_source = export_client.stream_batches_chunked(
+                    sql,
+                    chunk_size=app_settings.export_chunk_size,
+                    total_rows=total_rows,
+                    batch_size=batch_size,
+                    extra_settings=export_settings,
+                )
         else:
             batch_source = export_client.stream_batches(
                 sql, batch_size=batch_size, extra_settings=export_settings,
@@ -687,7 +718,7 @@ def _run_chunked_export_sync(job_id: str, config: Dict[str, Any]) -> None:
         build_chunk_filename,
         inject_date_filter,
         split_date_range,
-        subdivide_date_range,
+        subdivide_range,
         validate_chunk_config,
     )
     from backend.services.export_clients.clickhouse import (
@@ -695,9 +726,32 @@ def _run_chunked_export_sync(job_id: str, config: Dict[str, Any]) -> None:
         is_transient_stream_error,
     )
 
-    # 子块自动分裂的最大递归深度
-    # 5 天 → 2,3 → 1,1,1,2 → 1,1,1,1,1（最多 4 层即可降到 1 天）
-    MAX_SUBDIVISION_DEPTH = 4
+    # 子块自动分裂的最大递归深度。
+    # 日级:5 天 → 2,3 → 1,1,1,2 → 1,1,1,1,1（4 层即可降到 1 天）
+    # 时间级（min_subdivide_unit ∈ {hour, minute}）:1 天 → 12h → 6h → 3h → 1.5h → 45min → 22min(6 层)
+    # 总上限取并集:4(日级) + 6(时间级) = 10,既保留老行为又能覆盖 sub-day 下钻
+    MAX_SUBDIVISION_DEPTH = 10
+    # Task D:每个 chunk 失败后在原位重试一次再考虑分裂(应对瞬时网络抖动,
+    # 避免立刻产生子文件)。可通过 EXPORT_INPLACE_RETRY_MAX 环境变量覆盖。
+    MAX_INPLACE_RETRY = int(os.getenv("EXPORT_INPLACE_RETRY_MAX", "1"))
+    # 重试前的退避(秒):attempt 1 → 5s, attempt 2 → 10s …,上限 30s。
+    INPLACE_RETRY_BACKOFF_BASE = 5
+    INPLACE_RETRY_BACKOFF_MAX = 30
+
+    def _parse_iso_endpoint(s: str):
+        """ISO 字符串 → date 或 datetime。datetime 形如 'YYYY-MM-DDTHH:MM:SS' 含 'T'。"""
+        if "T" in s:
+            return datetime.fromisoformat(s)
+        return _date.fromisoformat(s)
+
+    def _sleep_with_cancel_check(seconds: int) -> bool:
+        """按秒为粒度睡眠;每秒检查一次 cancel。返回 True 表示被取消(应中断)。"""
+        import time
+        for _ in range(seconds):
+            if _is_cancelling(job_id):
+                return True
+            time.sleep(1)
+        return False
 
     sql = config["query_sql"]
     env = config["connection_env"]
@@ -750,6 +804,7 @@ def _run_chunked_export_sync(job_id: str, config: Dict[str, Any]) -> None:
             "sheets": 0,
             "status": "pending",
             "_depth": depth,  # 内部字段，跟踪递归深度（不影响前端展示）
+            "_retry_count": 0,  # Task D:在原位的重试次数(达到上限才考虑分裂)
         }
 
     output_files: List[Dict[str, Any]] = [
@@ -773,9 +828,13 @@ def _run_chunked_export_sync(job_id: str, config: Dict[str, Any]) -> None:
     cur_idx = 0
     while cur_idx < len(output_files):
         entry = output_files[cur_idx]
-        chunk_start = date.fromisoformat(entry["date_start"])
-        chunk_end = date.fromisoformat(entry["date_end"])
-        days_in_chunk = (chunk_end - chunk_start).days + 1
+        chunk_start = _parse_iso_endpoint(entry["date_start"])
+        chunk_end = _parse_iso_endpoint(entry["date_end"])
+        # 用秒级 duration 统一衡量两种端点（date 视作整天 86400s）
+        if isinstance(chunk_start, datetime):
+            duration_seconds = (chunk_end - chunk_start).total_seconds() + 1
+        else:
+            duration_seconds = ((chunk_end - chunk_start).days + 1) * 86400
         cur_depth = entry.get("_depth", 0)
 
         # 启动每块前检查是否已被取消
@@ -821,26 +880,68 @@ def _run_chunked_export_sync(job_id: str, config: Dict[str, Any]) -> None:
                 progress_offset=cumulative_rows,
                 progress_total=len(output_files),
                 chunk_label=chunk_label,
+                cursor_column=ncfg.cursor_column,
             )
         except Exception as exc:
-            # ── 自动日期再细分（v2.13）─────────────────────────────────────
+            # ── 自动日期再细分（v2.13 + v2.14 sub-day + Task D in-place retry）─
             # 触发条件：流式断开 / Code 160 / 且仍有可分裂空间 / 未达递归上限
             is_retryable = (
                 is_transient_stream_error(exc)
                 or is_ch_timeout_estimate_error(exc)
             )
+
+            # ── Task D:先在原位重试 1 次(应对瞬时网络抖动),失败再分裂 ───
+            if is_retryable and entry.get("_retry_count", 0) < MAX_INPLACE_RETRY:
+                entry["_retry_count"] = entry.get("_retry_count", 0) + 1
+                backoff = min(
+                    INPLACE_RETRY_BACKOFF_BASE * entry["_retry_count"],
+                    INPLACE_RETRY_BACKOFF_MAX,
+                )
+                logger.warning(
+                    "[ExportJob %s] Chunk %d (%s~%s) 失败 (%s), %ds 后原位重试 "
+                    "(attempt %d/%d)",
+                    job_id, cur_idx + 1, chunk_start, chunk_end,
+                    type(exc).__name__, backoff,
+                    entry["_retry_count"], MAX_INPLACE_RETRY,
+                )
+                # 删除可能已写入的部分文件
+                try:
+                    os.unlink(chunk_path)
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    pass
+                # 状态回到 pending(展示用),持久化重试计数
+                entry["status"] = "pending"
+                _update_job(job_id, output_files=list(output_files))
+                # 退避期间分段检查取消
+                if _sleep_with_cancel_check(backoff):
+                    _mark_cancelled(
+                        job_id, exported=cumulative_rows,
+                        done_b=completed_count, sheets=cumulative_sheets,
+                    )
+                    _update_job(job_id, output_files=list(output_files))
+                    return
+                # 不前进 cur_idx,下次循环重跑本块
+                continue
+
+            # 调用 chunker 的通用 subdivide_range,若返回单元素列表说明已不可再分
+            sub_ranges = subdivide_range(
+                chunk_start, chunk_end,
+                min_unit=ncfg.min_subdivide_unit,
+            ) if is_retryable else [(chunk_start, chunk_end)]
             can_subdivide = (
                 is_retryable
-                and days_in_chunk > 1
+                and len(sub_ranges) > 1
                 and cur_depth < MAX_SUBDIVISION_DEPTH
             )
 
             if can_subdivide:
                 logger.warning(
-                    "[ExportJob %s] Chunk %s~%s (depth=%d) 失败 (%s) "
+                    "[ExportJob %s] Chunk %s~%s (depth=%d, unit=%s) 失败 (%s) "
                     "— 自动对半分裂为更小子块重试",
                     job_id, chunk_start, chunk_end, cur_depth,
-                    type(exc).__name__,
+                    ncfg.min_subdivide_unit, type(exc).__name__,
                 )
                 # 删除可能已写入的部分文件
                 try:
@@ -850,8 +951,6 @@ def _run_chunked_export_sync(job_id: str, config: Dict[str, Any]) -> None:
                 except Exception:
                     pass
 
-                # 对半分裂日期范围，新建子条目，原位替换
-                sub_ranges = subdivide_date_range(chunk_start, chunk_end)
                 sub_entries = [
                     _make_entry(s, e, depth=cur_depth + 1)
                     for s, e in sub_ranges

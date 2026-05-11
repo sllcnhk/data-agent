@@ -108,10 +108,15 @@ const ChunkFileList: React.FC<{
   const cols = [
     { title: '#', dataIndex: 'index', key: 'index', width: 50 },
     {
-      title: '日期范围',
+      title: '日期/时间范围',
       key: 'range',
-      width: 200,
-      render: (_: any, f: ExportFileEntry) => `${f.date_start} ~ ${f.date_end}`,
+      width: 240,
+      render: (_: any, f: ExportFileEntry) => {
+        // v2.14: sub-day 自动细分时 date_start/date_end 可能是 ISO datetime
+        // ('YYYY-MM-DDTHH:MM:SS')。展示时把 T 替换为空格更易读。
+        const fmt = (s: string) => s.includes('T') ? s.replace('T', ' ') : s;
+        return `${fmt(f.date_start)} ~ ${fmt(f.date_end)}`;
+      },
     },
     { title: '文件名', dataIndex: 'filename', key: 'filename', ellipsis: true },
     {
@@ -320,6 +325,8 @@ const DataExport: React.FC = () => {
           date_start: range[0].format('YYYY-MM-DD'),
           date_end: range[1].format('YYYY-MM-DD'),
           chunk_days: values.chunk_days || 10,
+          min_subdivide_unit: values.min_subdivide_unit || 'day',
+          cursor_column: values.cursor_column?.trim() || null,
         };
       }
       const result = await dataExportApi.executeExport({
@@ -865,6 +872,45 @@ const DataExport: React.FC = () => {
                     }
                   >
                     <Input placeholder="如：event_date" maxLength={64} />
+                  </Form.Item>
+                  <Form.Item
+                    name="min_subdivide_unit"
+                    label="最小再细分粒度（高级）"
+                    extra={
+                      <span>
+                        块失败时自动对半再细分的最小粒度：
+                        <b>天</b>=不下钻到 sub-day（默认，与 v2.13 行为一致）；
+                        <b>小时/分钟</b>=允许在 1 天块失败后继续拆 12h+12h→6h+6h...
+                        <br />
+                        <b>仅当过滤列为 DateTime 时</b>启用小时/分钟才有效；Date 列下
+                        sub-day 字面量会被 ClickHouse 截到 Date 触发无效细分循环。
+                      </span>
+                    }
+                  >
+                    <Select
+                      allowClear
+                      options={[
+                        { value: 'day', label: '天（默认）' },
+                        { value: 'hour', label: '小时' },
+                        { value: 'minute', label: '分钟' },
+                      ]}
+                      placeholder="天（默认）"
+                      style={{ width: '100%' }}
+                    />
+                  </Form.Item>
+                  <Form.Item
+                    name="cursor_column"
+                    label="游标列名（可选，启用键集分页）"
+                    extra={
+                      <span>
+                        提供后，流式断开自动回退时使用 <code>WHERE cursor &gt; last
+                        ORDER BY cursor LIMIT N</code> 推进，代替 LIMIT/OFFSET。
+                        大数据集大幅提速 + 消除窗口非确定性。要求列单调可排序
+                        （主键 / 时间戳）；<b>不适用于 GROUP BY / DISTINCT 等聚合 SQL</b>。
+                      </span>
+                    }
+                  >
+                    <Input placeholder="如：id、event_time" maxLength={64} />
                   </Form.Item>
                 </>
               ) : null

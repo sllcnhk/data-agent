@@ -1,7 +1,7 @@
 # 数据智能体系统 — 核心使用手册
 
-**文档版本**: v2.13
-**适用系统版本**: P0 + P1 + P2 + P3 + 3-Tier Skill System + Semantic Skill Routing + RBAC + 角色管理页面 + 推理过程持久化 + ContinuationCard + ClickHouse 动态多区域配置 + Session 过期管理 + 对话打断（停止生成）+ 对话附件上传 + 用户技能目录隔离修复 + 对话用户隔离 + 侧边栏 Tab UI + 只读模式 + is_shared 群组框架 + 技能路由可视化 + 文件写入下载 + **Excel → ClickHouse 数据导入**（2026-04-05）+ **Skill 用户使用权限隔离 T1–T6**（2026-04-08）+ **多图表 HTML 报告生成**（2026-04-13）+ **数据管理中心 + 定时推送任务**（2026-04-13）+ **AI Pilot 实时助手 + 对话模型切换**（2026-04-14）+ **报表增强：图表控件 / MCP 工具 / 分屏查看 / Pilot 一对一绑定**（2026-04-15）+ **参数化动态报表 + 图表字段自动检测 + echarts_override 系列模板修复**（2026-04-15）+ **动态报表"Failed to fetch"三大根因修复**（2026-04-16）+ **SQL → Excel 按日期分块多文件导出**（2026-05-07，千万行月明细场景）
+**文档版本**: v2.14
+**适用系统版本**: P0 + P1 + P2 + P3 + 3-Tier Skill System + Semantic Skill Routing + RBAC + 角色管理页面 + 推理过程持久化 + ContinuationCard + ClickHouse 动态多区域配置 + Session 过期管理 + 对话打断（停止生成）+ 对话附件上传 + 用户技能目录隔离修复 + 对话用户隔离 + 侧边栏 Tab UI + 只读模式 + is_shared 群组框架 + 技能路由可视化 + 文件写入下载 + **Excel → ClickHouse 数据导入**（2026-04-05）+ **Skill 用户使用权限隔离 T1–T6**（2026-04-08）+ **多图表 HTML 报告生成**（2026-04-13）+ **数据管理中心 + 定时推送任务**（2026-04-13）+ **AI Pilot 实时助手 + 对话模型切换**（2026-04-14）+ **报表增强：图表控件 / MCP 工具 / 分屏查看 / Pilot 一对一绑定**（2026-04-15）+ **参数化动态报表 + 图表字段自动检测 + echarts_override 系列模板修复**（2026-04-15）+ **动态报表"Failed to fetch"三大根因修复**（2026-04-16）+ **SQL → Excel 按日期分块多文件导出**（2026-05-07，千万行月明细场景）+ **数据导出可靠性 v2.14**（2026-05-11，Windows TCP keepalive 修复 + 小时/分钟级再细分 + 键集分页 + 重试一次再分裂）
 **读者对象**: 数据工程师、数据分析师、系统管理员
 
 ---
@@ -2309,31 +2309,45 @@ customer_data/superadmin/exports/events_apr_20260507_120000/
 
 **根因**：ClickHouse 服务端先内部跑数分钟做计算，HTTP 连接此期间没有数据流动，中间链路（云 LB / NAT / 代理）默认 ~5 分钟空闲超时切断连接。
 
-**系统已自动启用以下五层防御（v2.13）**：
+**系统已自动启用以下七层防御（v2.13 五层 + v2.14 两层增强）**：
 
 1. **HTTP 层心跳**（服务端，已默认启用）：
    - `send_progress_in_http_headers=1` — ClickHouse 周期发送 `X-ClickHouse-Progress` HTTP 头
    - `http_headers_progress_interval_ms=10000` — 间隔 10 秒
    - `wait_end_of_query=0` — 立即流式发送，不在服务端缓冲
-   
+
    这些设置作为 per-query 参数附加到导出查询的 HTTP URL，**不修改 ClickHouse 服务器配置**。心跳头让 LB/NAT 认为连接活跃。
 
-2. **TCP 层心跳**（客户端 OS 内核，已默认启用）：
-   - `SO_KEEPALIVE` + `TCP_KEEPIDLE=30` + `TCP_KEEPINTVL=10` + `TCP_KEEPCNT=6`
-   - 即使服务端长时间内部计算无任何 HTTP 输出，OS 内核也会每 10 秒发送 TCP keepalive 包
-   - 防御 HTTP 心跳不够频繁或被中间链路过滤的极端场景
+2. **TCP 层心跳**（客户端 OS 内核，已默认启用，**v2.14 修复 Windows**）：
+   - Linux/macOS：`SO_KEEPALIVE` + `TCP_KEEPIDLE=30` + `TCP_KEEPINTVL=10` + `TCP_KEEPCNT=6`（setsockopt 方式）
+   - **Windows**（v2.14 修复）：`SIO_KEEPALIVE_VALS` ioctl 在连接建立后设置（毫秒级 idle/interval），重试次数由系统固定为 10。**v2.13 在 Windows 上只挂了基础 `SO_KEEPALIVE`，间隔由注册表默认 2 小时控制等同于无效**；v2.14 真正生效。
+   - 即使服务端长时间内部计算无任何 HTTP 输出，OS 内核也会每 10 秒发送 TCP keepalive 包；防御 HTTP 心跳不够频繁或被中间链路过滤的极端场景。
 
 3. **流式断开 LIMIT/OFFSET 回退**：
-   - 触发 `ChunkedEncodingError` / `IncompleteRead` / `Response ended prematurely` 时，自动切到 LIMIT/OFFSET 模式
+   - 触发 `ChunkedEncodingError` / `IncompleteRead` / `Response ended prematurely` 时，自动切到 LIMIT/OFFSET 模式。
+   - **v2.14 沿异常链探测**：包装层（如 `RuntimeError("分批模式预扫描行数失败")`）底下的瞬时错误也能识别，外层 retry 正确触发（修 v2.13 隐式 bug：包装异常吞掉指纹）。
 
-4. **★ 自动按日期对半分裂**（v2.13 v2 新增，最强武器）：
-   - 若 LIMIT/OFFSET 回退也失败（说明服务端跑完 SQL 计算就需 5+ 分钟），系统**自动把失败块的日期范围对半分裂为更小子块重试**
-   - 例：5 天块（01-01~01-05）失败 → 自动分裂为 2 天（01-01~01-02）+ 3 天（01-03~01-05）两个子块
-   - 子块若仍失败，继续递归对半分（最多 4 层，最小到 1 天）
-   - 用户**无需手动修改 chunk_days**，系统自适应；最终输出的文件数可能比原计划多，但每个文件仍按日期范围命名清晰可辨
+4. **★ 失败先原位重试一次再分裂**（v2.14 新增）：
+   - 单块流式断开 / Code 160 失败后，**先在原位重试 1 次**（5s 退避）。瞬时网络抖动场景下避免立即产出额外子文件。
+   - 重试也失败才进入对半分裂分支；重试退避期间支持取消。
+   - 上限通过环境变量 `EXPORT_INPLACE_RETRY_MAX` 控制（默认 1）。
 
-5. **可读错误提示**：
-   - 失败任务点击「查看详情」可见可读错误说明 + 处置建议 + 可复制的完整技术细节
+5. **★ 自动按日期对半分裂 + 小时/分钟级再细分（opt-in）**：
+   - 若重试也失败，系统**自动把失败块的日期范围对半分裂为更小子块**。
+   - 例：5 天块（01-01~01-05）失败 → 自动分裂为 2 天（01-01~01-02）+ 3 天（01-03~01-05）两个子块。
+   - **v2.13 floor 为 1 天**；**v2.14 用户可 opt-in 到小时/分钟级再细分**（见 13.7.8 节）：1 天块若失败可继续拆 12h+12h → 6h+6h... 直到 1 小时或 1 分钟阈值。
+   - 用户**无需手动修改 chunk_days**，系统自适应；最终输出的文件数可能比原计划多，但每个文件仍按日期范围命名清晰可辨。
+
+6. **★ 键集分页替代 LIMIT/OFFSET（v2.14 opt-in，正确性 + 性能双优）**：
+   - 用户提供 `cursor_column`（单调可排序列，通常是主键或时间戳）后，**流式断开回退路径用 keyset 而非 LIMIT/OFFSET**。
+   - 修两件事：
+     - **正确性**：ClickHouse 并行扫描下 `LIMIT N OFFSET M` 在无 ORDER BY 时窗口间可能重叠/漏行（隐藏 bug），keyset `WHERE cursor > last ORDER BY cursor LIMIT N` 保证互斥连续。
+     - **性能**：`LIMIT N OFFSET 1000万` 仍扫 1000 万行后丢弃；keyset 直接 `WHERE cursor > last` 从游标位置起扫，亿级行后期窗口可数量级加速。
+   - 不适用于 `GROUP BY / DISTINCT` 等聚合 SQL（行不在原表中，cursor 推进语义无效）。
+
+7. **可读错误提示**：
+   - 失败任务点击「查看详情」可见可读错误说明 + 处置建议 + 可复制的完整技术细节。
+   - **v2.14 沿异常链聚合 message**：`RuntimeError 包装 ChunkedEncodingError` 等多层异常下仍能识别底层错误类型，给出针对性建议。
 
 **自动子块分裂的用户体验**：
 
@@ -2365,16 +2379,77 @@ customer_data/superadmin/exports/events_apr_20260507_120000/
 CH_EXPORT_HTTP_KEEPALIVE=1                # 1=启用（默认），0=禁用
 CH_EXPORT_PROGRESS_INTERVAL_MS=10000      # 心跳间隔（ms），默认 10 秒
 
-# TCP 层心跳（客户端 OS 内核）
+# TCP 层心跳（客户端 OS 内核；v2.14 Windows 上真正生效）
 CH_EXPORT_TCP_KEEPALIVE=1                 # 1=启用（默认），0=禁用
 CH_EXPORT_TCP_KEEPIDLE=30                 # 空闲多少秒开始 TCP keepalive，默认 30
 CH_EXPORT_TCP_KEEPINTVL=10                # keepalive 包间隔，默认 10
-CH_EXPORT_TCP_KEEPCNT=6                   # 失败次数阈值，默认 6
+CH_EXPORT_TCP_KEEPCNT=6                   # 失败次数阈值，默认 6（Windows 上由系统固定 10，此变量被忽略）
 
 # 查询层
 EXPORT_QUERY_MAX_EXECUTION_TIME=300       # 单查询最大执行秒数，跨境可调高
 EXPORT_CHUNK_SIZE=200000                  # LIMIT/OFFSET 回退每窗口行数
+
+# v2.14 新增
+EXPORT_INPLACE_RETRY_MAX=1                # 单块失败后原位重试次数（默认 1,达上限才进入分裂）
 ```
+
+#### 13.7.8 v2.14 高级配置:小时级再细分 + 键集分页(opt-in)
+
+针对**导出几小时级、千万行级、重型 SQL**（含 `decrypt` / `JSONExtract` / `arrayMap` 等高 CPU 操作）的极端场景，v2.14 提供两个 opt-in 字段进一步提升成功率与速度。
+
+**默认行为零变化** —— 不传新字段时，行为与 v2.13 完全一致。
+
+##### 字段 1:`min_subdivide_unit`（Task A，最小再细分粒度）
+
+| 取值 | 行为 |
+|------|------|
+| `day`（默认） | 与 v2.13 一致:对半分裂最深到 1 天，1 天块失败后整个 Job 失败 |
+| `hour` | 1 天块失败后**继续拆 12h+12h → 6h+6h → 3h+3h → 1.5h+1.5h → ≈45min（hour floor）** |
+| `minute` | 进一步下钻到 1 分钟 floor |
+
+**前置条件**：用户 SQL 的过滤列（占位符或 `date_column`）必须是 **DateTime 类型**。`Date` 列下 sub-day 字面量会被 ClickHouse 自动截断到 Date，子块返回相同行集合 → 重复失败 → 自动停在递归上限（最多 10 层）。
+
+**前端操作**：导出 Modal 切换「按日期分块」→ 高级区下拉框「最小再细分粒度」→ 选择「小时」或「分钟」。
+
+##### 字段 2:`cursor_column`（Task B，键集分页游标列）
+
+提供此字段后，**流式断开自动回退路径用键集分页代替 LIMIT/OFFSET**，同时解决正确性 + 性能两个问题。
+
+| 维度 | LIMIT/OFFSET（无 cursor） | 键集分页（cursor_column） |
+|------|---------------------------|---------------------------|
+| 正确性 | ⚠️ 并行扫描下窗口可能重叠/漏行 | ✓ `WHERE cursor > last` 保证互斥连续 |
+| 后期窗口扫描量 | O(M+N)（OFFSET 越大越慢） | O(N)（与窗口位置无关） |
+| 适用 SQL | 任意 | 不含 `GROUP BY / DISTINCT` 等聚合 |
+
+**选列建议**：
+- 优先选**主键**（确保唯一 + 单调）
+- 时间戳列也可（高并发同微秒插入可能漏极少数行，对导出场景一般可接受）
+- **避免 NULL**：含 NULL 的 cursor 列推进语义不可靠
+
+**死循环保护**：若某窗口最末 cursor 值 == 上一窗口（cursor 列含重复值且 SQL ORDER BY 不稳定），客户端 fast-fail 抛 `RuntimeError("keyset cursor 死循环")`，避免无穷重发同 query。
+
+**前端操作**：导出 Modal 切换「按日期分块」→ 高级区文本框「游标列名」→ 填入主键列名（如 `id` / `order_id` / `event_time`）。
+
+##### 推荐组合(您下次几小时级千万行导出的最佳配置)
+
+```
+单块天数(chunk_days):  1
+最小再细分粒度:           hour
+游标列名:                 <您的主键列,如 order_id>
+```
+
+效果链路:
+1. 块流式断开 → Task D **原位重试 1 次**（吸收瞬时抖动）→ 仍失败
+2. → Task A **sub-day 拆 12h+12h** → 各子块进入 `_run_single_export`
+3. → 子块若也流式断开 → Task B **走 keyset 而非 LIMIT/OFFSET**(快 + 不漏不重)
+4. → 子块若继续失败 → Task A **递归对半到小时级**(最多 10 层)
+5. 任一层成功完成本块就跳到下一块；用户感知:可能产出比 chunk_days=1 计划多一些子文件,但总能跑完。
+
+##### 验证您的 SQL 是否适合 cursor_column
+
+1. **预览查询**:导出 Modal 顶部「查询」按钮跑预览,确认 cursor 列在结果集中(`SELECT * FROM (...)` 包含此列)
+2. **聚合检测**:若 SQL 含 `GROUP BY / DISTINCT / WITH ROLLUP / WITH CUBE`,**不要填 cursor_column**(运行时会因为 cursor 列在 GROUP BY 后含义改变而 fast-fail 报错)
+3. **NULL 检测**:`SELECT count(*) FROM (your_sql) WHERE cursor_col IS NULL` 应该是 0(否则 ORDER BY NULL 排序不稳)
 
 #### 13.7.6 端到端示例（4 月千万行明细 × 10 天分块）
 
