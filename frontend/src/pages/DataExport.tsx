@@ -178,14 +178,29 @@ const ChunkFileList: React.FC<{
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-// 检测 SQL 中是否含日期占位符（与后端 has_placeholders 一致）
+// 检测 SQL 中是否含日期占位符（与后端 data_export_chunker 一致）
 const sqlHasDatePlaceholders = (sql: string): boolean =>
   sql.includes('{{date_start}}') && sql.includes('{{date_end}}');
 
+const sqlHasTsPlaceholders = (sql: string): boolean =>
+  sql.includes('{{ts_start}}') && sql.includes('{{ts_end}}');
+
+const sqlHasAnyDatePlaceholders = (sql: string): boolean =>
+  sqlHasDatePlaceholders(sql) || sqlHasTsPlaceholders(sql);
+
 const sqlHasPartialPlaceholders = (sql: string): boolean => {
-  const hasStart = sql.includes('{{date_start}}');
-  const hasEnd = sql.includes('{{date_end}}');
-  return hasStart !== hasEnd;
+  const hasDateStart = sql.includes('{{date_start}}');
+  const hasDateEnd = sql.includes('{{date_end}}');
+  const hasTsStart = sql.includes('{{ts_start}}');
+  const hasTsEnd = sql.includes('{{ts_end}}');
+  return (hasDateStart !== hasDateEnd) || (hasTsStart !== hasTsEnd);
+};
+
+const placeholderPairText = (sql: string): string => {
+  const pairs: string[] = [];
+  if (sqlHasDatePlaceholders(sql)) pairs.push('{{date_start}} / {{date_end}}');
+  if (sqlHasTsPlaceholders(sql)) pairs.push('{{ts_start}} / {{ts_end}}');
+  return pairs.join('，');
 };
 
 const DataExport: React.FC = () => {
@@ -284,7 +299,7 @@ const DataExport: React.FC = () => {
       return;
     }
     if (sqlHasPartialPlaceholders(sql)) {
-      message.error('SQL 中 {{date_start}} 与 {{date_end}} 必须成对出现');
+      message.error('SQL 中 {{date_start}}/{{date_end}} 或 {{ts_start}}/{{ts_end}} 必须各自成对出现');
       return;
     }
     setPreviewing(true);
@@ -644,17 +659,19 @@ const DataExport: React.FC = () => {
           }}
         />
 
-        {sqlHasDatePlaceholders(sql) && (
+        {sqlHasAnyDatePlaceholders(sql) && (
           <Alert
             type="info"
             showIcon
             style={{ marginBottom: 12 }}
-            message="检测到日期占位符 {{date_start}} / {{date_end}}"
+            message={`检测到日期占位符 ${placeholderPairText(sql)}`}
             description={
               <Space direction="vertical" size={4} style={{ width: '100%' }}>
                 <Text type="secondary" style={{ fontSize: 12 }}>
                   预览时占位符会被替换为下方「样本日期」（留空默认昨日），
-                  让带占位符的 SQL 也能查询预览。导出时按实际日期范围替换为每个块的起止日期。
+                  让带占位符的 SQL 也能查询预览。导出时按实际日期范围替换为每个块的起止日期；
+                  <code>{'{{ts_start}}'}</code> / <code>{'{{ts_end}}'}</code> 会按样本日
+                  00:00:00 到次日 00:00:00 的半开区间替换。
                 </Text>
                 <Space>
                   <Text>预览样本日期：</Text>
@@ -675,7 +692,7 @@ const DataExport: React.FC = () => {
             showIcon
             style={{ marginBottom: 12 }}
             message="占位符须成对"
-            description="SQL 中 {{date_start}} 与 {{date_end}} 必须同时出现，仅写一个会导致预览/导出失败"
+            description="SQL 中 {{date_start}}/{{date_end}} 或 {{ts_start}}/{{ts_end}} 必须各自同时出现，仅写一个会导致预览/导出失败"
           />
         )}
 
@@ -866,7 +883,8 @@ const DataExport: React.FC = () => {
                     extra={
                       <span>
                         若 SQL 中已写 <code>{'{{date_start}}'}</code> /{' '}
-                        <code>{'{{date_end}}'}</code> 占位符，则可省略此项（推荐：性能最佳）。
+                        <code>{'{{date_end}}'}</code> 或 <code>{'{{ts_start}}'}</code> /{' '}
+                        <code>{'{{ts_end}}'}</code> 占位符，则可省略此项（推荐：性能最佳）。
                         否则填写表中的日期列名（仅字母/数字/下划线）。
                       </span>
                     }

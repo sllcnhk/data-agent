@@ -154,7 +154,7 @@ export const dataExportApi = {
   /**
    * 执行 SQL 预览，返回列信息和前 N 行。
    *
-   * 如果 SQL 含 {{date_start}}/{{date_end}} 占位符（用于按日期分块导出），
+   * 如果 SQL 含 {{date_start}}/{{date_end}} 或 {{ts_start}}/{{ts_end}} 占位符，
    * previewDate 指定占位符替换的样本日期（ISO YYYY-MM-DD）；不传默认昨日。
    */
   previewQuery: async (

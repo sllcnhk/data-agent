@@ -387,6 +387,39 @@ class TestPreviewQuery:
                 result = preview_query("SELECT 1", "test")
         assert result["rows"][0][0] == str(big)
 
+    def test_d2b_ts_placeholders_substituted_for_preview(self):
+        """D2b: {{ts_start}}/{{ts_end}} 预览时替换为样本日半开区间"""
+        from backend.services.data_export_service import preview_query
+
+        mock_http = Mock()
+        mock_http.execute.return_value = ([], [("id", "UInt64")])
+        mock_settings = Mock()
+        mock_settings.get_clickhouse_config.return_value = {
+            "host": "h", "http_port": 8123, "user": "u", "password": "p", "database": "db"
+        }
+        sql = (
+            "SELECT id FROM t "
+            "PREWHERE ts >= parseDateTimeBestEffort('{{ts_start}}') "
+            "AND ts < parseDateTimeBestEffort('{{ts_end}}')"
+        )
+        with patch("backend.mcp.clickhouse.http_client.ClickHouseHTTPClient", return_value=mock_http):
+            with patch("backend.config.settings.settings", mock_settings):
+                result = preview_query(sql, "test", preview_date="2025-04-15")
+
+        assert result["preview_date"] == "2025-04-15"
+        executed_sql = mock_http.execute.call_args[0][0]
+        assert "'2025-04-15 00:00:00'" in executed_sql
+        assert "'2025-04-16 00:00:00'" in executed_sql
+        assert "{{ts_start}}" not in executed_sql
+        assert "{{ts_end}}" not in executed_sql
+
+    def test_d2c_partial_ts_placeholder_raises(self):
+        """D2c: 仅写 {{ts_start}} 或 {{ts_end}} 时预览直接拒绝"""
+        from backend.services.data_export_service import preview_query
+
+        with pytest.raises(ValueError, match="成对"):
+            preview_query("SELECT 1 WHERE ts >= '{{ts_start}}'", "test")
+
     def test_d3_sql_error_propagates(self):
         """D3: SQL 错误向上传播"""
         from backend.services.data_export_service import preview_query

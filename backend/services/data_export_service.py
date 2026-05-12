@@ -112,9 +112,11 @@ def preview_query(
     """
     执行 SQL（加 LIMIT），返回列信息和前 N 行数据，用于前端展示预览。
 
-    占位符处理（v2.13）：
+    占位符处理：
       若 SQL 含 {{date_start}} / {{date_end}} 占位符（用于按日期分块导出），
       preview_query 会用 preview_date（或默认昨日）自动替换，让预览能正常执行。
+      若 SQL 含 {{ts_start}} / {{ts_end}} 占位符（v2.14.4 半开 DateTime 区间），
+      则替换为样本日 00:00:00 到次日 00:00:00。
       这样用户在写好分块 SQL 后无需手动修改即可预览验证。
 
     Args:
@@ -131,19 +133,25 @@ def preview_query(
         }
     """
     from backend.services.data_export_chunker import (
-        has_placeholders, has_partial_placeholders,
+        _format_ts_exclusive_end,
+        _format_ts_inclusive_start,
+        has_placeholders,
+        has_partial_placeholders,
+        has_ts_placeholders,
     )
 
-    # 防御：单占位符（仅 {{date_start}} 或仅 {{date_end}}）会让 ClickHouse 误把
+    # 防御：单占位符（仅 start 或仅 end）会让 ClickHouse 误把
     # 字面量当作日期解析，必须拒绝
     if has_partial_placeholders(sql):
         raise ValueError(
-            "SQL 中 {{date_start}} 与 {{date_end}} 必须成对出现；"
+            "SQL 中 {{date_start}}/{{date_end}} 或 {{ts_start}}/{{ts_end}} 必须各自成对出现；"
             "仅写一个会导致预览失败"
         )
 
     actual_preview_date: Optional[str] = None
-    if has_placeholders(sql):
+    has_date_pair = has_placeholders(sql)
+    has_ts_pair = has_ts_placeholders(sql)
+    if has_date_pair or has_ts_pair:
         if preview_date:
             try:
                 d = datetime.strptime(preview_date, "%Y-%m-%d").date()
@@ -155,11 +163,16 @@ def preview_query(
             from datetime import timedelta
             d = (datetime.utcnow().date()) - timedelta(days=1)
         ds = d.isoformat()
-        sql = sql.replace("{{date_start}}", ds).replace("{{date_end}}", ds)
+        if has_date_pair:
+            sql = sql.replace("{{date_start}}", ds).replace("{{date_end}}", ds)
+        if has_ts_pair:
+            ts_start = _format_ts_inclusive_start(d)
+            ts_end = _format_ts_exclusive_end(d)
+            sql = sql.replace("{{ts_start}}", ts_start).replace("{{ts_end}}", ts_end)
         actual_preview_date = ds
         logger.info(
-            "[preview_query] Substituted placeholders with sample date %s "
-            "(provided=%s)", ds, bool(preview_date),
+            "[preview_query] Substituted placeholders(date=%s, ts=%s) with sample date %s "
+            "(provided=%s)", has_date_pair, has_ts_pair, ds, bool(preview_date),
         )
 
     if connection_type == "clickhouse":

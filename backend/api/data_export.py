@@ -61,6 +61,7 @@ class PreviewRequest(BaseModel):
         default=None,
         description=(
             "样本日期（ISO YYYY-MM-DD）；仅当 SQL 含 {{date_start}}/{{date_end}} "
+            "或 {{ts_start}}/{{ts_end}} "
             "占位符时使用，留空默认昨日"
         ),
     )

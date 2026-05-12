@@ -1979,6 +1979,83 @@ class TestPreviewPlaceholderSubstitution:
         })
         assert resp.status_code == 400
 
+    # ─ v2.14.4: ts 占位符的 preview 路径 ─
+
+    def test_l6_ts_placeholders_preview_substitution(self, app_client):
+        """L6(v2.14.4): SQL 含 {{ts_start}}/{{ts_end}} → 预览时替换为
+        datetime 半开区间字面量(start='2025-04-15 00:00:00', end='2025-04-16 00:00:00')"""
+        mock_http = Mock()
+        mock_http.execute.return_value = ([], [("c", "String")])
+
+        mock_settings = Mock()
+        mock_settings.get_clickhouse_config.return_value = {
+            "host": "h", "http_port": 8123, "user": "u", "password": "p", "database": "db",
+        }
+        with patch("backend.mcp.clickhouse.http_client.ClickHouseHTTPClient", return_value=mock_http):
+            with patch("backend.config.settings.settings", mock_settings):
+                resp = app_client.post("/api/v1/data-export/preview", json={
+                    "query_sql": (
+                        "SELECT col FROM t "
+                        "WHERE ts >= parseDateTimeBestEffort('{{ts_start}}') "
+                        "  AND ts <  parseDateTimeBestEffort('{{ts_end}}')"
+                    ),
+                    "connection_env": "test",
+                    "preview_date": "2025-04-15",
+                })
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["data"]["preview_date"] == "2025-04-15"
+
+        executed_sql = mock_http.execute.call_args[0][0]
+        # ts_start = 样本日 00:00:00, ts_end = 次日 00:00:00 (半开区间)
+        assert "'2025-04-15 00:00:00'" in executed_sql
+        assert "'2025-04-16 00:00:00'" in executed_sql
+        # 占位符已全部替换
+        assert "{{ts_start}}" not in executed_sql
+        assert "{{ts_end}}" not in executed_sql
+
+    def test_l7_partial_ts_placeholder_400(self, app_client):
+        """L7(v2.14.4): 单 ts 占位符(仅 ts_start 不含 ts_end)→ 400 拒绝"""
+        resp = app_client.post("/api/v1/data-export/preview", json={
+            "query_sql": "SELECT 1 WHERE ts >= '{{ts_start}}'",
+            "connection_env": "test",
+        })
+        assert resp.status_code == 400
+        assert "成对" in resp.json()["detail"]
+
+    def test_l8_mixed_date_and_ts_placeholders_preview(self, app_client):
+        """L8(v2.14.4): SQL 同时含 date 和 ts 占位符 → 预览同时替换两套"""
+        mock_http = Mock()
+        mock_http.execute.return_value = ([], [("c", "String")])
+
+        mock_settings = Mock()
+        mock_settings.get_clickhouse_config.return_value = {
+            "host": "h", "http_port": 8123, "user": "u", "password": "p", "database": "db",
+        }
+        with patch("backend.mcp.clickhouse.http_client.ClickHouseHTTPClient", return_value=mock_http):
+            with patch("backend.config.settings.settings", mock_settings):
+                resp = app_client.post("/api/v1/data-export/preview", json={
+                    "query_sql": (
+                        "SELECT col FROM t "
+                        "WHERE d BETWEEN '{{date_start}}' AND '{{date_end}}' "
+                        "  OR ts >= '{{ts_start}}' AND ts < '{{ts_end}}'"
+                    ),
+                    "connection_env": "test",
+                    "preview_date": "2025-04-15",
+                })
+        assert resp.status_code == 200, resp.text
+        executed_sql = mock_http.execute.call_args[0][0]
+        # date 闭区间字面量(原样)
+        assert "'2025-04-15'" in executed_sql
+        assert "BETWEEN '2025-04-15' AND '2025-04-15'" in executed_sql
+        # ts 半开区间字面量(datetime)
+        assert "'2025-04-15 00:00:00'" in executed_sql
+        assert "'2025-04-16 00:00:00'" in executed_sql
+        # 全部占位符替换
+        assert "{{date_start}}" not in executed_sql
+        assert "{{date_end}}" not in executed_sql
+        assert "{{ts_start}}" not in executed_sql
+        assert "{{ts_end}}" not in executed_sql
+
 
 def teardown_module(_):
     try:
