@@ -29,8 +29,23 @@ from typing import List, Literal, Optional, Tuple, Union
 
 
 # 占位符（大小写敏感，仅匹配标准形式）
+# 经典 date 占位符:闭区间 [start, end],date 模式输出 'YYYY-MM-DD',sub-day 模式输出
+# 'YYYY-MM-DD HH:MM:SS'。语义与 SQL 写法强耦合（用户须自行 addDays / +1 INTERVAL）。
 _PLACEHOLDER_START = "{{date_start}}"
 _PLACEHOLDER_END = "{{date_end}}"
+
+# v2.14.4 引入:统一 datetime + 半开区间占位符 [ts_start, ts_end)。
+# 无论 day 还是 sub-day 模式,占位符**始终输出 'YYYY-MM-DD HH:MM:SS' 字面量**,
+# 且 ts_end 永远等于「下一窗口起点」(exclusive end):
+#   - day 1 天块:ts_start='YYYY-MM-DD 00:00:00', ts_end='YYYY-MM-(DD+1) 00:00:00'
+#   - sub-day 12h 第一半:ts_start='YYYY-MM-DD 00:00:00', ts_end='YYYY-MM-DD 12:00:00'
+#   - sub-day 12h 第二半:ts_start='YYYY-MM-DD 12:00:00', ts_end='YYYY-MM-(DD+1) 00:00:00'
+# 用户 SQL 用半开区间统一写法:
+#   WHERE col >= parseDateTimeBestEffort('{{ts_start}}')
+#     AND col <  parseDateTimeBestEffort('{{ts_end}}')
+# 优势:day/sub-day 无缝兼容,无重叠无遗漏,DateTime64 亚秒精度安全(用 < 而非 <=)。
+_PLACEHOLDER_TS_START = "{{ts_start}}"
+_PLACEHOLDER_TS_END = "{{ts_end}}"
 
 # 文件名安全字符（保留中文、字母数字、连字符、下划线）
 _FILENAME_UNSAFE_RE = re.compile(r"[^\w\-一-鿿]+", re.UNICODE)
@@ -244,8 +259,18 @@ def split_date_range(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def has_placeholders(sql: str) -> bool:
-    """检测 SQL 中是否含有 {{date_start}} 与 {{date_end}} 双占位符"""
+    """检测 SQL 中是否含有 {{date_start}} 与 {{date_end}} 双占位符(经典 date 占位符)"""
     return _PLACEHOLDER_START in sql and _PLACEHOLDER_END in sql
+
+
+def has_ts_placeholders(sql: str) -> bool:
+    """检测 SQL 中是否含有 {{ts_start}} 与 {{ts_end}} 双占位符(v2.14.4 半开区间)"""
+    return _PLACEHOLDER_TS_START in sql and _PLACEHOLDER_TS_END in sql
+
+
+def has_any_placeholders(sql: str) -> bool:
+    """检测 SQL 中是否含有任意一对占位符(经典 date 或 v2.14.4 ts)"""
+    return has_placeholders(sql) or has_ts_placeholders(sql)
 
 
 def has_partial_placeholders(sql: str) -> bool:
@@ -253,20 +278,54 @@ def has_partial_placeholders(sql: str) -> bool:
     检测 SQL 中是否仅含一个占位符（XOR）。
     单占位符是危险状态：若用户提供 date_column 走 wrapper 路径，未替换的占位符
     字面量会被原样送给 ClickHouse 触发语法错误。校验层须在创建 Job 前拒绝。
+
+    覆盖经典 date 占位符与 v2.14.4 ts 占位符:任一对单出现 → True。
     """
-    has_start = _PLACEHOLDER_START in sql
-    has_end = _PLACEHOLDER_END in sql
-    return has_start != has_end
+    has_date_start = _PLACEHOLDER_START in sql
+    has_date_end = _PLACEHOLDER_END in sql
+    has_ts_start = _PLACEHOLDER_TS_START in sql
+    has_ts_end = _PLACEHOLDER_TS_END in sql
+    return (has_date_start != has_date_end) or (has_ts_start != has_ts_end)
 
 
 def _format_range_literal(v: RangeEndpoint) -> str:
     """把 date 或 datetime 端点序列化为 ClickHouse SQL 字面量值（不含外层引号）。
     date  → 'YYYY-MM-DD'
-    datetime → 'YYYY-MM-DD HH:MM:SS'（截到秒,丢弃微秒,与 ClickHouse DateTime 类型对齐）"""
+    datetime → 'YYYY-MM-DD HH:MM:SS'（截到秒,丢弃微秒,与 ClickHouse DateTime 类型对齐）
+
+    仅用于经典 date 占位符 / wrapper 模式(闭区间语义)。
+    ts 占位符走 _format_ts_inclusive_start / _format_ts_exclusive_end。
+    """
     if isinstance(v, datetime):
         return v.strftime("%Y-%m-%d %H:%M:%S")
     if _is_pure_date(v):
         return v.isoformat()
+    raise ValueError(f"不支持的端点类型: {type(v).__name__}")
+
+
+def _format_ts_inclusive_start(v: RangeEndpoint) -> str:
+    """v2.14.4 半开区间起点字面量:始终 'YYYY-MM-DD HH:MM:SS'。
+    - date 端点 → 'YYYY-MM-DD 00:00:00'(零点)
+    - datetime 端点 → 'YYYY-MM-DD HH:MM:SS'(原样,秒精度)"""
+    if isinstance(v, datetime):
+        return v.strftime("%Y-%m-%d %H:%M:%S")
+    if _is_pure_date(v):
+        return f"{v.isoformat()} 00:00:00"
+    raise ValueError(f"不支持的端点类型: {type(v).__name__}")
+
+
+def _format_ts_exclusive_end(v: RangeEndpoint) -> str:
+    """v2.14.4 半开区间 exclusive 终点字面量:等于「下一窗口起点」。
+    - date 端点(闭区间最后日,如 2026-03-01)→ 加 1 天 → 'YYYY-MM-(DD+1) 00:00:00'
+    - datetime 端点(闭区间最末秒,如 2026-03-01 11:59:59)→ 加 1 秒 → '...12:00:00'
+
+    跨月跨年由 timedelta 自动处理(标准库)。"""
+    if isinstance(v, datetime):
+        ex = v + timedelta(seconds=1)
+        return ex.strftime("%Y-%m-%d %H:%M:%S")
+    if _is_pure_date(v):
+        next_day = v + timedelta(days=1)
+        return f"{next_day.isoformat()} 00:00:00"
     raise ValueError(f"不支持的端点类型: {type(v).__name__}")
 
 
@@ -297,25 +356,38 @@ def inject_date_filter(
     if s_is_dt != e_is_dt:
         raise ValueError("chunk_start 和 chunk_end 类型必须一致（同为 date 或同为 datetime）")
 
-    start_lit = _format_range_literal(chunk_start)
-    end_lit = _format_range_literal(chunk_end)
+    has_ts = has_ts_placeholders(sql)
+    has_date = has_placeholders(sql)
 
-    if has_placeholders(sql):
-        # 占位符模式：直接替换字符串字面量（带单引号）
-        s = sql.replace(_PLACEHOLDER_START, start_lit)
-        s = s.replace(_PLACEHOLDER_END, end_lit)
+    # 占位符模式:同时支持 ts(半开区间,v2.14.4 推荐)和 date(闭区间,经典)。
+    # 两套并存时,各自替换各自的占位符(允许混用,但通常只用一套)。
+    if has_ts or has_date:
+        s = sql
+        if has_ts:
+            ts_start_lit = _format_ts_inclusive_start(chunk_start)
+            ts_end_lit = _format_ts_exclusive_end(chunk_end)
+            s = s.replace(_PLACEHOLDER_TS_START, ts_start_lit)
+            s = s.replace(_PLACEHOLDER_TS_END, ts_end_lit)
+        if has_date:
+            start_lit = _format_range_literal(chunk_start)
+            end_lit = _format_range_literal(chunk_end)
+            s = s.replace(_PLACEHOLDER_START, start_lit)
+            s = s.replace(_PLACEHOLDER_END, end_lit)
         return s, "placeholder"
 
-    # 包装模式
+    # 包装模式(无任何占位符 → 系统外包子查询过滤)
     if not date_column:
         raise ValueError(
-            "SQL 不含 {{date_start}}/{{date_end}} 占位符时，必须提供 date_column"
+            "SQL 不含 {{date_start}}/{{date_end}} 或 {{ts_start}}/{{ts_end}} 占位符时，"
+            "必须提供 date_column"
         )
     if not _IDENT_RE.match(date_column):
         raise ValueError(
             f"date_column 含非法字符（仅允许字母/数字/下划线，须以字母或下划线起首）: {date_column!r}"
         )
 
+    start_lit = _format_range_literal(chunk_start)
+    end_lit = _format_range_literal(chunk_end)
     stripped = sql.rstrip().rstrip(";")
     wrapped = (
         f"SELECT * FROM ({stripped}) AS _chunk_q"
@@ -413,9 +485,10 @@ def validate_chunk_config(raw: dict, sql: str) -> NormalizedChunkConfig:
         raise ValueError("chunk_config 必须是对象")
 
     # 防御：单占位符 SQL — 包装路径会把未替换的占位符送给 ClickHouse 触发语法错
+    # 覆盖经典 date 占位符与 v2.14.4 ts 占位符:任一对仅出现单个 → 拒绝
     if has_partial_placeholders(sql):
         raise ValueError(
-            "SQL 中 {{date_start}} 与 {{date_end}} 必须成对出现；"
+            "SQL 中 {{date_start}}/{{date_end}} 或 {{ts_start}}/{{ts_end}} 必须各自成对出现；"
             "仅写一个会导致包装路径下未替换的占位符被送往 ClickHouse 触发语法错误"
         )
 
@@ -439,10 +512,11 @@ def validate_chunk_config(raw: dict, sql: str) -> NormalizedChunkConfig:
             raise ValueError("date_column 必须是字符串")
         date_column = date_column.strip() or None
 
-    use_placeholder = has_placeholders(sql)
+    # 任意一对占位符存在(date 或 ts)都视作 placeholder 模式
+    use_placeholder = has_any_placeholders(sql)
     if not use_placeholder and not date_column:
         raise ValueError(
-            "SQL 不含 {{date_start}}/{{date_end}} 占位符时必须提供 date_column"
+            "SQL 不含 {{date_start}}/{{date_end}} 或 {{ts_start}}/{{ts_end}} 占位符时必须提供 date_column"
         )
     if date_column is not None and not _IDENT_RE.match(date_column):
         raise ValueError(

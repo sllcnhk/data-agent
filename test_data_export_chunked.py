@@ -845,6 +845,108 @@ class TestSubDaySubdivision:
         """KN/L 段共用:让 in-place retry 的退避秒数瞬时跳过"""
         return patch("time.sleep", lambda s: None)
 
+    def test_kn3_ts_placeholders_subday_handoff_seamless(self, tmp_path):
+        """KN3(v2.14.4): ts 占位符 + sub-day 拆分场景下,验证两个子块替换出的 SQL
+        字面量边界完美衔接(第一半 ts_end == 第二半 ts_start),且日期/时间过滤
+        在 sub-day 模式下真实有效(不会因 toDate 截断导致 sub-day 失效)。"""
+        from backend.config.database import SessionLocal
+        from backend.models.export_job import ExportJob
+        import backend.services.data_export_service as svc
+        from requests.exceptions import ChunkedEncodingError
+
+        db = SessionLocal()
+        out_dir = tmp_path / "kn3_output"
+        # SQL 使用 ts 占位符(半开区间);1 天 + min_unit=hour 触发 sub-day
+        sql_ts = (
+            "SELECT id, name, ts FROM t "
+            "WHERE ts >= parseDateTimeBestEffort('{{ts_start}}') "
+            "  AND ts <  parseDateTimeBestEffort('{{ts_end}}')"
+        )
+        job = ExportJob(
+            user_id="uid",
+            username=f"{_PREFIX}kn3",
+            query_sql=sql_ts,
+            connection_env="test", status="pending",
+            export_mode="date_chunked",
+            chunk_config={
+                "date_start": "2025-04-01", "date_end": "2025-04-01",
+                "chunk_days": 1, "min_subdivide_unit": "hour",
+            },
+            output_filename=out_dir.name,
+            file_path=str(out_dir),
+        )
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        job_id = str(job.id)
+        db.close()
+
+        # 捕获每次 stream_batches 调用的 SQL,用于验证字面量衔接
+        captured_sqls: List[str] = []
+
+        def _mk_client(*args, **kw):
+            mc = Mock()
+            mc.get_columns.return_value = _make_columns()
+
+            def _stream(sql, **kwargs):
+                captured_sqls.append(sql)
+                # 原 1 天 SQL(含 '00:00:00' 与 '02 00:00:00')→ 抛 transient
+                # sub-day SQL(含 '12:00:00' 衔接点)→ 成功
+                if "12:00:00" in sql:
+                    yield _make_batch(3, base=len(captured_sqls) * 10)
+                    return
+                raise ChunkedEncodingError("simulated stream disconnect")
+
+            mc.count_rows.return_value = 3
+            mc.stream_batches.side_effect = _stream
+            mc.stream_batches_chunked.side_effect = _stream
+            return mc
+
+        config = {
+            "query_sql": sql_ts,
+            "connection_env": "test", "connection_type": "clickhouse",
+            "batch_size": 1000, "export_mode": "date_chunked",
+            "chunk_config": {
+                "date_start": "2025-04-01", "date_end": "2025-04-01",
+                "chunk_days": 1, "min_subdivide_unit": "hour",
+            },
+            "output_dir": str(out_dir), "job_name": "kn3job",
+        }
+
+        with patch("time.sleep", lambda s: None), \
+             patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
+            _run_async(svc.run_export_job(job_id, config))
+
+        db = SessionLocal()
+        try:
+            j = db.query(ExportJob).filter(ExportJob.id == job_id).first()
+            assert j.status == "completed", f"got {j.status}, err={j.error_message}"
+            files = j.output_files
+            assert len(files) == 2, f"expected 2 sub-day entries, got {len(files)}"
+            # 两个子块都完成
+            for f in files:
+                assert f["status"] == "completed"
+                assert "T" in f["date_start"]
+        finally:
+            db.close()
+
+        # 关键:验证 SQL 字面量衔接 — 找到含 12:00:00 的 sub-day SQL
+        subday_sqls = [s for s in captured_sqls if "12:00:00" in s]
+        assert len(subday_sqls) >= 2, f"expected ≥2 sub-day SQLs, got {len(subday_sqls)}"
+        # 第一半 ts_end 等于第二半 ts_start = '2025-04-01 12:00:00'
+        # 第一半 SQL 应同时含 '2025-04-01 00:00:00' 和 '2025-04-01 12:00:00'
+        first_half_sql = next(s for s in subday_sqls
+                              if "'2025-04-01 00:00:00'" in s and "'2025-04-01 12:00:00'" in s)
+        # 第二半 SQL 含 '2025-04-01 12:00:00' 与 '2025-04-02 00:00:00'
+        second_half_sql = next(s for s in subday_sqls
+                               if "'2025-04-01 12:00:00'" in s and "'2025-04-02 00:00:00'" in s)
+        # 第一半 ts_end 字面量 ('2025-04-01 12:00:00') == 第二半 ts_start 字面量
+        # 衔接处既无重叠(不同时 <= 12:00:00 和 >= 12:00:00),也无遗漏(都用半开)
+        assert "'2025-04-01 12:00:00'" in first_half_sql
+        assert "'2025-04-01 12:00:00'" in second_half_sql
+        # 没有半开区间末端 +1 秒("12:00:01")这种边界异味
+        assert "12:00:01" not in first_half_sql
+
     def test_kn2_default_day_unit_fails_fast_on_single_day(self, tmp_path):
         """K-new2: min_subdivide_unit 默认 'day'(老行为兜底),1 天块失败后
         fail-fast,不下钻到 sub-day → Job failed,output_files 老 entry 标 failed。"""

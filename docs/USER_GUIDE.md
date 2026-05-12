@@ -1,7 +1,7 @@
 # 数据智能体系统 — 核心使用手册
 
-**文档版本**: v2.14
-**适用系统版本**: P0 + P1 + P2 + P3 + 3-Tier Skill System + Semantic Skill Routing + RBAC + 角色管理页面 + 推理过程持久化 + ContinuationCard + ClickHouse 动态多区域配置 + Session 过期管理 + 对话打断（停止生成）+ 对话附件上传 + 用户技能目录隔离修复 + 对话用户隔离 + 侧边栏 Tab UI + 只读模式 + is_shared 群组框架 + 技能路由可视化 + 文件写入下载 + **Excel → ClickHouse 数据导入**（2026-04-05）+ **Skill 用户使用权限隔离 T1–T6**（2026-04-08）+ **多图表 HTML 报告生成**（2026-04-13）+ **数据管理中心 + 定时推送任务**（2026-04-13）+ **AI Pilot 实时助手 + 对话模型切换**（2026-04-14）+ **报表增强：图表控件 / MCP 工具 / 分屏查看 / Pilot 一对一绑定**（2026-04-15）+ **参数化动态报表 + 图表字段自动检测 + echarts_override 系列模板修复**（2026-04-15）+ **动态报表"Failed to fetch"三大根因修复**（2026-04-16）+ **SQL → Excel 按日期分块多文件导出**（2026-05-07，千万行月明细场景）+ **数据导出可靠性 v2.14**（2026-05-11，Windows TCP keepalive 修复 + 小时/分钟级再细分 + 键集分页 + 重试一次再分裂）
+**文档版本**: v2.14.4
+**适用系统版本**: P0 + P1 + P2 + P3 + 3-Tier Skill System + Semantic Skill Routing + RBAC + 角色管理页面 + 推理过程持久化 + ContinuationCard + ClickHouse 动态多区域配置 + Session 过期管理 + 对话打断（停止生成）+ 对话附件上传 + 用户技能目录隔离修复 + 对话用户隔离 + 侧边栏 Tab UI + 只读模式 + is_shared 群组框架 + 技能路由可视化 + 文件写入下载 + **Excel → ClickHouse 数据导入**（2026-04-05）+ **Skill 用户使用权限隔离 T1–T6**（2026-04-08）+ **多图表 HTML 报告生成**（2026-04-13）+ **数据管理中心 + 定时推送任务**（2026-04-13）+ **AI Pilot 实时助手 + 对话模型切换**（2026-04-14）+ **报表增强：图表控件 / MCP 工具 / 分屏查看 / Pilot 一对一绑定**（2026-04-15）+ **参数化动态报表 + 图表字段自动检测 + echarts_override 系列模板修复**（2026-04-15）+ **动态报表"Failed to fetch"三大根因修复**（2026-04-16）+ **SQL → Excel 按日期分块多文件导出**（2026-05-07，千万行月明细场景）+ **数据导出可靠性 v2.14**（2026-05-11，Windows TCP keepalive 修复 + 小时/分钟级再细分 + 键集分页 + 重试一次再分裂）+ **数据导出 ts 半开区间占位符 v2.14.4**（2026-05-12,sub-day 安全 SQL 写法,day/sub-day 统一兼容）
 **读者对象**: 数据工程师、数据分析师、系统管理员
 
 ---
@@ -2410,6 +2410,39 @@ EXPORT_INPLACE_RETRY_MAX=1                # 单块失败后原位重试次数（
 **前置条件**：用户 SQL 的过滤列（占位符或 `date_column`）必须是 **DateTime 类型**。`Date` 列下 sub-day 字面量会被 ClickHouse 自动截断到 Date，子块返回相同行集合 → 重复失败 → 自动停在递归上限（最多 10 层）。
 
 **前端操作**：导出 Modal 切换「按日期分块」→ 高级区下拉框「最小再细分粒度」→ 选择「小时」或「分钟」。
+
+##### ★ 重要提醒(v2.14.4):占位符语义 + sub-day 兼容性
+
+经典 `{{date_start}}` / `{{date_end}}` 占位符是**闭区间** `[start, end]`,而且 day 模式输出 `'YYYY-MM-DD'`、sub-day 模式输出 `'YYYY-MM-DD HH:MM:SS'` — 这使**同一份 SQL 难以同时兼容 day 与 sub-day**:
+
+- 如果用户 SQL 写 `addDays(toDate('{{date_end}}'), 1)`(day 模式正确):
+  - sub-day 时 `toDate('2026-03-01 11:59:59')` 会截断到 `2026-03-01` → **整天数据被两个 12h 子块各取一遍 → 数据重复 2 倍** ❌
+- 如果写 `addDays(parseDateTimeBestEffort('{{date_end}}'), 1) + INTERVAL 1 SECOND`:
+  - day 模式 end=`'2026-03-01'` → `addDays(... ,1) + 1s = '2026-03-02 00:00:01'` → 多取下一天的 1 秒(与下一天 chunk 重叠)❌
+  - sub-day 时 end=`'2026-03-01 11:59:59'` → `addDays(... ,1) + 1s = '2026-03-02 12:00:00'` → **过滤窗口变成 36 小时,与第二半子块严重重叠**!❌❌
+
+**v2.14.4 推荐方案 — 使用新占位符 `{{ts_start}}` / `{{ts_end}}`(半开区间 + 始终 datetime)**:
+
+无论 day 还是 sub-day,占位符**始终输出 datetime 字面量,且 `{{ts_end}}` 等于「下一窗口起点」(exclusive end)**:
+
+| 占位符 | day(2026-03-01) | sub-day 12h 第一半 | sub-day 12h 第二半 |
+|--------|------------------|---------------------|---------------------|
+| `{{ts_start}}`(inclusive) | `'2026-03-01 00:00:00'` | `'2026-03-01 00:00:00'` | `'2026-03-01 12:00:00'` |
+| `{{ts_end}}`(**exclusive**) | `'2026-03-02 00:00:00'` | `'2026-03-01 12:00:00'` | `'2026-03-02 00:00:00'` |
+
+**用户 SQL 统一写法**(day / sub-day 完美兼容,无重叠无遗漏):
+
+```sql
+prewhere call_start_time >= parseDateTimeBestEffort('{{ts_start}}')
+    and  call_start_time <  parseDateTimeBestEffort('{{ts_end}}')
+```
+
+注意:
+- 用 `<` 而非 `<=`(半开区间);新占位符叫 `ts_end` 表示 exclusive end,语义清晰
+- `parseDateTimeBestEffort` 兼容 `Date` / `DateTime` / `DateTime64` 列(自动类型提升)
+- DateTime64 亚秒精度数据(如 11:59:59.500)在第一半 `< '12:00:00'` 内,**不会丢**
+
+**向后兼容**:经典 `{{date_start}}` / `{{date_end}}` 占位符**保留不变**,现有 SQL 无需改动;两套占位符可在同一 SQL 共存(各自替换各自)。但**强烈建议 sub-day 场景下迁移到 ts 占位符**。
 
 ##### 字段 2:`cursor_column`（Task B，键集分页游标列）
 

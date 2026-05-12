@@ -26,6 +26,7 @@ from backend.services.data_export_chunker import (  # noqa: E402
     MIN_CHUNK_DAYS,
     build_chunk_filename,
     has_placeholders,
+    has_partial_placeholders,
     inject_date_filter,
     split_date_range,
     subdivide_date_range,
@@ -855,3 +856,149 @@ class TestValidateChunkConfigNewFields:
         }
         ncfg = validate_chunk_config(cfg, sql)
         assert ncfg.cursor_column is None
+
+
+# =============================================================================
+# V · v2.14.4 ts 占位符(半开区间,统一 datetime 字面量)
+# =============================================================================
+
+from backend.services.data_export_chunker import (  # noqa: E402
+    has_ts_placeholders,
+    has_any_placeholders,
+    _format_ts_inclusive_start,
+    _format_ts_exclusive_end,
+)
+
+
+class TestTsPlaceholders:
+
+    # --- V1 - V2:helper 单元正确性 ---
+
+    def test_v1_format_ts_start_day_mode(self):
+        """V1a: date 端点 → ts_start='YYYY-MM-DD 00:00:00'"""
+        assert _format_ts_inclusive_start(date(2026, 3, 1)) == "2026-03-01 00:00:00"
+
+    def test_v1_format_ts_start_datetime_mode(self):
+        """V1b: datetime 端点 → ts_start 原样 'YYYY-MM-DD HH:MM:SS'(秒精度)"""
+        assert _format_ts_inclusive_start(datetime(2026, 3, 1, 12, 0, 0)) == "2026-03-01 12:00:00"
+
+    def test_v2_format_ts_end_day_mode_adds_one_day(self):
+        """V2a: date 端点 → ts_end = 下一天 00:00:00(跨日 +1 day)"""
+        assert _format_ts_exclusive_end(date(2026, 3, 1)) == "2026-03-02 00:00:00"
+
+    def test_v2_format_ts_end_datetime_mode_adds_one_second(self):
+        """V2b: datetime 端点 → ts_end = end + 1 second(子块衔接)"""
+        assert _format_ts_exclusive_end(datetime(2026, 3, 1, 11, 59, 59)) == "2026-03-01 12:00:00"
+
+    def test_v2_format_ts_end_crosses_month_boundary(self):
+        """V2c: 跨月 2026-02-28 → ts_end='2026-03-01 00:00:00'"""
+        assert _format_ts_exclusive_end(date(2026, 2, 28)) == "2026-03-01 00:00:00"
+
+    def test_v2_format_ts_end_crosses_year_boundary(self):
+        """V2d: 跨年 2026-12-31 → ts_end='2027-01-01 00:00:00'"""
+        assert _format_ts_exclusive_end(date(2026, 12, 31)) == "2027-01-01 00:00:00"
+
+    # --- V3:sub-day 拆 12h+12h 衔接 ---
+
+    def test_v3_subday_12h_chunks_seamless_handoff(self):
+        """V3: sub-day 拆 12h+12h,第一半 ts_end == 第二半 ts_start(无重叠无遗漏)"""
+        # 模拟 subdivide_range(2026-03-01 00:00:00, 23:59:59) 的两半
+        first_start = datetime(2026, 3, 1, 0, 0, 0)
+        first_end = datetime(2026, 3, 1, 11, 59, 59)
+        second_start = datetime(2026, 3, 1, 12, 0, 0)
+        second_end = datetime(2026, 3, 1, 23, 59, 59)
+
+        first_ts_end = _format_ts_exclusive_end(first_end)
+        second_ts_start = _format_ts_inclusive_start(second_start)
+        assert first_ts_end == second_ts_start == "2026-03-01 12:00:00"
+
+        # 第二半 ts_end 等于下一天 00:00:00 (覆盖到当天最末微秒)
+        assert _format_ts_exclusive_end(second_end) == "2026-03-02 00:00:00"
+
+    # --- V4:inject_date_filter ts 路径 ---
+
+    def test_v4_inject_ts_day_mode_outputs_half_open_datetime(self):
+        """V4a: ts 占位符 + date 端点 → 输出 datetime 半开区间字面量"""
+        sql = "WHERE ts >= '{{ts_start}}' AND ts < '{{ts_end}}'"
+        result, mode = inject_date_filter(sql, None, date(2026, 3, 1), date(2026, 3, 1))
+        assert mode == "placeholder"
+        assert "'2026-03-01 00:00:00'" in result
+        assert "'2026-03-02 00:00:00'" in result
+        assert "{{ts_start}}" not in result
+        assert "{{ts_end}}" not in result
+
+    def test_v4_inject_ts_datetime_mode_outputs_half_open(self):
+        """V4b: ts 占位符 + datetime 端点 → ts_end = end + 1s"""
+        sql = "WHERE ts >= '{{ts_start}}' AND ts < '{{ts_end}}'"
+        result, mode = inject_date_filter(
+            sql, None, datetime(2026, 3, 1, 0, 0, 0), datetime(2026, 3, 1, 11, 59, 59),
+        )
+        assert mode == "placeholder"
+        assert "'2026-03-01 00:00:00'" in result
+        assert "'2026-03-01 12:00:00'" in result
+
+    # --- V5:ts + date 占位符共存 ---
+
+    def test_v5_ts_and_date_placeholders_coexist(self):
+        """V5: SQL 同时含 ts 和 date 占位符 → 都替换(允许混用,但通常只用一种)"""
+        sql = (
+            "WHERE ts >= '{{ts_start}}' AND ts < '{{ts_end}}' "
+            "OR event_date BETWEEN '{{date_start}}' AND '{{date_end}}'"
+        )
+        result, _ = inject_date_filter(sql, None, date(2026, 3, 1), date(2026, 3, 1))
+        # ts 半开
+        assert "'2026-03-01 00:00:00'" in result
+        assert "'2026-03-02 00:00:00'" in result
+        # date 闭(原样)
+        assert "BETWEEN '2026-03-01' AND '2026-03-01'" in result
+
+    # --- V6:单 ts 占位符拒绝 ---
+
+    def test_v6_single_ts_placeholder_rejected(self):
+        """V6a: 仅含 {{ts_start}} 不含 {{ts_end}} → has_partial_placeholders True"""
+        sql_partial = "WHERE ts >= '{{ts_start}}' AND ts < some_other"
+        assert has_partial_placeholders(sql_partial)
+
+    def test_v6_single_ts_validate_rejected(self):
+        """V6b: 单 ts 占位符在 validate_chunk_config 被拒"""
+        cfg = {
+            "date_start": "2026-03-01", "date_end": "2026-03-03",
+            "chunk_days": 1,
+        }
+        sql_partial = "WHERE ts < '{{ts_end}}'"
+        with pytest.raises(ValueError, match="必须各自成对出现"):
+            validate_chunk_config(cfg, sql_partial)
+
+    # --- V7:向后兼容:经典 date 占位符行为不变 ---
+
+    def test_v7_legacy_date_placeholders_unchanged(self):
+        """V7a: 仅含 date 占位符 SQL 行为完全不变(向后兼容)"""
+        sql = "WHERE ts BETWEEN '{{date_start}}' AND '{{date_end}}'"
+        result_v213, _ = inject_date_filter(sql, None, date(2026, 3, 1), date(2026, 3, 1))
+        assert "'2026-03-01'" in result_v213
+        assert "BETWEEN" in result_v213
+        assert "ts_start" not in result_v213
+        # 不会引入半开区间的下一天字面量
+        assert "2026-03-02" not in result_v213
+
+    def test_v7_legacy_validate_unchanged(self):
+        """V7b: 仅含 date 占位符 validate 仍走 placeholder 模式(免 date_column)"""
+        sql = "WHERE ts BETWEEN '{{date_start}}' AND '{{date_end}}'"
+        cfg = {"date_start": "2026-03-01", "date_end": "2026-03-03", "chunk_days": 1}
+        ncfg = validate_chunk_config(cfg, sql)
+        assert ncfg.mode == "placeholder"
+        assert ncfg.date_column is None
+
+    # --- 额外:has_ts_placeholders + has_any_placeholders 工具函数 ---
+
+    def test_v8_has_ts_placeholders_helper(self):
+        """V8: has_ts_placeholders 仅在 ts_start + ts_end 都存在时 True"""
+        assert has_ts_placeholders("WHERE ts >= '{{ts_start}}' AND ts < '{{ts_end}}'")
+        assert not has_ts_placeholders("WHERE ts >= '{{ts_start}}'")
+        assert not has_ts_placeholders("WHERE ts BETWEEN '{{date_start}}' AND '{{date_end}}'")
+
+    def test_v8_has_any_placeholders_helper(self):
+        """V8b: has_any_placeholders 检测任一对占位符"""
+        assert has_any_placeholders("WHERE ts BETWEEN '{{date_start}}' AND '{{date_end}}'")
+        assert has_any_placeholders("WHERE ts >= '{{ts_start}}' AND ts < '{{ts_end}}'")
+        assert not has_any_placeholders("WHERE ts BETWEEN '2026-01-01' AND '2026-01-05'")
