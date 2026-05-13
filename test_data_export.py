@@ -441,6 +441,91 @@ class TestPreviewQuery:
             preview_query("SELECT 1", "test", connection_type="oracle")
 
 
+class TestCsvStagingToXlsx:
+    """CSV staging → XLSX 转换的编码与分列安全性"""
+
+    def test_csv_to_xlsx_preserves_chinese_commas_and_newlines(self, tmp_path):
+        from backend.services.data_export_service import _csv_to_xlsx
+        import openpyxl
+
+        csv_path = tmp_path / "stage.csv"
+        xlsx_path = tmp_path / "out.xlsx"
+        with open(csv_path, "w", encoding="utf-8", newline="") as fp:
+            fp.write(
+                "\ufeff姓名,备注,金额\n"
+                "张三,\"包含,逗号\",123\n"
+                "李四,\"第一行\n第二行\",9007199254740993\n"
+            )
+
+        result = _csv_to_xlsx(
+            str(csv_path),
+            str(xlsx_path),
+            job_id=str(uuid.uuid4()),
+        )
+
+        assert result["exported_rows"] == 2
+        wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        assert rows[0] == ("姓名", "备注", "金额")
+        assert rows[1] == ("张三", "包含,逗号", "123")
+        assert rows[2] == ("李四", "第一行\n第二行", "9007199254740993")
+
+
+    def test_csv_to_xlsx_splits_sheet_at_limit_and_throttles_cancel_checks(self, tmp_path):
+        """CSV staging -> XLSX: reaches row limit then creates a new sheet; cancel check is throttled."""
+        import csv
+        import openpyxl
+        import backend.services.data_export_service as svc
+
+        csv_path = tmp_path / "stage_many.csv"
+        xlsx_path = tmp_path / "out_many.xlsx"
+        with open(csv_path, "w", encoding="utf-8", newline="") as fp:
+            writer = csv.writer(fp)
+            writer.writerow(["id", "name"])
+            for i in range(5):
+                writer.writerow([i, f"name-{i}"])
+
+        cancel_calls = 0
+
+        def fake_is_cancelling(_job_id):
+            nonlocal cancel_calls
+            cancel_calls += 1
+            return False
+
+        with patch("backend.services.data_export_service.MAX_ROWS_PER_SHEET", 2), \
+             patch("backend.services.data_export_service.CSV_XLSX_CANCEL_CHECK_EVERY_ROWS", 2), \
+             patch("backend.services.data_export_service.CSV_XLSX_PROGRESS_EVERY_ROWS", 1), \
+             patch("backend.services.data_export_service._is_cancelling", side_effect=fake_is_cancelling), \
+             patch("backend.services.data_export_service._update_job"):
+            result = svc._csv_to_xlsx(
+                str(csv_path),
+                str(xlsx_path),
+                job_id=str(uuid.uuid4()),
+            )
+
+        assert result["exported_rows"] == 5
+        assert result["total_sheets"] == 3
+        assert cancel_calls == 3
+
+        wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
+        assert wb.sheetnames == ["Sheet1", "Sheet2", "Sheet3"]
+        assert list(wb["Sheet1"].iter_rows(values_only=True)) == [
+            ("id", "name"),
+            ("0", "name-0"),
+            ("1", "name-1"),
+        ]
+        assert list(wb["Sheet2"].iter_rows(values_only=True)) == [
+            ("id", "name"),
+            ("2", "name-2"),
+            ("3", "name-3"),
+        ]
+        assert list(wb["Sheet3"].iter_rows(values_only=True)) == [
+            ("id", "name"),
+            ("4", "name-4"),
+        ]
+
+
 # =============================================================================
 # E · run_export_job 协程
 # =============================================================================

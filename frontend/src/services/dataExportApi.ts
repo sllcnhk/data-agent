@@ -55,10 +55,13 @@ export type ExportJobStatus =
   | 'running'
   | 'completed'
   | 'failed'
+  | 'partial_failed'  // v2.14.7: 分块模式下部分块成功 + 部分块失败
   | 'cancelling'
   | 'cancelled';
 
 export type ExportMode = 'single' | 'date_chunked';
+export type OutputFormat = 'xlsx' | 'csv' | 'csv_zip';
+export type XlsxEngine = 'auto' | 'direct' | 'csv_staging';
 
 export interface ChunkConfig {
   /** 日期列名，包装模式必填；占位符模式可省 */
@@ -82,6 +85,19 @@ export interface ChunkConfig {
    * 要求列单调可排序(主键 / 时间戳);不适用于 GROUP BY/DISTINCT 聚合。
    */
   cursor_column?: string | null;
+  /** 预分裂窗口小时数；启用 hour/minute 再细分时留空默认 6 小时；"auto"=按数据量自动计算 */
+  pre_split_hours?: number | 'auto' | null;
+  /** auto 模式统计时间列（可选）。pre_split_hours="auto" 时使用。留空则使用 date_column */
+  auto_split_column?: string | null;
+  /** auto 模式每窗口目标行数阈值（默认 1,000,000） */
+  auto_split_target_rows?: number | null;
+  /**
+   * 首选分批模式(跳过单流首试) — 跨境/不稳网络下,5 分钟左右 LB 切断单流的现象稳定,
+   * 每块先单流试 5 分钟再 fallback 浪费严重。勾选 → 直接走 keyset(若 cursor_column 提供)
+   * 或 LIMIT/OFFSET。建议同时填 cursor_column。
+   * null=后端用 EXPORT_PREFER_CHUNKED env 默认;true/false=显式覆盖
+   */
+  prefer_chunked?: boolean | null;
 }
 
 export interface ExportFileEntry {
@@ -94,6 +110,8 @@ export interface ExportFileEntry {
   rows: number;
   sheets: number;
   status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
+  /** v2.14.7: 块失败时记录的错误摘要(≤200 字符,用于错误 Modal 展示) */
+  error_summary?: string | null;
 }
 
 export interface ExportJob {
@@ -122,6 +140,8 @@ export interface ExportJob {
   export_mode: ExportMode;
   chunk_config: ChunkConfig | null;
   output_files: ExportFileEntry[] | null;
+  output_format?: OutputFormat;
+  xlsx_engine?: XlsxEngine;
 }
 
 export interface ExportJobListResult {
@@ -137,6 +157,8 @@ export interface ExecuteExportRequest {
   connection_type?: string;
   job_name?: string;
   batch_size?: number;
+  output_format?: OutputFormat;
+  xlsx_engine?: XlsxEngine;
   /** 提供则启用按日期分块导出（多文件） */
   chunk_config?: ChunkConfig;
 }

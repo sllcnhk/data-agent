@@ -19,11 +19,11 @@ import shutil
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
 from backend.api.deps import get_current_user, require_permission
@@ -100,6 +100,54 @@ class ChunkConfigSchema(BaseModel):
             "可带反引号(`Call ID`)系统会自动 strip。"
         ),
     )
+    pre_split_hours: Optional[Union[int, str]] = Field(
+        default=None,
+        description=(
+            '预分裂窗口：整数(1-24 小时)或字符串"auto"(按数据量自动计算窗口)。'
+            "启用 hour/minute 再细分时，留空默认按 6 小时预拆，"
+            '减少先跑大块 5 分钟后断流的浪费；填"auto"时后端按数据行数自动决定窗口。'
+        ),
+    )
+    auto_split_column: Optional[str] = Field(
+        default=None,
+        description=(
+            'auto 模式统计时间列（可选）。pre_split_hours="auto" 时用于统计每时段行数。'
+            "留空则使用 date_column。仅允许字母/数字/下划线。"
+        ),
+    )
+    auto_split_target_rows: Optional[int] = Field(
+        default=None,
+        ge=100_000,
+        le=10_000_000,
+        description=(
+            'auto 模式每窗口目标行数阈值（默认 1,000,000）。pre_split_hours="auto" 时生效。'
+        ),
+    )
+    prefer_chunked: Optional[bool] = Field(
+        default=None,
+        description=(
+            "首选分批模式(跳过单流首试):每块直接走 keyset(若 cursor_column 提供)或 "
+            "LIMIT/OFFSET,不再 5 分钟单流试错。适用于跨境/不稳网络环境下流式总在 5 分钟左右 "
+            "被 LB/NAT 切断的场景。留空 → 用环境变量 EXPORT_PREFER_CHUNKED 的全局默认; "
+            "True/False 显式覆盖。注:当 cursor_column 未提供时,后期 OFFSET 重扫开销大,"
+            "更建议同时填写 cursor_column。"
+        ),
+    )
+
+    @field_validator("pre_split_hours")
+    @classmethod
+    def _validate_pre_split_hours(cls, v):
+        if v is None:
+            return v
+        if isinstance(v, str):
+            if v.strip().lower() != "auto":
+                raise ValueError('pre_split_hours 字符串值仅支持 "auto"')
+            return "auto"
+        if isinstance(v, int):
+            if v < 1 or v > 24:
+                raise ValueError("pre_split_hours 整数值须在 [1, 24] 范围内")
+            return v
+        raise ValueError("pre_split_hours 须为整数(1-24)或字符串 'auto'")
 
 
 class ExecuteExportRequest(BaseModel):
@@ -108,6 +156,17 @@ class ExecuteExportRequest(BaseModel):
     connection_type: str = Field(default="clickhouse", description="连接类型")
     job_name: str = Field(default="", description="任务名称（用于文件名，留空则自动生成）")
     batch_size: int = Field(default=DEFAULT_BATCH_SIZE, ge=1000, le=200_000)
+    output_format: Literal["xlsx", "csv", "csv_zip"] = Field(
+        default="xlsx",
+        description="输出格式：xlsx=Excel；csv=极速 CSV；csv_zip=CSV 压缩包（分块模式下打包全部 CSV）",
+    )
+    xlsx_engine: Literal["auto", "direct", "csv_staging"] = Field(
+        default="auto",
+        description=(
+            "XLSX 写入引擎：auto=系统判断（分块/大数据默认 CSV 临时落盘再转 XLSX）；"
+            "direct=直接写 XLSX；csv_staging=先写 CSV 临时文件再本地转换 XLSX。"
+        ),
+    )
     chunk_config: Optional[ChunkConfigSchema] = Field(
         default=None,
         description="按日期分块配置；提供则启用 date_chunked 模式（多文件输出）",
@@ -200,6 +259,9 @@ async def execute_export(
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
     is_chunked = req.chunk_config is not None
+    output_format = req.output_format
+    xlsx_engine = req.xlsx_engine
+    ext = "zip" if output_format == "csv_zip" else ("csv" if output_format == "csv" else "xlsx")
     if is_chunked:
         # 提早校验 — 失败直接 400
         try:
@@ -218,10 +280,16 @@ async def execute_export(
         sub_dir_name = f"{safe_name}_{timestamp}"
         chunked_output_dir = export_dir / sub_dir_name
         # 目录创建延后到 service 层（service 层 mkdir）
-        output_filename = sub_dir_name              # 目录名（兼容现有 list 显示）
-        output_path_for_job = str(chunked_output_dir)
+        if output_format == "csv_zip":
+            output_filename = f"{sub_dir_name}.zip"
+            output_path_for_job = str(export_dir / output_filename)
+            chunked_work_dir_for_config = str(chunked_output_dir)
+        else:
+            output_filename = sub_dir_name              # 目录名（兼容现有 list 显示）
+            output_path_for_job = str(chunked_output_dir)
+            chunked_work_dir_for_config = output_path_for_job
     else:
-        output_filename = f"{safe_name}_{timestamp}.xlsx"
+        output_filename = f"{safe_name}_{timestamp}.{ext}"
         output_path_for_job = str(export_dir / output_filename)
 
     # 配置快照
@@ -230,6 +298,8 @@ async def execute_export(
         "connection_env": req.connection_env,
         "connection_type": req.connection_type,
         "batch_size": req.batch_size,
+        "output_format": output_format,
+        "xlsx_engine": xlsx_engine,
     }
     if is_chunked:
         config_snapshot["chunk_config"] = req.chunk_config.dict()
@@ -262,9 +332,13 @@ async def execute_export(
             "connection_env": req.connection_env,
             "connection_type": req.connection_type,
             "batch_size": req.batch_size,
+            "output_format": output_format,
+            "xlsx_engine": xlsx_engine,
             "export_mode": "date_chunked",
             "chunk_config": req.chunk_config.dict(),
-            "output_dir": output_path_for_job,
+            "output_dir": chunked_work_dir_for_config,
+            "zip_output_path": output_path_for_job if output_format == "csv_zip" else None,
+            "zip_output_filename": output_filename if output_format == "csv_zip" else None,
             "job_name": safe_name,
         }
     else:
@@ -273,6 +347,8 @@ async def execute_export(
             "connection_env": req.connection_env,
             "connection_type": req.connection_type,
             "batch_size": req.batch_size,
+            "output_format": output_format,
+            "xlsx_engine": xlsx_engine,
             "export_mode": "single",
             "output_path": output_path_for_job,
             "output_filename": output_filename,
@@ -280,6 +356,9 @@ async def execute_export(
     task = asyncio.create_task(run_export_job(job_id, config))
 
     def _on_done(t: asyncio.Task):
+        if t.cancelled():
+            logger.warning("[DataExport] Job %s background task cancelled", job_id)
+            return
         exc = t.exception()
         if exc:
             logger.error("[DataExport] Job %s background task failed: %s", job_id, exc, exc_info=exc)
@@ -380,8 +459,8 @@ async def delete_job(
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"任务不存在: {job_id}")
 
-    # 只允许删除终态任务（完成/取消/失败），活跃任务须先取消
-    _TERMINAL = {"completed", "cancelled", "failed"}
+    # 只允许删除终态任务（完成/部分完成/取消/失败），活跃任务须先取消
+    _TERMINAL = {"completed", "partial_failed", "cancelled", "failed"}
     if job.status not in _TERMINAL:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -401,6 +480,22 @@ async def delete_job(
             pass
         except Exception as e:
             logger.warning("[DataExport] Failed to delete %s: %s", job.file_path, e)
+
+    # csv_zip 分块模式下 job.file_path 是最终 zip，CSV 子文件位于 output_files 中的工作目录；
+    # 这里额外清理子文件及其父目录，避免孤儿临时目录。
+    for entry in (job.output_files or []):
+        fpath = entry.get("file_path") if isinstance(entry, dict) else None
+        if not fpath:
+            continue
+        try:
+            p = Path(fpath)
+            if p.exists():
+                p.unlink()
+            parent = p.parent
+            if parent.exists() and parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
+        except Exception as e:
+            logger.warning("[DataExport] Failed to delete chunk file %s: %s", fpath, e)
 
     db.delete(job)
     db.commit()
@@ -468,10 +563,36 @@ async def download_job(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"任务不存在: {job_id}")
 
     export_mode = getattr(job, "export_mode", None) or "single"
+    cfg = job.config_snapshot or {}
+    output_format = cfg.get("output_format") or ("xlsx")
+
+    def _media_type(fmt: str) -> str:
+        if fmt == "csv":
+            return "text/csv; charset=utf-8"
+        if fmt == "csv_zip":
+            return "application/zip"
+        return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
     # 分块模式：必须有 file_index，且块状态须为 completed
     if export_mode == "date_chunked":
         files = job.output_files or []
+        if file_index is None and output_format == "csv_zip":
+            # v2.14.7:partial_failed 状态下也允许下载 ZIP(内含已成功块,文件名前缀 partial_)
+            if job.status not in ("completed", "partial_failed"):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"任务尚未完成（当前状态: {job.status}），无法下载 ZIP",
+                )
+            if not job.file_path or not Path(job.file_path).exists():
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="CSV ZIP 文件不存在（可能已被清理）",
+                )
+            return FileResponse(
+                path=job.file_path,
+                media_type="application/zip",
+                filename=job.output_filename or Path(job.file_path).name,
+            )
         if file_index is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -495,9 +616,10 @@ async def download_job(
                 detail="分块文件不存在（可能已被清理）",
             )
         filename = entry.get("filename") or Path(fpath).name
+        entry_format = "csv" if str(filename).lower().endswith(".csv") else "xlsx"
         return FileResponse(
             path=fpath,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            media_type=_media_type(entry_format),
             filename=filename,
         )
 
@@ -516,6 +638,6 @@ async def download_job(
     filename = job.output_filename or Path(job.file_path).name
     return FileResponse(
         path=job.file_path,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        media_type=_media_type(output_format),
         filename=filename,
     )

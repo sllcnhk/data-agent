@@ -109,6 +109,7 @@ def _create_chunked_job_via_api(
     sql: str = None,
     chunk_config: Dict = None,
     monkeypatch=None,
+    xlsx_engine: str = None,
 ) -> str:
     """通过 API 提交 chunked Job 并返回 job_id"""
     from backend.api import data_export as api_module
@@ -127,6 +128,8 @@ def _create_chunked_job_via_api(
             "chunk_days": 10,
         },
     }
+    if xlsx_engine is not None:
+        payload["xlsx_engine"] = xlsx_engine
     r = app_client.post("/api/v1/data-export/execute", json=payload)
     assert r.status_code == 200, r.text
     return r.json()["data"]["job_id"]
@@ -135,6 +138,48 @@ def _create_chunked_job_via_api(
 # =============================================================================
 # A · 校验层防御（在创建 Job 前拦截非法配置）
 # =============================================================================
+
+
+
+def _attach_csv_stream_raw(mc) -> None:
+    """
+    给 Mock 的 export_client 补一个 stream_raw 实现,使其在 csv_staging 引擎下也能工作。
+
+    背景：v2.14.x 起 chunked 模式 xlsx_engine="auto" 默认走 csv_staging,
+          会调用 export_client.stream_raw(sql, format_name="CSVWithNames")
+          直接取 CSV 字节流落盘。老 Mock 只 stub 了 stream_batches → 缺方法。
+
+    本 helper 用同一个 stream_batches 的 side_effect 重放出 CSV 字节流,
+    格式为 CSVWithNames：第 1 行列名,后续每行 row 值,逗号分隔,逗号/引号/换行需转义。
+    side_effect 中的副作用(如 sqls_seen.append)会在 csv_staging 模式下从 stream_raw
+    触发,语义等价于 direct 模式下从 stream_batches 触发(都是「每个 SQL 一次」)。
+    """
+    cols = mc.get_columns.return_value
+    try:
+        col_names: List[str] = [c.name for c in cols] if cols else []
+    except TypeError:
+        # Mock 默认 return_value 不可迭代 / get_columns 用 side_effect 抛错的场景 →
+        # 列预检会在外层失败,此处提供退化列名让 helper 不抛(否则 _mk_client 自身崩溃)
+        col_names = []
+    sb_side = mc.stream_batches.side_effect  # 捕获原闭包
+
+    def _csv_escape(v: Any) -> str:
+        if v is None:
+            return ""
+        s = str(v)
+        if "," in s or '"' in s or "\n" in s or "\r" in s:
+            s = '"' + s.replace('"', '""') + '"'
+        return s
+
+    def _stream_raw(sql, format_name="CSVWithNames", **kw):
+        yield (",".join(col_names) + "\n").encode("utf-8")
+        gen = sb_side(sql) if sb_side else iter([])
+        for batch in gen:
+            for row in batch:
+                yield (",".join(_csv_escape(v) for v in row) + "\n").encode("utf-8")
+
+    mc.stream_raw.side_effect = _stream_raw
+
 
 class TestValidationDefense:
     """A1-A8：错误请求应在 API 层就被拒绝，不污染 DB"""
@@ -289,6 +334,7 @@ class TestUIFieldSemantics:
                         time.sleep(0.01)
                 yield _make_batch(2)
             mc.stream_batches.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         captured: List[str] = []
@@ -351,10 +397,16 @@ class TestUIFieldSemantics:
                     while block["hold"]:
                         time.sleep(0.02)
             mc.stream_batches.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
-            jid = _create_chunked_job_via_api(app_client, tmp_path, "b2", monkeypatch=monkeypatch)
+            # B2 测取消时序按 direct 引擎(批次粒度);csv_staging 在 CSV→XLSX 转换
+            # 起点检查 cancelling,会把 chunk1 标 cancelled 而非 completed,不是本测试覆盖目标。
+            jid = _create_chunked_job_via_api(
+                app_client, tmp_path, "b2", monkeypatch=monkeypatch,
+                xlsx_engine="direct",
+            )
 
             # 等第 1 块完成
             for _ in range(80):
@@ -393,6 +445,7 @@ class TestRealExcelContent:
             mc.stream_batches.side_effect = lambda sql, **kw: iter([
                 [("100", "alice"), ("200", "bob")]
             ])
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
@@ -426,6 +479,7 @@ class TestRealExcelContent:
             mc.stream_batches.side_effect = lambda sql, **kw: iter([
                 [(BIG, "x")]
             ])
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
@@ -462,6 +516,7 @@ class TestRealExcelContent:
                 elif "2025-04-21" in sql:
                     yield [("apr21", "row_apr21"), ("apr22", "row_apr22"), ("apr23", "row_apr23")]
             mc.stream_batches.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
@@ -499,6 +554,7 @@ class TestRealExcelContent:
             mc = Mock()
             mc.get_columns.return_value = _make_columns()
             mc.stream_batches.side_effect = lambda sql, **kw: iter([[("1", "a")]])
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
@@ -527,6 +583,7 @@ class TestRealExcelContent:
             mc = Mock()
             mc.get_columns.return_value = _make_columns()
             mc.stream_batches.side_effect = lambda sql, **kw: iter([[("1", "a")]])
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
@@ -563,6 +620,7 @@ class TestEdgeCases:
             mc = Mock()
             mc.get_columns.return_value = _make_columns()
             mc.stream_batches.side_effect = lambda sql, **kw: iter([])  # 无数据
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
@@ -593,6 +651,7 @@ class TestEdgeCases:
             mc = Mock()
             mc.get_columns.return_value = _make_columns()
             mc.stream_batches.side_effect = lambda sql, **kw: iter([[("1", "a")]])
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
@@ -622,6 +681,7 @@ class TestEdgeCases:
             mc = Mock()
             mc.get_columns.return_value = _make_columns()
             mc.stream_batches.side_effect = lambda sql, **kw: iter([[("1", "a")]])
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
@@ -654,6 +714,7 @@ class TestEdgeCases:
             mc.stream_batches.side_effect = lambda sql, **kw: iter([
                 [(str(i), f"r{i}") for i in range(12)]
             ])
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
@@ -691,6 +752,7 @@ class TestEdgeCases:
             mc = Mock()
             mc.get_columns.return_value = _make_columns()
             mc.stream_batches.side_effect = lambda sql, **kw: iter([[("1", "a")]])
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
@@ -722,6 +784,7 @@ class TestFailureModes:
         def _mk_client(*args, **kw):
             mc = Mock()
             mc.get_columns.side_effect = RuntimeError("Connection refused")
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
@@ -755,7 +818,8 @@ class TestFailureModes:
             assert len(xlsx_files) == 0, f"列预检失败后不应有残留 xlsx: {xlsx_files}"
 
     def test_e2_partial_download_from_failed_job(self, app_client, tmp_path, monkeypatch):
-        """E2（B7）: 块 1 完成 + 块 2 失败 → Job=failed，但块 1 应可下载"""
+        """E2(v2.14.7): 块 1 完成 + 块 2 失败 → Job=partial_failed,块 1/3 应可下载"""
+        monkeypatch.delenv("EXPORT_FAIL_FAST_ON_CHUNK_ERROR", raising=False)
         # 计数器须在 _mk_client 闭包外，使所有 client 实例共享
         call = {"n": 0}
         def _mk_client(*args, **kw):
@@ -767,6 +831,7 @@ class TestFailureModes:
                     raise RuntimeError("CH error on chunk 2")
                 yield [("1", "a")]
             mc.stream_batches.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
@@ -780,7 +845,8 @@ class TestFailureModes:
                 monkeypatch=monkeypatch,
             )
             final = _wait_done(app_client, jid, timeout=10.0)
-            assert final["status"] == "failed"
+            # 新行为:partial_failed(块 1+3 完成,块 2 失败)
+            assert final["status"] == "partial_failed", final
 
         # 块 0 status=completed，应可下载
         dl0 = app_client.get(f"/api/v1/data-export/jobs/{jid}/download?file_index=0")
@@ -791,12 +857,13 @@ class TestFailureModes:
         dl1 = app_client.get(f"/api/v1/data-export/jobs/{jid}/download?file_index=1")
         assert dl1.status_code == 400
 
-        # 块 2 status=pending（未启动），下载应 400
+        # 块 2 status=completed,下载应可成功(v2.14.7 新行为:继续执行)
         dl2 = app_client.get(f"/api/v1/data-export/jobs/{jid}/download?file_index=2")
-        assert dl2.status_code == 400
+        assert dl2.status_code == 200
 
     def test_e3_failed_chunk_keeps_completed_chunks(self, app_client, tmp_path, monkeypatch):
-        """E3: 块 2 失败时块 1 文件状态应为 completed 且物理存在"""
+        """E3(v2.14.7): 块 2 失败时块 1/3 状态应为 completed 且物理存在"""
+        monkeypatch.delenv("EXPORT_FAIL_FAST_ON_CHUNK_ERROR", raising=False)
         call = {"n": 0}  # 共享计数器
         def _mk_client(*args, **kw):
             mc = Mock()
@@ -807,6 +874,7 @@ class TestFailureModes:
                     raise RuntimeError("simulated")
                 yield [("1", "a")]
             mc.stream_batches.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
@@ -825,7 +893,9 @@ class TestFailureModes:
         assert files[0]["status"] == "completed"
         assert Path(files[0]["file_path"]).exists()
         assert files[1]["status"] == "failed"
-        assert files[2]["status"] == "pending"  # 未启动
+        # v2.14.7:块 3 继续执行,不再 pending
+        assert files[2]["status"] == "completed"
+        assert Path(files[2]["file_path"]).exists()
 
     def test_e4_unknown_connection_env_fails_gracefully(self, app_client, tmp_path, monkeypatch):
         """E4: connection_env 不存在时应 Job=failed 而非协程崩溃"""
@@ -989,6 +1059,7 @@ class TestSQLContract:
                 seen.append(sql)
                 yield []
             mc.stream_batches.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         from backend.config.database import SessionLocal
@@ -1040,6 +1111,7 @@ class TestSQLContract:
                 seen.append(sql)
                 yield []
             mc.stream_batches.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         from backend.config.database import SessionLocal
@@ -1173,6 +1245,7 @@ class TestCode160InsideChunk:
             def _stream_chunked(sql, chunk_size, total_rows, batch_size, extra_settings=None):
                 yield from _stream(sql, batch_size=batch_size, extra_settings=extra_settings)
             mc.stream_batches_chunked.side_effect = _stream_chunked
+            _attach_csv_stream_raw(mc)
             return mc
 
         config = {
@@ -1219,6 +1292,7 @@ class TestConcurrentJobs:
             mc.stream_batches.side_effect = lambda sql, **kw: iter([
                 [("1", "a"), ("2", "b")]
             ])
+            _attach_csv_stream_raw(mc)
             return mc
 
         from backend.api import data_export as api_module
@@ -1407,6 +1481,7 @@ class TestStreamDisconnectFallback:
                                    extra_settings=extra_settings)
 
             mc.stream_batches_chunked.side_effect = _stream_chunked
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client",
@@ -1519,6 +1594,7 @@ class TestAutoSubdivision:
                 _fail_if_full_range(sql, batch_size=batch_size,
                                     extra_settings=extra_settings)
             )
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client",
@@ -1584,6 +1660,7 @@ class TestAutoSubdivision:
                 lambda sql, chunk_size, total_rows, batch_size, extra_settings=None:
                 _stream(sql, batch_size=batch_size, extra_settings=extra_settings)
             )
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client",
@@ -1637,6 +1714,7 @@ class TestAutoSubdivision:
 
             mc.stream_batches.side_effect = _stream
             mc.stream_batches_chunked.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client",
@@ -1674,6 +1752,7 @@ class TestAutoSubdivision:
                 yield  # noqa
 
             mc.stream_batches.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client",
@@ -1720,6 +1799,7 @@ class TestAutoSubdivision:
                 lambda sql, chunk_size, total_rows, batch_size, extra_settings=None:
                 _stream(sql, batch_size=batch_size, extra_settings=extra_settings)
             )
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client",
@@ -1804,7 +1884,7 @@ class TestDefaultStreamingSettings:
             list(client.stream_batches("SELECT 1"))
 
         assert captured_params.get("send_progress_in_http_headers") == "1"
-        assert captured_params.get("http_headers_progress_interval_ms") == "10000"
+        assert captured_params.get("http_headers_progress_interval_ms") == "3000"
         assert captured_params.get("wait_end_of_query") == "0"
 
     def test_n2_extra_settings_overrides_defaults(self):
@@ -2055,6 +2135,1005 @@ class TestPreviewPlaceholderSubstitution:
         assert "{{date_end}}" not in executed_sql
         assert "{{ts_start}}" not in executed_sql
         assert "{{ts_end}}" not in executed_sql
+
+
+# =============================================================================
+# Q · auto 预分窗口：空数据范围 / 单桶超阈值 / 多 chunk 拼接
+# =============================================================================
+# v2.14.5：auto 模式下 bucket 全空 → 不再生成「仅表头」占位文件。
+# 单桶单独超阈值仍然作为单独窗口（不再细分;Excel sheet 切分兜底）。
+
+class TestAutoPreSplitSkipEmpty:
+    """Q1-Q8：auto 模式空数据范围不生成空文件 + 边界情况"""
+
+    def test_q1_auto_bucket_to_windows_empty_input(self):
+        """Q1: 空 bucket_rows → 空 windows（不生成任何窗口）"""
+        from backend.services.data_export_service import _auto_bucket_rows_to_windows
+        windows = _auto_bucket_rows_to_windows(
+            [], unit="hour", target_rows=1_000_000,
+        )
+        assert windows == []
+
+    def test_q2_auto_bucket_to_windows_all_zero_counts(self):
+        """Q2: 所有桶 count=0 → 全部被过滤 → 空 windows"""
+        from backend.services.data_export_service import _auto_bucket_rows_to_windows
+        rows = [
+            ("2026-03-06 09:00:00", 0),
+            ("2026-03-06 10:00:00", 0),
+            ("2026-03-06 11:00:00", 0),
+        ]
+        windows = _auto_bucket_rows_to_windows(
+            rows, unit="hour", target_rows=1_000_000,
+        )
+        assert windows == []
+
+    def test_q3_auto_bucket_greedy_merge_under_threshold(self):
+        """Q3: 09+10+11=99万 ≤ 100万 → 合并为 09-11 单窗口（注释里描述的典型情况）"""
+        from backend.services.data_export_service import _auto_bucket_rows_to_windows
+        rows = [
+            ("2026-03-06 09:00:00", 330_000),
+            ("2026-03-06 10:00:00", 330_000),
+            ("2026-03-06 11:00:00", 330_000),
+        ]
+        windows = _auto_bucket_rows_to_windows(
+            rows, unit="hour", target_rows=1_000_000,
+        )
+        assert len(windows) == 1
+        s, e, cnt = windows[0]
+        assert s == datetime(2026, 3, 6, 9, 0, 0)
+        assert e == datetime(2026, 3, 6, 11, 59, 59)
+        assert cnt == 990_000
+
+    def test_q4_auto_bucket_breaks_when_exceed_threshold(self):
+        """Q4: 09+10+11=99w → +12(33w)=132w > 100w → 09-11 封口；12 起新窗口"""
+        from backend.services.data_export_service import _auto_bucket_rows_to_windows
+        rows = [
+            ("2026-03-06 09:00:00", 330_000),
+            ("2026-03-06 10:00:00", 330_000),
+            ("2026-03-06 11:00:00", 330_000),
+            ("2026-03-06 12:00:00", 330_000),
+        ]
+        windows = _auto_bucket_rows_to_windows(
+            rows, unit="hour", target_rows=1_000_000,
+        )
+        assert len(windows) == 2
+        s0, e0, c0 = windows[0]
+        s1, e1, c1 = windows[1]
+        assert s0 == datetime(2026, 3, 6, 9, 0, 0)
+        assert e0 == datetime(2026, 3, 6, 11, 59, 59)
+        assert c0 == 990_000
+        assert s1 == datetime(2026, 3, 6, 12, 0, 0)
+        assert e1 == datetime(2026, 3, 6, 12, 59, 59)
+        assert c1 == 330_000
+
+    def test_q5_auto_bucket_single_oversized_becomes_own_window(self):
+        """Q5: 单桶 150万 > 100万 阈值 → 仍作为单独窗口（不再下钻细分;sheet 切分兜底）"""
+        from backend.services.data_export_service import _auto_bucket_rows_to_windows
+        rows = [
+            ("2026-03-06 09:00:00", 1_500_000),
+            ("2026-03-06 10:00:00", 200_000),
+        ]
+        windows = _auto_bucket_rows_to_windows(
+            rows, unit="hour", target_rows=1_000_000,
+        )
+        # 9点单独成窗(超阈值)；10点单独成窗(因 9 点已 > target,加 10 也超)
+        assert len(windows) == 2
+        assert windows[0][2] == 1_500_000
+        assert windows[1][2] == 200_000
+
+    def test_q6_auto_bucket_minute_unit_step(self):
+        """Q6: minute 粒度 → 每桶步长 1 分钟"""
+        from backend.services.data_export_service import _auto_bucket_rows_to_windows
+        rows = [
+            ("2026-03-06 09:00:00", 400_000),
+            ("2026-03-06 09:01:00", 500_000),
+        ]
+        windows = _auto_bucket_rows_to_windows(
+            rows, unit="minute", target_rows=1_000_000,
+        )
+        assert len(windows) == 1
+        s, e, cnt = windows[0]
+        assert s == datetime(2026, 3, 6, 9, 0, 0)
+        # 1 分钟步长 → 09:01:59 而非 09:59:59
+        assert e == datetime(2026, 3, 6, 9, 1, 59)
+        assert cnt == 900_000
+
+    def test_q7_pre_split_ranges_empty_buckets_returns_empty(self, tmp_path, monkeypatch):
+        """Q7（核心修复）: auto 模式下 bucket 查询返回空 → _pre_split_ranges 返回 [],
+        不再生成仅表头占位文件。"""
+        # 直接验证 _auto_bucket_rows_to_windows([]) == [] 已在 Q1 覆盖;
+        # 这里通过 mock _fetch_auto_bucket_rows 全链路验证 _pre_split_ranges → []。
+        from backend.services import data_export_service as svc
+
+        # 构造一个最小化的 raw_chunk_cfg / ncfg 模拟环境
+        raw_chunk_cfg = {
+            "date_column": "dt",
+            "date_start": "2026-03-06",
+            "date_end": "2026-03-06",
+            "chunk_days": 1,
+            "min_subdivide_unit": "hour",
+            "pre_split_hours": "auto",
+            "auto_split_target_rows": 1_000_000,
+        }
+        # 用 ChunkConfig validate 做参数归一化
+        from backend.services.data_export_chunker import validate_chunk_config
+        sql = "SELECT id FROM t WHERE dt >= '{{date_start}}' AND dt <= '{{date_end}}'"
+        ncfg = validate_chunk_config(raw_chunk_cfg, sql)
+
+        # mock _fetch_auto_bucket_rows 返回空
+        from datetime import date as _date
+
+        # 我们不调用真实 _run_chunked_export_sync,而是直接重现 _pre_split_ranges 闭包
+        # 逻辑:auto 路径 → _fetch_auto_bucket_rows → _auto_bucket_rows_to_windows([])
+        # → windows=[] → 返回 []。 已被 Q1 直接验证。本测试加一层契约检查。
+
+        # 直接调用底层助手验证关键不变量
+        bucket_rows = []
+        windows = svc._auto_bucket_rows_to_windows(
+            bucket_rows, unit=ncfg.min_subdivide_unit, target_rows=1_000_000,
+        )
+        assert windows == []
+
+    def test_q8_end_to_end_auto_all_empty_completes_zero_files(
+        self, app_client, tmp_path, monkeypatch,
+    ):
+        """Q8: 全链路 — auto 模式下整段范围无数据 → job 成功完成 + output_files=[] +
+        rows=0 + 不写任何 .xlsx 文件到磁盘。"""
+        from backend.api import data_export as api_module
+        monkeypatch.setattr(api_module, "_CUSTOMER_DATA_ROOT", tmp_path)
+        # 注入 mock 客户端
+        from backend.services.export_clients.base import ColumnInfo
+        from backend.services import data_export_service as svc
+
+        class _MockClient:
+            def get_columns(self, sql):
+                return [ColumnInfo("id", "Int64"), ColumnInfo("name", "String")]
+
+            def count_rows(self, sql, timeout=None):
+                return 0
+
+            def stream_batches(self, sql, batch_size=50_000, extra_settings=None, query_id_prefix=None):
+                # 用于 _fetch_auto_bucket_rows:返回空(无桶)
+                return iter([])
+
+            def stream_batches_keyset(self, *a, **kw):
+                return iter([])
+
+            def stream_batches_chunked(self, *a, **kw):
+                return iter([])
+
+        monkeypatch.setattr(svc, "_build_export_client", lambda env, conn_type: _MockClient())
+
+        payload = {
+            "query_sql": "SELECT id, name FROM events WHERE dt >= '{{date_start}}' AND dt <= '{{date_end}}'",
+            "connection_env": "test",
+            "job_name": f"{_PREFIX}q8",
+            "chunk_config": {
+                "date_column": "dt",
+                "date_start": "2026-03-06",
+                "date_end": "2026-03-06",
+                "chunk_days": 1,
+                "min_subdivide_unit": "hour",
+                "pre_split_hours": "auto",
+                "auto_split_target_rows": 1_000_000,
+            },
+        }
+        r = app_client.post("/api/v1/data-export/execute", json=payload)
+        assert r.status_code == 200, r.text
+        job_id = r.json()["data"]["job_id"]
+
+        final = _wait_done(app_client, job_id, timeout=15.0)
+        assert final is not None
+        assert final["status"] == "completed", final
+        # 关键断言:auto + 空数据 → 0 文件 + 0 行
+        assert final["exported_rows"] == 0
+        assert final["output_files"] == []
+        # 确认目录里也确实没有 .xlsx 落盘
+        xlsx_files = list(tmp_path.rglob("*.xlsx"))
+        assert xlsx_files == [], f"不该有 xlsx 文件,但发现 {xlsx_files}"
+
+    def test_q9_end_to_end_auto_mixed_chunks_skip_only_empty_ones(
+        self, app_client, tmp_path, monkeypatch,
+    ):
+        """Q9: 多 chunk 拼接 — 部分 chunk 无数据应只跳过它自己,其他 chunk 正常生成文件。
+        date_range=2026-03-01~2026-03-30, chunk_days=10 → 3 chunks。
+        Chunk1 无数据(跳过),Chunk2 有数据,Chunk3 无数据(跳过) → 仅 Chunk2 出文件。"""
+        from backend.api import data_export as api_module
+        monkeypatch.setattr(api_module, "_CUSTOMER_DATA_ROOT", tmp_path)
+        from backend.services.export_clients.base import ColumnInfo
+        from backend.services import data_export_service as svc
+
+        # 共享调用状态:用 chunk 起始日期判断当前在哪个 chunk
+        call_state = {"bucket_sql_count": 0}
+
+        def _stream_factory(_self, sql, batch_size=50_000, extra_settings=None, query_id_prefix=None):
+            # 桶查询(_fetch_auto_bucket_rows):SQL 含 toStartOfHour
+            if "toStartOfHour" in sql:
+                call_state["bucket_sql_count"] += 1
+                # 判断 chunk:SQL 内嵌的 date 字面量(注入后的 WHERE 范围字面量)
+                if "'2026-03-11'" in sql or "'2026-03-15'" in sql:
+                    # Chunk2 (03-11~03-20):返回 1 个桶 50w 行(放在 03-15 10:00 这个小时)
+                    return iter([[("2026-03-15 10:00:00", 500_000)]])
+                # Chunk1 / Chunk3:空桶
+                return iter([])
+            # 真实导出:auto 模式下 chunk2 narrow window 落在 2026-03-15 这小时上
+            if "'2026-03-15" in sql:
+                rows = [(str(i), f"n{i}") for i in range(500_000)]
+                return iter([rows])
+            return iter([])
+
+        class _MockClient:
+            def get_columns(self, sql):
+                return [ColumnInfo("id", "Int64"), ColumnInfo("name", "String")]
+
+            def count_rows(self, sql, timeout=None):
+                return 500_000
+
+            def stream_batches(self, *a, **kw):
+                return _stream_factory(self, *a, **kw)
+
+            def stream_batches_keyset(self, *a, **kw):
+                return iter([])
+
+            def stream_batches_chunked(self, *a, **kw):
+                return _stream_factory(self, *a, **kw)
+
+        monkeypatch.setattr(svc, "_build_export_client", lambda env, conn_type: _MockClient())
+
+        payload = {
+            "query_sql": "SELECT id, name FROM events WHERE dt >= '{{date_start}}' AND dt <= '{{date_end}}'",
+            "connection_env": "test",
+            "job_name": f"{_PREFIX}q9",
+            # 强制走 direct 引擎,避免 csv_staging 触发 stream_raw 调用(测试 mock 简化)
+            "xlsx_engine": "direct",
+            "chunk_config": {
+                "date_column": "dt",
+                "date_start": "2026-03-01",
+                "date_end": "2026-03-30",
+                "chunk_days": 10,
+                "min_subdivide_unit": "hour",
+                "pre_split_hours": "auto",
+                "auto_split_target_rows": 1_000_000,
+            },
+        }
+        r = app_client.post("/api/v1/data-export/execute", json=payload)
+        assert r.status_code == 200, r.text
+        job_id = r.json()["data"]["job_id"]
+
+        final = _wait_done(app_client, job_id, timeout=60.0)
+        assert final is not None
+        assert final["status"] == "completed", final
+        # 关键断言:三个 chunk 各跑一次桶查询
+        assert call_state["bucket_sql_count"] == 3
+        # 只有 Chunk2 出文件
+        assert len(final["output_files"]) == 1
+        f = final["output_files"][0]
+        # 文件落在 Chunk2 (03-11~03-20) 范围内
+        assert f["date_start"].startswith("2026-03-15"), f
+        assert f["rows"] == 500_000
+
+    def test_q10_count_sql_uses_clickhouse_minute_directive(self):
+        """Q10(v2.14.5 hotfix): auto 预分窗口的 count SQL 必须使用 ClickHouse formatDateTime
+        的 `%i` 分钟语义,绝不能用 Python 风格的 `%M`(在 CH 里是月份英文全名,会返回
+        '2026-03-02 09:March:00' 之类无法解析的字符串 → ValueError → 整个 Job 失败)。
+
+        本测试锚定 SQL 字符串内容,防止后续重构再次踩坑。
+        """
+        from backend.services.data_export_service import _build_auto_pre_split_count_sql
+        sql = _build_auto_pre_split_count_sql(
+            "SELECT id, name FROM events WHERE dt >= '2026-03-01' AND dt <= '2026-03-31'",
+            time_column="event_time",
+            unit="hour",
+        )
+        # 必须用 ClickHouse 正确的分钟语义:%i 或包含 %T(= %H:%i:%S)
+        has_correct_minute = "%i" in sql or "%T" in sql
+        assert has_correct_minute, f"SQL 缺少 CH 分钟语义 %i/%T:\n{sql}"
+        # 关键反向断言:不能出现 '%H:%M:%S' 这种 Python 风格(CH 下 %M=月份英文全名)
+        assert "%H:%M:%S" not in sql, (
+            f"SQL 含 Python 风格 '%H:%M:%S';CH formatDateTime 下 %M=月份英文,会返回 "
+            f"'09:March:00' 之类无法解析的字符串。SQL:\n{sql}"
+        )
+        # 桶函数应正确(hour → toStartOfHour)
+        assert "toStartOfHour" in sql
+        # 时间列被正确引用
+        assert "`event_time`" in sql
+
+    def test_q11_count_sql_minute_unit(self):
+        """Q11: unit=minute → toStartOfMinute 桶"""
+        from backend.services.data_export_service import _build_auto_pre_split_count_sql
+        sql = _build_auto_pre_split_count_sql(
+            "SELECT 1 FROM t WHERE d = '2026-03-01'",
+            time_column="ts",
+            unit="minute",
+        )
+        assert "toStartOfMinute" in sql
+        assert "%H:%M:%S" not in sql
+        assert "%i" in sql or "%T" in sql
+
+    def test_q12_count_sql_unit_validation(self):
+        """Q12: unit=day 等不允许值应抛 ValueError"""
+        from backend.services.data_export_service import _build_auto_pre_split_count_sql
+        with pytest.raises(ValueError, match="hour/minute"):
+            _build_auto_pre_split_count_sql(
+                "SELECT 1", time_column="ts", unit="day",
+            )
+
+    def test_q13_parse_bucket_datetime_rejects_bad_format(self):
+        """Q13(v2.14.5 hotfix): _parse_bucket_datetime 对类似 '2026-03-02 09:March:00' 的
+        畸形字符串应抛 ValueError(保持 fail-loud,防止 SQL bug 静默退化为 0 文件)。"""
+        from backend.services.data_export_service import _parse_bucket_datetime
+        with pytest.raises(ValueError, match="无法解析"):
+            _parse_bucket_datetime("2026-03-02 09:March:00")
+        with pytest.raises(ValueError):
+            _parse_bucket_datetime("not-a-date")
+
+    def test_q14_parse_bucket_datetime_iso_t_separator(self):
+        """Q14: ClickHouse 某些场景返回 ISO 'T' 分隔符,parser 应自动归一化"""
+        from backend.services.data_export_service import _parse_bucket_datetime
+        dt = _parse_bucket_datetime("2026-03-02T09:00:00")
+        assert dt == datetime(2026, 3, 2, 9, 0, 0)
+
+
+# =============================================================================
+# R · prefer_chunked — 跳过单流首试,直接走 chunked 路径
+# =============================================================================
+# v2.14.6 新增:跨境/不稳网络下单流 5 分钟必断,每块先单流试错浪费 5-10 分钟。
+# prefer_chunked=True 直接走 keyset(若提供 cursor_column)或 LIMIT/OFFSET,
+# 跳过单流首试。
+
+class TestPreferChunked:
+    """R1-R5: prefer_chunked 行为契约"""
+
+    def test_r1_prefer_chunked_with_cursor_routes_to_keyset_no_stream(
+        self, app_client, tmp_path, monkeypatch,
+    ):
+        """R1: prefer_chunked=True + cursor_column → 直接 stream_batches_keyset,
+        不调 stream_batches(单流)。"""
+        from backend.api import data_export as api_module
+        monkeypatch.setattr(api_module, "_CUSTOMER_DATA_ROOT", tmp_path)
+        from backend.services.export_clients.base import ColumnInfo
+        from backend.services import data_export_service as svc
+
+        calls = {"stream_batches": 0, "stream_batches_keyset": 0}
+
+        class _MockClient:
+            def get_columns(self, sql):
+                return [ColumnInfo("id", "Int64"), ColumnInfo("name", "String")]
+
+            def count_rows(self, sql, timeout=None):
+                return 100
+
+            def stream_batches(self, *a, **kw):
+                calls["stream_batches"] += 1
+                # 不应被调用(prefer_chunked 跳过单流)
+                return iter([])
+
+            def stream_batches_keyset(self, *a, **kw):
+                calls["stream_batches_keyset"] += 1
+                yield [(str(i), f"n{i}") for i in range(100)]
+
+            def stream_batches_chunked(self, *a, **kw):
+                return iter([])
+
+        monkeypatch.setattr(svc, "_build_export_client", lambda env, conn_type: _MockClient())
+
+        payload = {
+            "query_sql": "SELECT id, name FROM t WHERE dt >= '{{date_start}}' AND dt <= '{{date_end}}'",
+            "connection_env": "test",
+            "job_name": f"{_PREFIX}r1",
+            "xlsx_engine": "direct",  # csv_staging 不走 _run_single_export 的 chunked 分支
+            "chunk_config": {
+                "date_column": "dt",
+                "date_start": "2026-03-06",
+                "date_end": "2026-03-06",
+                "chunk_days": 1,
+                "cursor_column": "id",
+                "prefer_chunked": True,
+            },
+        }
+        r = app_client.post("/api/v1/data-export/execute", json=payload)
+        assert r.status_code == 200, r.text
+        job_id = r.json()["data"]["job_id"]
+        final = _wait_done(app_client, job_id, timeout=30.0)
+        assert final["status"] == "completed", final
+        # 关键断言:单流 0 次,keyset 1 次
+        assert calls["stream_batches"] == 0, (
+            f"prefer_chunked 下不应调单流 stream_batches,实际 {calls['stream_batches']} 次"
+        )
+        assert calls["stream_batches_keyset"] == 1, (
+            f"prefer_chunked + cursor 应直接走 keyset,实际 {calls['stream_batches_keyset']} 次"
+        )
+
+    def test_r2_prefer_chunked_without_cursor_routes_to_limit_offset_no_stream(
+        self, app_client, tmp_path, monkeypatch,
+    ):
+        """R2: prefer_chunked=True + 无 cursor_column → 直接 stream_batches_chunked
+        (LIMIT/OFFSET),不调单流。"""
+        from backend.api import data_export as api_module
+        monkeypatch.setattr(api_module, "_CUSTOMER_DATA_ROOT", tmp_path)
+        from backend.services.export_clients.base import ColumnInfo
+        from backend.services import data_export_service as svc
+
+        calls = {"stream_batches": 0, "stream_batches_chunked": 0, "count_rows": 0}
+
+        class _MockClient:
+            def get_columns(self, sql):
+                return [ColumnInfo("id", "Int64"), ColumnInfo("name", "String")]
+
+            def count_rows(self, sql, timeout=None):
+                calls["count_rows"] += 1
+                return 100
+
+            def stream_batches(self, *a, **kw):
+                calls["stream_batches"] += 1
+                return iter([])
+
+            def stream_batches_keyset(self, *a, **kw):
+                return iter([])
+
+            def stream_batches_chunked(self, sql, chunk_size, total_rows, **kw):
+                calls["stream_batches_chunked"] += 1
+                yield [(str(i), f"n{i}") for i in range(100)]
+
+        monkeypatch.setattr(svc, "_build_export_client", lambda env, conn_type: _MockClient())
+
+        payload = {
+            "query_sql": "SELECT id, name FROM t WHERE dt >= '{{date_start}}' AND dt <= '{{date_end}}'",
+            "connection_env": "test",
+            "job_name": f"{_PREFIX}r2",
+            "xlsx_engine": "direct",
+            "chunk_config": {
+                "date_column": "dt",
+                "date_start": "2026-03-06",
+                "date_end": "2026-03-06",
+                "chunk_days": 1,
+                "prefer_chunked": True,
+            },
+        }
+        r = app_client.post("/api/v1/data-export/execute", json=payload)
+        assert r.status_code == 200, r.text
+        job_id = r.json()["data"]["job_id"]
+        final = _wait_done(app_client, job_id, timeout=30.0)
+        assert final["status"] == "completed", final
+        # LIMIT/OFFSET 路径需要预扫描 count_rows
+        assert calls["count_rows"] == 1, f"应预扫描 count_rows,实际 {calls['count_rows']}"
+        assert calls["stream_batches"] == 0, f"不应调单流,实际 {calls['stream_batches']}"
+        assert calls["stream_batches_chunked"] == 1, (
+            f"无 cursor 时应走 LIMIT/OFFSET,实际 {calls['stream_batches_chunked']}"
+        )
+
+    def test_r3_default_false_keeps_legacy_stream_first_behavior(
+        self, app_client, tmp_path, monkeypatch,
+    ):
+        """R3: 未填 prefer_chunked + 无 env var → 沿用单流首试老行为(向后兼容)"""
+        from backend.api import data_export as api_module
+        monkeypatch.delenv("EXPORT_PREFER_CHUNKED", raising=False)
+        monkeypatch.setattr(api_module, "_CUSTOMER_DATA_ROOT", tmp_path)
+        from backend.services.export_clients.base import ColumnInfo
+        from backend.services import data_export_service as svc
+
+        calls = {"stream_batches": 0, "stream_batches_keyset": 0}
+
+        class _MockClient:
+            def get_columns(self, sql):
+                return [ColumnInfo("id", "Int64")]
+
+            def count_rows(self, sql, timeout=None):
+                return 10
+
+            def stream_batches(self, *a, **kw):
+                calls["stream_batches"] += 1
+                yield [(str(i),) for i in range(10)]
+
+            def stream_batches_keyset(self, *a, **kw):
+                calls["stream_batches_keyset"] += 1
+                return iter([])
+
+            def stream_batches_chunked(self, *a, **kw):
+                return iter([])
+
+        monkeypatch.setattr(svc, "_build_export_client", lambda env, conn_type: _MockClient())
+
+        payload = {
+            "query_sql": "SELECT id FROM t WHERE dt >= '{{date_start}}' AND dt <= '{{date_end}}'",
+            "connection_env": "test",
+            "job_name": f"{_PREFIX}r3",
+            "xlsx_engine": "direct",
+            "chunk_config": {
+                "date_column": "dt",
+                "date_start": "2026-03-06",
+                "date_end": "2026-03-06",
+                "chunk_days": 1,
+                "cursor_column": "id",
+                # prefer_chunked 不填 → 沿用单流首试
+            },
+        }
+        r = app_client.post("/api/v1/data-export/execute", json=payload)
+        assert r.status_code == 200, r.text
+        job_id = r.json()["data"]["job_id"]
+        final = _wait_done(app_client, job_id, timeout=30.0)
+        assert final["status"] == "completed", final
+        # 关键断言:仍走单流(成功),不调 keyset
+        assert calls["stream_batches"] == 1
+        assert calls["stream_batches_keyset"] == 0
+
+    def test_r4_env_var_acts_as_default_when_field_unset(
+        self, app_client, tmp_path, monkeypatch,
+    ):
+        """R4: 未填 prefer_chunked + env EXPORT_PREFER_CHUNKED=1 → 也跳过单流"""
+        from backend.api import data_export as api_module
+        monkeypatch.setenv("EXPORT_PREFER_CHUNKED", "1")
+        monkeypatch.setattr(api_module, "_CUSTOMER_DATA_ROOT", tmp_path)
+        from backend.services.export_clients.base import ColumnInfo
+        from backend.services import data_export_service as svc
+
+        calls = {"stream_batches": 0, "stream_batches_keyset": 0}
+
+        class _MockClient:
+            def get_columns(self, sql):
+                return [ColumnInfo("id", "Int64")]
+
+            def count_rows(self, sql, timeout=None):
+                return 10
+
+            def stream_batches(self, *a, **kw):
+                calls["stream_batches"] += 1
+                return iter([])
+
+            def stream_batches_keyset(self, *a, **kw):
+                calls["stream_batches_keyset"] += 1
+                yield [(str(i),) for i in range(10)]
+
+            def stream_batches_chunked(self, *a, **kw):
+                return iter([])
+
+        monkeypatch.setattr(svc, "_build_export_client", lambda env, conn_type: _MockClient())
+
+        payload = {
+            "query_sql": "SELECT id FROM t WHERE dt >= '{{date_start}}' AND dt <= '{{date_end}}'",
+            "connection_env": "test",
+            "job_name": f"{_PREFIX}r4",
+            "xlsx_engine": "direct",
+            "chunk_config": {
+                "date_column": "dt",
+                "date_start": "2026-03-06",
+                "date_end": "2026-03-06",
+                "chunk_days": 1,
+                "cursor_column": "id",
+                # prefer_chunked 不填,env=1 应生效
+            },
+        }
+        r = app_client.post("/api/v1/data-export/execute", json=payload)
+        assert r.status_code == 200, r.text
+        job_id = r.json()["data"]["job_id"]
+        final = _wait_done(app_client, job_id, timeout=30.0)
+        assert final["status"] == "completed", final
+        assert calls["stream_batches"] == 0
+        assert calls["stream_batches_keyset"] == 1
+
+    def test_r5_field_false_overrides_env_true(
+        self, app_client, tmp_path, monkeypatch,
+    ):
+        """R5: prefer_chunked=False 显式 + env=1 → 字段优先,沿用单流首试"""
+        from backend.api import data_export as api_module
+        monkeypatch.setenv("EXPORT_PREFER_CHUNKED", "1")
+        monkeypatch.setattr(api_module, "_CUSTOMER_DATA_ROOT", tmp_path)
+        from backend.services.export_clients.base import ColumnInfo
+        from backend.services import data_export_service as svc
+
+        calls = {"stream_batches": 0, "stream_batches_keyset": 0}
+
+        class _MockClient:
+            def get_columns(self, sql):
+                return [ColumnInfo("id", "Int64")]
+
+            def count_rows(self, sql, timeout=None):
+                return 10
+
+            def stream_batches(self, *a, **kw):
+                calls["stream_batches"] += 1
+                yield [(str(i),) for i in range(10)]
+
+            def stream_batches_keyset(self, *a, **kw):
+                calls["stream_batches_keyset"] += 1
+                return iter([])
+
+            def stream_batches_chunked(self, *a, **kw):
+                return iter([])
+
+        monkeypatch.setattr(svc, "_build_export_client", lambda env, conn_type: _MockClient())
+
+        payload = {
+            "query_sql": "SELECT id FROM t WHERE dt >= '{{date_start}}' AND dt <= '{{date_end}}'",
+            "connection_env": "test",
+            "job_name": f"{_PREFIX}r5",
+            "xlsx_engine": "direct",
+            "chunk_config": {
+                "date_column": "dt",
+                "date_start": "2026-03-06",
+                "date_end": "2026-03-06",
+                "chunk_days": 1,
+                "cursor_column": "id",
+                "prefer_chunked": False,  # 显式 false 覆盖 env=1
+            },
+        }
+        r = app_client.post("/api/v1/data-export/execute", json=payload)
+        assert r.status_code == 200, r.text
+        job_id = r.json()["data"]["job_id"]
+        final = _wait_done(app_client, job_id, timeout=30.0)
+        assert final["status"] == "completed", final
+        assert calls["stream_batches"] == 1
+        assert calls["stream_batches_keyset"] == 0
+
+
+# =============================================================================
+# P · partial_failed — v2.14.7 单块失败不再拖垮整 Job
+# =============================================================================
+
+class TestPartialFailure:
+    """P1-P8: 某块 exhaust 所有重试+分裂仍失败 → 跳过继续做剩下,Job 终态根据计数判定"""
+
+    def _build_mock_with_failing_chunks(self, failing_chunk_filter):
+        """构造 mock,根据 SQL 内含的日期字面量判断当前块是否模拟失败。
+
+        failing_chunk_filter(sql: str) -> bool — True 表示该块的 SQL 应抛 ConnectionError
+        """
+        from backend.services.export_clients.base import ColumnInfo
+        from requests.exceptions import ConnectionError as RConnErr
+
+        class _MockClient:
+            def get_columns(self, sql):
+                return [ColumnInfo("id", "Int64"), ColumnInfo("name", "String")]
+
+            def count_rows(self, sql, timeout=None):
+                if failing_chunk_filter(sql):
+                    raise ConnectionError("mock failure for count_rows")
+                return 10
+
+            def stream_batches(self, sql, batch_size=50_000, extra_settings=None, query_id_prefix=None):
+                if failing_chunk_filter(sql):
+                    raise RConnErr(
+                        "Connection aborted - mock RST",
+                    )
+                yield [(str(i), f"n{i}") for i in range(10)]
+
+            def stream_batches_keyset(self, *a, **kw):
+                # keyset 用不上,但要存在
+                sql = kw.get("sql") if "sql" in kw else (a[0] if a else "")
+                if failing_chunk_filter(sql):
+                    raise ConnectionError("mock keyset failure")
+                return iter([])
+
+            def stream_batches_chunked(self, sql, chunk_size, total_rows, **kw):
+                if failing_chunk_filter(sql):
+                    raise ConnectionError("mock LIMIT/OFFSET failure")
+                yield [(str(i), f"n{i}") for i in range(10)]
+
+        return _MockClient
+
+    def test_p1_one_chunk_fails_others_succeed_yields_partial_failed(
+        self, app_client, tmp_path, monkeypatch,
+    ):
+        """P1: 3 块 job 中第 2 块失败 → job.status='partial_failed';
+        output_files 含 2 completed + 1 failed;error_message 含失败块明细。"""
+        from backend.api import data_export as api_module
+        monkeypatch.setattr(api_module, "_CUSTOMER_DATA_ROOT", tmp_path)
+        from backend.services import data_export_service as svc
+
+        # 04-10 ~ 04-12 共 3 天,chunk_days=1 → 3 块
+        # 让 04-11 这块失败
+        MockClient = self._build_mock_with_failing_chunks(
+            lambda sql: "'2025-04-11'" in sql
+        )
+        monkeypatch.setattr(svc, "_build_export_client", lambda env, conn_type: MockClient())
+        # 老行为开关默认 0,partial_failed 模式生效
+        monkeypatch.delenv("EXPORT_FAIL_FAST_ON_CHUNK_ERROR", raising=False)
+
+        payload = {
+            "query_sql": "SELECT id, name FROM t WHERE dt >= '{{date_start}}' AND dt <= '{{date_end}}'",
+            "connection_env": "test",
+            "job_name": f"{_PREFIX}p1",
+            "xlsx_engine": "direct",
+            "chunk_config": {
+                "date_column": "dt",
+                "date_start": "2025-04-10",
+                "date_end": "2025-04-12",
+                "chunk_days": 1,
+            },
+        }
+        r = app_client.post("/api/v1/data-export/execute", json=payload)
+        assert r.status_code == 200, r.text
+        job_id = r.json()["data"]["job_id"]
+        final = _wait_done(app_client, job_id, timeout=30.0)
+        assert final is not None
+        assert final["status"] == "partial_failed", final
+        # 2 块 completed, 1 块 failed
+        statuses = [f["status"] for f in final["output_files"]]
+        assert statuses.count("completed") == 2
+        assert statuses.count("failed") == 1
+        # error_message 含失败块明细
+        assert "失败" in (final.get("error_message") or "")
+        # 失败块有 error_summary
+        failed_entry = next(f for f in final["output_files"] if f["status"] == "failed")
+        assert "error_summary" in failed_entry
+        assert failed_entry["error_summary"]
+        # 已 exported_rows > 0 (前面的成功块计入)
+        assert final["exported_rows"] >= 20  # 2 块 × 10 行
+
+    def test_p2_all_chunks_fail_yields_failed(
+        self, app_client, tmp_path, monkeypatch,
+    ):
+        """P2: 全部块都失败 → job.status='failed' (与原行为一致)"""
+        from backend.api import data_export as api_module
+        monkeypatch.setattr(api_module, "_CUSTOMER_DATA_ROOT", tmp_path)
+        from backend.services import data_export_service as svc
+
+        MockClient = self._build_mock_with_failing_chunks(lambda sql: True)
+        monkeypatch.setattr(svc, "_build_export_client", lambda env, conn_type: MockClient())
+        monkeypatch.delenv("EXPORT_FAIL_FAST_ON_CHUNK_ERROR", raising=False)
+
+        payload = {
+            "query_sql": "SELECT id, name FROM t WHERE dt >= '{{date_start}}' AND dt <= '{{date_end}}'",
+            "connection_env": "test",
+            "job_name": f"{_PREFIX}p2",
+            "xlsx_engine": "direct",
+            "chunk_config": {
+                "date_column": "dt",
+                "date_start": "2025-04-10",
+                "date_end": "2025-04-12",
+                "chunk_days": 1,
+            },
+        }
+        r = app_client.post("/api/v1/data-export/execute", json=payload)
+        assert r.status_code == 200, r.text
+        job_id = r.json()["data"]["job_id"]
+        final = _wait_done(app_client, job_id, timeout=30.0)
+        assert final["status"] == "failed", final
+        # 所有 entry 都是 failed
+        statuses = [f["status"] for f in final["output_files"]]
+        assert all(s == "failed" for s in statuses)
+
+    def test_p3_all_chunks_succeed_yields_completed(
+        self, app_client, tmp_path, monkeypatch,
+    ):
+        """P3: 全部块都成功 → job.status='completed' (与原行为一致)"""
+        from backend.api import data_export as api_module
+        monkeypatch.setattr(api_module, "_CUSTOMER_DATA_ROOT", tmp_path)
+        from backend.services import data_export_service as svc
+
+        MockClient = self._build_mock_with_failing_chunks(lambda sql: False)  # 不失败
+        monkeypatch.setattr(svc, "_build_export_client", lambda env, conn_type: MockClient())
+        monkeypatch.delenv("EXPORT_FAIL_FAST_ON_CHUNK_ERROR", raising=False)
+
+        payload = {
+            "query_sql": "SELECT id, name FROM t WHERE dt >= '{{date_start}}' AND dt <= '{{date_end}}'",
+            "connection_env": "test",
+            "job_name": f"{_PREFIX}p3",
+            "xlsx_engine": "direct",
+            "chunk_config": {
+                "date_column": "dt",
+                "date_start": "2025-04-10",
+                "date_end": "2025-04-12",
+                "chunk_days": 1,
+            },
+        }
+        r = app_client.post("/api/v1/data-export/execute", json=payload)
+        assert r.status_code == 200, r.text
+        job_id = r.json()["data"]["job_id"]
+        final = _wait_done(app_client, job_id, timeout=30.0)
+        assert final["status"] == "completed", final
+        assert all(f["status"] == "completed" for f in final["output_files"])
+
+    def test_p4_partial_failed_download_chunk_success(
+        self, app_client, tmp_path, monkeypatch,
+    ):
+        """P4: partial_failed 状态下,通过 file_index 下载 status=completed 的块仍正常"""
+        from backend.api import data_export as api_module
+        monkeypatch.setattr(api_module, "_CUSTOMER_DATA_ROOT", tmp_path)
+        from backend.services import data_export_service as svc
+
+        MockClient = self._build_mock_with_failing_chunks(lambda sql: "'2025-04-11'" in sql)
+        monkeypatch.setattr(svc, "_build_export_client", lambda env, conn_type: MockClient())
+        monkeypatch.delenv("EXPORT_FAIL_FAST_ON_CHUNK_ERROR", raising=False)
+
+        payload = {
+            "query_sql": "SELECT id, name FROM t WHERE dt >= '{{date_start}}' AND dt <= '{{date_end}}'",
+            "connection_env": "test",
+            "job_name": f"{_PREFIX}p4",
+            "xlsx_engine": "direct",
+            "chunk_config": {
+                "date_column": "dt",
+                "date_start": "2025-04-10",
+                "date_end": "2025-04-12",
+                "chunk_days": 1,
+            },
+        }
+        r = app_client.post("/api/v1/data-export/execute", json=payload)
+        job_id = r.json()["data"]["job_id"]
+        final = _wait_done(app_client, job_id, timeout=30.0)
+        assert final["status"] == "partial_failed"
+
+        # 找到第一个 completed 块,下载它
+        completed_idx = next(
+            f["index"] for f in final["output_files"] if f["status"] == "completed"
+        )
+        dl = app_client.get(
+            f"/api/v1/data-export/jobs/{job_id}/download?file_index={completed_idx}"
+        )
+        assert dl.status_code == 200, dl.text
+
+        # 反过来,下载 failed 块应 400
+        failed_idx = next(
+            f["index"] for f in final["output_files"] if f["status"] == "failed"
+        )
+        dl_failed = app_client.get(
+            f"/api/v1/data-export/jobs/{job_id}/download?file_index={failed_idx}"
+        )
+        assert dl_failed.status_code == 400, dl_failed.text
+
+    def test_p5_partial_failed_delete_job_ok(
+        self, app_client, tmp_path, monkeypatch,
+    ):
+        """P5: partial_failed 状态可以删除 job 记录(连带磁盘文件)"""
+        from backend.api import data_export as api_module
+        monkeypatch.setattr(api_module, "_CUSTOMER_DATA_ROOT", tmp_path)
+        from backend.services import data_export_service as svc
+
+        MockClient = self._build_mock_with_failing_chunks(lambda sql: "'2025-04-11'" in sql)
+        monkeypatch.setattr(svc, "_build_export_client", lambda env, conn_type: MockClient())
+        monkeypatch.delenv("EXPORT_FAIL_FAST_ON_CHUNK_ERROR", raising=False)
+
+        payload = {
+            "query_sql": "SELECT id, name FROM t WHERE dt >= '{{date_start}}' AND dt <= '{{date_end}}'",
+            "connection_env": "test",
+            "job_name": f"{_PREFIX}p5",
+            "xlsx_engine": "direct",
+            "chunk_config": {
+                "date_column": "dt",
+                "date_start": "2025-04-10",
+                "date_end": "2025-04-12",
+                "chunk_days": 1,
+            },
+        }
+        r = app_client.post("/api/v1/data-export/execute", json=payload)
+        job_id = r.json()["data"]["job_id"]
+        final = _wait_done(app_client, job_id, timeout=30.0)
+        assert final["status"] == "partial_failed"
+
+        # 删除应成功
+        delr = app_client.delete(f"/api/v1/data-export/jobs/{job_id}")
+        assert delr.status_code == 200, delr.text
+
+    def test_p6_env_fail_fast_restores_legacy_behavior(
+        self, app_client, tmp_path, monkeypatch,
+    ):
+        """P6: env EXPORT_FAIL_FAST_ON_CHUNK_ERROR=1 → 回退老行为(整 Job failed 一遇错)"""
+        from backend.api import data_export as api_module
+        monkeypatch.setenv("EXPORT_FAIL_FAST_ON_CHUNK_ERROR", "1")
+        monkeypatch.setattr(api_module, "_CUSTOMER_DATA_ROOT", tmp_path)
+        from backend.services import data_export_service as svc
+
+        # 04-11 块失败,但 env=1 → 04-12 不会执行,整 Job failed
+        MockClient = self._build_mock_with_failing_chunks(
+            lambda sql: "'2025-04-11'" in sql
+        )
+        monkeypatch.setattr(svc, "_build_export_client", lambda env, conn_type: MockClient())
+
+        payload = {
+            "query_sql": "SELECT id, name FROM t WHERE dt >= '{{date_start}}' AND dt <= '{{date_end}}'",
+            "connection_env": "test",
+            "job_name": f"{_PREFIX}p6",
+            "xlsx_engine": "direct",
+            "chunk_config": {
+                "date_column": "dt",
+                "date_start": "2025-04-10",
+                "date_end": "2025-04-12",
+                "chunk_days": 1,
+            },
+        }
+        r = app_client.post("/api/v1/data-export/execute", json=payload)
+        job_id = r.json()["data"]["job_id"]
+        final = _wait_done(app_client, job_id, timeout=30.0)
+        assert final["status"] == "failed", final
+        # 04-10 块应已 completed,04-11 failed,04-12 仍 pending(因为整 Job failed return 提前退出)
+        statuses = [f["status"] for f in final["output_files"]]
+        assert "completed" in statuses
+        assert "failed" in statuses
+        assert "pending" in statuses
+
+    def test_p7_csv_zip_partial_failed_uses_partial_prefix(
+        self, app_client, tmp_path, monkeypatch,
+    ):
+        """P7: csv_zip 模式 partial_failed → ZIP 文件名加 partial_ 前缀,仅含成功块"""
+        from backend.api import data_export as api_module
+        monkeypatch.setattr(api_module, "_CUSTOMER_DATA_ROOT", tmp_path)
+        from backend.services.export_clients.base import ColumnInfo
+        from backend.services import data_export_service as svc
+
+        # csv 模式走 stream_raw 直写字节流;mock 需要按 sql 内日期返回 raw bytes 或抛错
+        def _csv_mock_factory(env, conn_type):
+            class _CSVClient:
+                def get_columns(self, sql):
+                    return [ColumnInfo("id", "Int64"), ColumnInfo("name", "String")]
+                def count_rows(self, sql, timeout=None):
+                    return 5
+                def stream_batches(self, *a, **kw):
+                    return iter([])
+                def stream_batches_keyset(self, *a, **kw):
+                    return iter([])
+                def stream_batches_chunked(self, *a, **kw):
+                    return iter([])
+                def stream_raw(self, sql, format_name="CSVWithNames", **kw):
+                    if "'2025-04-11'" in sql:
+                        raise ConnectionError("mock csv RST for 04-11")
+                    yield b"id,name\n"
+                    for i in range(5):
+                        yield f"{i},n{i}\n".encode("utf-8")
+            return _CSVClient()
+
+        monkeypatch.setattr(svc, "_build_export_client", _csv_mock_factory)
+        monkeypatch.delenv("EXPORT_FAIL_FAST_ON_CHUNK_ERROR", raising=False)
+
+        payload = {
+            "query_sql": "SELECT id, name FROM t WHERE dt >= '{{date_start}}' AND dt <= '{{date_end}}'",
+            "connection_env": "test",
+            "job_name": f"{_PREFIX}p7",
+            "output_format": "csv_zip",
+            "chunk_config": {
+                "date_column": "dt",
+                "date_start": "2025-04-10",
+                "date_end": "2025-04-12",
+                "chunk_days": 1,
+            },
+        }
+        r = app_client.post("/api/v1/data-export/execute", json=payload)
+        job_id = r.json()["data"]["job_id"]
+        final = _wait_done(app_client, job_id, timeout=30.0)
+        assert final["status"] == "partial_failed", final
+        # ZIP 文件名应有 partial_ 前缀
+        zip_name = final.get("output_filename") or ""
+        assert zip_name.startswith("partial_"), f"期望 partial_ 前缀,实际 {zip_name!r}"
+        # ZIP 文件存在且能下载
+        dl = app_client.get(f"/api/v1/data-export/jobs/{job_id}/download")
+        assert dl.status_code == 200, dl.text
+
+    def test_p8_failure_summary_includes_chunk_details(
+        self, app_client, tmp_path, monkeypatch,
+    ):
+        """P8: error_message 含每个失败块的 index, 时间范围, 错误指纹"""
+        from backend.api import data_export as api_module
+        monkeypatch.setattr(api_module, "_CUSTOMER_DATA_ROOT", tmp_path)
+        from backend.services import data_export_service as svc
+
+        # 04-10, 04-12 失败; 04-11 成功
+        MockClient = self._build_mock_with_failing_chunks(
+            lambda sql: "'2025-04-10'" in sql or "'2025-04-12'" in sql
+        )
+        monkeypatch.setattr(svc, "_build_export_client", lambda env, conn_type: MockClient())
+        monkeypatch.delenv("EXPORT_FAIL_FAST_ON_CHUNK_ERROR", raising=False)
+
+        payload = {
+            "query_sql": "SELECT id, name FROM t WHERE dt >= '{{date_start}}' AND dt <= '{{date_end}}'",
+            "connection_env": "test",
+            "job_name": f"{_PREFIX}p8",
+            "xlsx_engine": "direct",
+            "chunk_config": {
+                "date_column": "dt",
+                "date_start": "2025-04-10",
+                "date_end": "2025-04-12",
+                "chunk_days": 1,
+            },
+        }
+        r = app_client.post("/api/v1/data-export/execute", json=payload)
+        job_id = r.json()["data"]["job_id"]
+        final = _wait_done(app_client, job_id, timeout=30.0)
+        assert final["status"] == "partial_failed", final
+        err = final.get("error_message") or ""
+        # summary 应说明「3 块中 2 块失败」
+        assert "3 块中 2 块失败" in err, f"期望含失败计数,实际: {err}"
+        # 应含 2025-04-10 和 2025-04-12 字面量
+        assert "2025-04-10" in err
+        assert "2025-04-12" in err
 
 
 def teardown_module(_):

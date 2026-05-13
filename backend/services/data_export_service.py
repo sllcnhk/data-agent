@@ -16,11 +16,18 @@
   事件循环，使其他 API 请求（如任务列表轮询 GET /data-export/jobs）能正常响应。
 """
 import asyncio
+import csv
 import logging
 import math
 import os
+import re
+import shutil
+import tempfile
+import threading
+import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -37,6 +44,37 @@ DEFAULT_BATCH_SIZE = 50_000          # 每批行数
 PREVIEW_LIMIT = 100                  # 预览行数
 MAX_ROWS_PER_SHEET = 1_000_000       # 每 Sheet 最大数据行（不含表头）
 PROGRESS_UPDATE_EVERY = 10           # 每 N 批更新一次 DB 进度
+CSV_XLSX_PROGRESS_EVERY_ROWS = 20_000
+CSV_XLSX_CANCEL_CHECK_EVERY_ROWS = 5_000
+CSV_STREAM_PROGRESS_EVERY_MB = 64
+CSV_STREAM_CANCEL_CHECK_EVERY_MB = 16
+
+SUPPORTED_OUTPUT_FORMATS = {"xlsx", "csv", "csv_zip"}
+SUPPORTED_XLSX_ENGINES = {"auto", "direct", "csv_staging"}
+
+_EXPORT_QUERY_SEMAPHORES: Dict[str, threading.BoundedSemaphore] = {}
+_EXPORT_QUERY_SEMAPHORES_LOCK = threading.Lock()
+
+
+def _env_int(name: str, default: int, *, min_value: int = 1) -> int:
+    """Read a positive integer env var; fall back to default on invalid values."""
+    try:
+        value = int(os.getenv(name, str(default)))
+        return max(min_value, value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_export_query_semaphore(env: str) -> threading.BoundedSemaphore:
+    """按 ClickHouse env 限制导出查询并发，避免多个后台任务挤爆用户级 max_concurrent_queries。"""
+    max_per_env = max(1, int(os.getenv("EXPORT_MAX_CONCURRENT_QUERIES_PER_ENV", "1")))
+    key = (env or "default").lower()
+    with _EXPORT_QUERY_SEMAPHORES_LOCK:
+        sem = _EXPORT_QUERY_SEMAPHORES.get(key)
+        if sem is None:
+            sem = threading.BoundedSemaphore(max_per_env)
+            _EXPORT_QUERY_SEMAPHORES[key] = sem
+        return sem
 
 # ClickHouse 大整数类型（超过 JS Number.MAX_SAFE_INTEGER = 2^53-1，需转字符串）
 _LARGE_INT_TYPES = frozenset([
@@ -254,6 +292,12 @@ def _humanize_error(exc: Exception) -> str:
             "增加索引/分区；③ 调高 EXPORT_QUERY_MAX_EXECUTION_TIME 环境变量。\n"
             f"[技术细节] {raw}"
         )
+    if "Code: 202" in raw or "TOO_MANY_SIMULTANEOUS_QUERIES" in raw or "Too many simultaneous queries" in raw:
+        return (
+            "ClickHouse 当前用户并发查询数已达到上限。系统已对导出任务增加 env 级并发闸门和自动退避重试；"
+            "若仍失败，请稍后重试、减少同时运行的报表/导出任务，或为导出配置独立 ClickHouse 用户。\n"
+            f"[技术细节] {raw}"
+        )
     # 网络连接失败 — 配置或环境问题
     if "Connection refused" in raw or "Failed to establish" in raw:
         return (
@@ -268,6 +312,417 @@ def _humanize_error(exc: Exception) -> str:
         return f"SQL 引用的表/视图不存在。\n[技术细节] {raw}"
     # 兜底
     return raw
+
+
+def _media_type_for_format(fmt: str) -> str:
+    if fmt == "csv":
+        return "text/csv; charset=utf-8"
+    if fmt == "csv_zip":
+        return "application/zip"
+    return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _count_csv_records(csv_path: str) -> int:
+    """用 csv.reader 正确处理引号/换行，返回数据行数（不含表头）。"""
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as fp:
+        reader = csv.reader(fp)
+        try:
+            next(reader)
+        except StopIteration:
+            return 0
+        return sum(1 for _ in reader)
+
+
+def _csv_to_xlsx(
+    csv_path: str,
+    xlsx_path: str,
+    *,
+    job_id: str,
+    sheet_prefix: str = "Sheet",
+    progress_offset: int = 0,
+    progress_total: Optional[int] = None,
+    chunk_label: Optional[str] = None,
+    on_cancel: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    CSV 临时文件 → XLSX。
+
+    open(..., newline="") 交给 csv 模块处理 CRLF/引号内换行，避免错误分列/错行；
+    encoding="utf-8-sig" 兼容带 BOM 的 CSV，避免首列表头带 BOM。
+    """
+    import xlsxwriter
+
+    _XLSX_OPTIONS = {
+        "constant_memory": True,
+        "strings_to_numbers": False,
+        "strings_to_formulas": False,
+        "strings_to_urls": False,
+    }
+
+    Path(xlsx_path).parent.mkdir(parents=True, exist_ok=True)
+    wb = xlsxwriter.Workbook(xlsx_path, options=_XLSX_OPTIONS)
+    sheet_num = 1
+    ws = wb.add_worksheet(f"{sheet_prefix}{sheet_num}")
+    data_rows = 0
+    sheet_row_count = 0
+    progress_every = _env_int(
+        "CSV_XLSX_PROGRESS_EVERY_ROWS",
+        CSV_XLSX_PROGRESS_EVERY_ROWS,
+    )
+    cancel_check_every = _env_int(
+        "CSV_XLSX_CANCEL_CHECK_EVERY_ROWS",
+        CSV_XLSX_CANCEL_CHECK_EVERY_ROWS,
+    )
+
+    def _format_sheet_label(n: int) -> str:
+        base = f"{sheet_prefix}{n}"
+        return f"{chunk_label} - {base}" if chunk_label else base
+
+    _update_job(job_id, current_sheet=_format_sheet_label(sheet_num))
+
+    try:
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as fp:
+            reader = csv.reader(fp)
+            header = next(reader, None) or []
+            ws.write_row(0, 0, header)
+            cur_row = 1
+
+            for row in reader:
+                # CSV -> XLSX 是纯本地转换，不能每行查一次 DB，否则几十万行会产生
+                # 几十万次短连接/checkout，表现为“ClickHouse 查询已结束但页面长时间 0 行”。
+                if data_rows % cancel_check_every == 0:
+                    cancelled = (on_cancel and on_cancel()) or _is_cancelling(job_id)
+                    if cancelled:
+                        wb.close()
+                        return {
+                            "exported_rows": data_rows,
+                            "total_sheets": sheet_num,
+                            "done_batches": 0,
+                            "total_sql_chunks": None,
+                            "file_size": Path(xlsx_path).stat().st_size if Path(xlsx_path).exists() else 0,
+                            "cancelled": True,
+                        }
+
+                if sheet_row_count >= MAX_ROWS_PER_SHEET:
+                    sheet_num += 1
+                    ws = wb.add_worksheet(f"{sheet_prefix}{sheet_num}")
+                    ws.write_row(0, 0, header)
+                    cur_row = 1
+                    sheet_row_count = 0
+                    _update_job(
+                        job_id,
+                        current_sheet=f"{_format_sheet_label(sheet_num)} · 已转换 {data_rows:,} 行",
+                    )
+
+                ws.write_row(cur_row, 0, row)
+                cur_row += 1
+                data_rows += 1
+                sheet_row_count += 1
+
+                if data_rows % progress_every == 0:
+                    _update_job(
+                        job_id,
+                        exported_rows=progress_offset + data_rows,
+                        current_sheet=f"{_format_sheet_label(sheet_num)} · 已转换 {data_rows:,} 行",
+                    )
+
+        wb.close()
+        return {
+            "exported_rows": data_rows,
+            "total_sheets": sheet_num,
+            "done_batches": max(1, math.ceil(data_rows / DEFAULT_BATCH_SIZE)) if data_rows else 0,
+            "total_sql_chunks": None,
+            "file_size": Path(xlsx_path).stat().st_size,
+            "cancelled": False,
+        }
+    except Exception:
+        try:
+            wb.close()
+        except Exception:
+            pass
+        raise
+
+
+def _zip_single_file(src_path: str, zip_path: str, arcname: Optional[str] = None) -> int:
+    Path(zip_path).parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        zf.write(src_path, arcname=arcname or Path(src_path).name)
+    return Path(zip_path).stat().st_size
+
+
+def _is_auto_pre_split(value: Any) -> bool:
+    """Whether pre_split_hours requests data-volume based auto windows."""
+    return isinstance(value, str) and value.strip().lower() == "auto"
+
+
+def _validate_auto_split_column(name: str) -> str:
+    """Validate a SELECT alias/column name used by auto pre-split count SQL."""
+    cleaned = (name or "").strip().strip("`").strip()
+    if not cleaned:
+        raise ValueError("auto 预分窗口需要提供统计时间列（date_column 或 auto_split_column）")
+    # Match the cursor-column policy: allow letters/digits/underscore/space/CJK, no backticks.
+    if "`" in cleaned or not re.match(r"^[A-Za-z_\u4e00-\u9fff][A-Za-z0-9_ \u4e00-\u9fff]*$", cleaned):
+        raise ValueError(
+            "auto 预分窗口统计时间列仅允许字母/数字/下划线/空格/中文，且不能包含反引号"
+        )
+    return cleaned
+
+
+def _quote_ch_identifier(name: str) -> str:
+    """Quote a ClickHouse identifier after validation."""
+    return f"`{_validate_auto_split_column(name)}`"
+
+
+def _parse_bucket_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value.replace(microsecond=0)
+    raw = str(value).strip().replace("T", " ")
+    # ClickHouse formatDateTime returns YYYY-mm-dd HH:MM:SS; keep a fallback for Date-only.
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            parsed = datetime.strptime(raw, fmt)
+            return parsed.replace(microsecond=0)
+        except ValueError:
+            continue
+    raise ValueError(f"无法解析 auto 预分窗口 bucket 时间: {value!r}")
+
+
+def _auto_bucket_rows_to_windows(
+    bucket_rows: List[Tuple[Any, Any]],
+    *,
+    unit: str,
+    target_rows: int = MAX_ROWS_PER_SHEET,
+) -> List[Tuple[datetime, datetime, int]]:
+    """
+    Convert sorted bucket counts into greedy continuous windows.
+
+    The next bucket is appended while total rows remain <= target_rows.
+    If a single bucket already exceeds target_rows it becomes a single window;
+    later XLSX sheet splitting still protects Excel's per-sheet row limit.
+    """
+    if unit not in ("hour", "minute"):
+        raise ValueError("auto 预分窗口仅支持 hour/minute 粒度")
+    target_rows = max(1, int(target_rows or MAX_ROWS_PER_SHEET))
+    step = timedelta(hours=1) if unit == "hour" else timedelta(minutes=1)
+
+    parsed: List[Tuple[datetime, int]] = []
+    for bucket, cnt in bucket_rows:
+        rows = int(cnt or 0)
+        if rows <= 0:
+            continue
+        parsed.append((_parse_bucket_datetime(bucket), rows))
+    parsed.sort(key=lambda x: x[0])
+
+    windows: List[Tuple[datetime, datetime, int]] = []
+    cur_start: Optional[datetime] = None
+    cur_end: Optional[datetime] = None
+    cur_rows = 0
+
+    for bucket_start, rows in parsed:
+        bucket_end = bucket_start + step - timedelta(seconds=1)
+        if cur_start is None:
+            cur_start, cur_end, cur_rows = bucket_start, bucket_end, rows
+            continue
+        if cur_rows > 0 and cur_rows + rows > target_rows:
+            windows.append((cur_start, cur_end or bucket_end, cur_rows))
+            cur_start, cur_end, cur_rows = bucket_start, bucket_end, rows
+        else:
+            cur_end = bucket_end
+            cur_rows += rows
+
+    if cur_start is not None:
+        windows.append((cur_start, cur_end or cur_start + step - timedelta(seconds=1), cur_rows))
+    return windows
+
+
+def _build_auto_pre_split_count_sql(
+    filtered_sql: str,
+    *,
+    time_column: str,
+    unit: str,
+) -> str:
+    """Build a ClickHouse query that returns bucket_start,count for the filtered user SQL.
+
+    格式串陷阱(v2.14.5 修复):
+        ClickHouse formatDateTime 遵循 MySQL DATE_FORMAT 语义,与 Python strftime 不同:
+            %i  → 分钟 (00-59)        ← 我们要的
+            %M  → 月份英文全名 (March) ← Python 里才是分钟
+            %S  → 秒  %H → 时(00-23)  %d → 日  %m → 月数字  %Y → 年
+            %F  ≡ %Y-%m-%d    %T  ≡ %H:%i:%S
+        旧实现误用 '%H:%M:%S' → 返回 '09:March:00' → _parse_bucket_datetime ValueError
+        导致整个 Job 失败。改成 '%F %T' 等价但更显眼,杜绝该类拼写错误。
+    """
+    if unit not in ("hour", "minute"):
+        raise ValueError("auto 预分窗口仅支持 hour/minute 粒度")
+    bucket_func = "toStartOfHour" if unit == "hour" else "toStartOfMinute"
+    col = _quote_ch_identifier(time_column)
+    stripped = filtered_sql.rstrip().rstrip(";")
+    return (
+        "SELECT formatDateTime(bucket, '%F %T') AS bucket_start, count() AS rows\n"
+        "FROM (\n"
+        f"  SELECT {bucket_func}(toDateTime(_auto_q.{col})) AS bucket\n"
+        f"  FROM ({stripped}) AS _auto_q\n"
+        ") AS _auto_bucket_q\n"
+        "GROUP BY bucket\n"
+        "ORDER BY bucket"
+    )
+
+
+def _stream_sql_to_csv_file(
+    *,
+    job_id: str,
+    sql: str,
+    env: str,
+    conn_type: str,
+    csv_path: str,
+    query_id_prefix: str,
+    on_cancel: Optional[Any] = None,
+    count_rows: bool = True,
+    progress_label: Optional[str] = None,
+) -> Dict[str, Any]:
+    """ClickHouse FORMAT CSVWithNames 原始字节直写 CSV 文件（带 UTF-8 BOM，方便 Excel 打开中文不乱码）。"""
+    from backend.config.settings import settings as app_settings
+    from backend.services.export_clients.clickhouse import is_ch_too_many_queries_error
+
+    export_settings = {"max_execution_time": app_settings.export_query_max_execution_time}
+    export_client = _build_export_client(env, conn_type)
+    sem = _get_export_query_semaphore(env)
+    max_too_many_retry = int(os.getenv("EXPORT_TOO_MANY_RETRY_MAX", "5"))
+    base_sleep = int(os.getenv("EXPORT_TOO_MANY_RETRY_BACKOFF", "10"))
+    progress_every_bytes = (
+        _env_int("CSV_STREAM_PROGRESS_EVERY_MB", CSV_STREAM_PROGRESS_EVERY_MB)
+        * 1024 * 1024
+    )
+    cancel_check_every_bytes = (
+        _env_int("CSV_STREAM_CANCEL_CHECK_EVERY_MB", CSV_STREAM_CANCEL_CHECK_EVERY_MB)
+        * 1024 * 1024
+    )
+
+    Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
+
+    for attempt in range(max_too_many_retry + 1):
+        try:
+            bytes_written = 0
+            last_progress_bytes = 0
+            last_cancel_check_bytes = 0
+            if progress_label:
+                _update_job(job_id, current_sheet=f"{progress_label} · 0.0 MB")
+            with sem:
+                with open(csv_path, "wb") as fp:
+                    # UTF-8 BOM 仅用于文件层；后续 csv_to_xlsx 通过 utf-8-sig 自动吞掉
+                    fp.write(b"\xef\xbb\xbf")
+                    bytes_written += 3
+                    for chunk in export_client.stream_raw(
+                        sql,
+                        format_name="CSVWithNames",
+                        extra_settings=export_settings,
+                        query_id_prefix=f"{query_id_prefix}:csv",
+                    ):
+                        # HTTP 原始流的 chunk 可能很多；按字节节流取消检查，避免频繁查 DB。
+                        if bytes_written - last_cancel_check_bytes >= cancel_check_every_bytes:
+                            last_cancel_check_bytes = bytes_written
+                            if (on_cancel and on_cancel()) or _is_cancelling(job_id):
+                                return {
+                                    "exported_rows": 0,
+                                    "total_sheets": 0,
+                                    "done_batches": 0,
+                                    "total_sql_chunks": None,
+                                    "file_size": bytes_written,
+                                    "cancelled": True,
+                                }
+                        fp.write(chunk)
+                        bytes_written += len(chunk)
+                        if progress_label and bytes_written - last_progress_bytes >= progress_every_bytes:
+                            last_progress_bytes = bytes_written
+                            _update_job(
+                                job_id,
+                                current_sheet=(
+                                    f"{progress_label} · {bytes_written / 1024 / 1024:.1f} MB"
+                                ),
+                            )
+            if not count_rows:
+                return {
+                    "exported_rows": 0,
+                    "total_sheets": 0,
+                    "done_batches": 1,
+                    "total_sql_chunks": None,
+                    "file_size": Path(csv_path).stat().st_size,
+                    "cancelled": False,
+                }
+            if progress_label:
+                _update_job(job_id, current_sheet=f"{progress_label} · 统计 CSV 行数")
+            rows = _count_csv_records(csv_path)
+            return {
+                "exported_rows": rows,
+                "total_sheets": 0,
+                "done_batches": 1,
+                "total_sql_chunks": None,
+                "file_size": Path(csv_path).stat().st_size,
+                "cancelled": False,
+            }
+        except Exception as exc:
+            if is_ch_too_many_queries_error(exc) and attempt < max_too_many_retry:
+                sleep_s = min(60, base_sleep * (attempt + 1))
+                logger.warning(
+                    "[ExportJob %s] ClickHouse too many simultaneous queries, retry in %ss "
+                    "(attempt %d/%d): %s",
+                    job_id, sleep_s, attempt + 1, max_too_many_retry, exc,
+                )
+                try:
+                    os.unlink(csv_path)
+                except Exception:
+                    pass
+                time.sleep(sleep_s)
+                continue
+            raise
+
+    raise RuntimeError("CSV stream export failed after retries")
+
+
+def _run_csv_export(
+    *,
+    job_id: str,
+    sql: str,
+    env: str,
+    conn_type: str,
+    output_path: str,
+    output_format: str,
+    query_id_prefix: str,
+    on_cancel: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """CSV / CSV ZIP 极速导出路径。"""
+    if output_format == "csv":
+        return _stream_sql_to_csv_file(
+            job_id=job_id,
+            sql=sql,
+            env=env,
+            conn_type=conn_type,
+            csv_path=output_path,
+            query_id_prefix=query_id_prefix,
+            on_cancel=on_cancel,
+        )
+
+    # csv_zip:先落 CSV 临时文件，再 zip。避免把 zip 写入失败与 ClickHouse 查询耦合。
+    tmp_dir = tempfile.mkdtemp(prefix=f"dataagent_export_{job_id}_")
+    try:
+        csv_name = Path(output_path).with_suffix(".csv").name
+        tmp_csv = str(Path(tmp_dir) / csv_name)
+        result = _stream_sql_to_csv_file(
+            job_id=job_id,
+            sql=sql,
+            env=env,
+            conn_type=conn_type,
+            csv_path=tmp_csv,
+            query_id_prefix=query_id_prefix,
+            on_cancel=on_cancel,
+        )
+        if result.get("cancelled"):
+            return result
+        file_size = _zip_single_file(tmp_csv, output_path, arcname=csv_name)
+        result["file_size"] = file_size
+        return result
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _is_cancelling(job_id: str) -> bool:
@@ -312,6 +767,10 @@ def _run_single_export(
     chunk_label: Optional[str] = None,
     on_cancel: Optional[Any] = None,
     cursor_column: Optional[str] = None,
+    output_format: str = "xlsx",
+    xlsx_engine: str = "direct",
+    query_id_prefix: Optional[str] = None,
+    prefer_chunked: bool = False,
 ) -> Dict[str, Any]:
     """
     执行单个 SQL 的 ClickHouse → Excel 流式导出。
@@ -330,6 +789,12 @@ def _run_single_export(
       - cursor_column 提供 → keyset 分页(stream_batches_keyset),正确性 + 性能双优;
       - 否则 → LIMIT/OFFSET (stream_batches_chunked),老行为兜底。
 
+    v2.14.6 — prefer_chunked 参数:
+      跨境/不稳网络下,5 分钟左右 LB/NAT 切断单流的现象极为稳定,每个块先单流试错 5 分钟
+      浪费严重且会产生不完整 xlsx 重头来。prefer_chunked=True 时直接跳过单流,首试就走
+      chunked 路径(keyset 或 LIMIT/OFFSET),省掉 5-10 分钟/块的浪费。
+      建议同时填 cursor_column,否则 chunked 用 LIMIT/OFFSET 在后期 OFFSET 大时重扫开销显著。
+
     Excel 写入引擎(v2.14.3):
       使用 xlsxwriter constant_memory 模式替代 openpyxl write_only。
       性能:典型场景写入速度 3-5x 提升(C 加速字符串处理 + 流式 zip);
@@ -346,6 +811,7 @@ def _run_single_export(
     from backend.config.settings import settings as app_settings
     from backend.services.export_clients.clickhouse import (
         is_ch_timeout_estimate_error,
+        is_ch_too_many_queries_error,
         is_transient_stream_error,
     )
 
@@ -365,8 +831,59 @@ def _run_single_export(
     col_names = [c.name for c in columns]
     col_types = [c.type for c in columns]
 
-    use_chunked = False
+    query_id_prefix = query_id_prefix or f"dataagent_export:{job_id}"
+
+    if output_format in {"csv", "csv_zip"}:
+        return _run_csv_export(
+            job_id=job_id,
+            sql=sql,
+            env=env,
+            conn_type=conn_type,
+            output_path=output_path,
+            output_format=output_format,
+            query_id_prefix=query_id_prefix,
+            on_cancel=on_cancel,
+        )
+
+    if output_format == "xlsx" and xlsx_engine == "csv_staging":
+        tmp_dir = tempfile.mkdtemp(prefix=f"dataagent_xlsx_stage_{job_id}_")
+        try:
+            tmp_csv = str(Path(tmp_dir) / (Path(output_path).stem + ".csv"))
+            csv_result = _stream_sql_to_csv_file(
+                job_id=job_id,
+                sql=sql,
+                env=env,
+                conn_type=conn_type,
+                csv_path=tmp_csv,
+                query_id_prefix=f"{query_id_prefix}:stage",
+                on_cancel=on_cancel,
+                count_rows=False,
+                progress_label=(f"{chunk_label} - CSV??" if chunk_label else "CSV??"),
+            )
+            if csv_result.get("cancelled"):
+                return csv_result
+            _update_job(job_id, current_sheet=(f"{chunk_label} - CSV?XLSX" if chunk_label else "CSV?XLSX"))
+            return _csv_to_xlsx(
+                tmp_csv,
+                output_path,
+                job_id=job_id,
+                sheet_prefix=sheet_prefix,
+                progress_offset=progress_offset,
+                progress_total=progress_total,
+                chunk_label=chunk_label,
+                on_cancel=on_cancel,
+            )
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # v2.14.6: prefer_chunked=True → 跳过单流首试,直接走 chunked 路径
+    use_chunked = bool(prefer_chunked)
     total_sql_chunks = 1
+    if use_chunked:
+        logger.info(
+            "[ExportJob %s] prefer_chunked=True: 跳过单流首试,直接走 %s 路径",
+            job_id, "keyset" if cursor_column else "LIMIT/OFFSET",
+        )
 
     for attempt in range(2):
         if attempt == 1 and not use_chunked:
@@ -407,12 +924,23 @@ def _run_single_export(
                     "(replaces LIMIT/OFFSET for correctness + speed)",
                     job_id, cursor_column,
                 )
-                batch_source = export_client.stream_batches_keyset(
-                    sql,
-                    cursor_column=cursor_column,
-                    batch_size=batch_size,
-                    extra_settings=export_settings,
-                )
+                try:
+                    batch_source = export_client.stream_batches_keyset(
+                        sql,
+                        cursor_column=cursor_column,
+                        batch_size=batch_size,
+                        extra_settings=export_settings,
+                        query_id_prefix=f"{query_id_prefix}:keyset",
+                    )
+                except TypeError as exc:
+                    if "query_id_prefix" not in str(exc):
+                        raise
+                    batch_source = export_client.stream_batches_keyset(
+                        sql,
+                        cursor_column=cursor_column,
+                        batch_size=batch_size,
+                        extra_settings=export_settings,
+                    )
                 # 进度分母对 keyset 不易预先知道,沿用现有进度条逻辑(无 total_sql_chunks)
                 total_sql_chunks = 1
             else:
@@ -437,83 +965,134 @@ def _run_single_export(
                 if update_kw:
                     _update_job(job_id, **update_kw)
 
-                batch_source = export_client.stream_batches_chunked(
+                try:
+                    batch_source = export_client.stream_batches_chunked(
+                        sql,
+                        chunk_size=app_settings.export_chunk_size,
+                        total_rows=total_rows,
+                        batch_size=batch_size,
+                        extra_settings=export_settings,
+                        query_id_prefix=f"{query_id_prefix}:limit_offset",
+                    )
+                except TypeError as exc:
+                    if "query_id_prefix" not in str(exc):
+                        raise
+                    batch_source = export_client.stream_batches_chunked(
+                        sql,
+                        chunk_size=app_settings.export_chunk_size,
+                        total_rows=total_rows,
+                        batch_size=batch_size,
+                        extra_settings=export_settings,
+                    )
+        else:
+            try:
+                batch_source = export_client.stream_batches(
                     sql,
-                    chunk_size=app_settings.export_chunk_size,
-                    total_rows=total_rows,
+                    batch_size=batch_size,
+                    extra_settings=export_settings,
+                    query_id_prefix=f"{query_id_prefix}:stream",
+                )
+            except TypeError as exc:
+                if "query_id_prefix" not in str(exc):
+                    raise
+                batch_source = export_client.stream_batches(
+                    sql,
                     batch_size=batch_size,
                     extra_settings=export_settings,
                 )
-        else:
-            batch_source = export_client.stream_batches(
-                sql, batch_size=batch_size, extra_settings=export_settings,
-            )
 
         try:
-            for batch in batch_source:
-                # 检查取消
-                cancelled = (on_cancel and on_cancel()) or _is_cancelling(job_id)
-                if cancelled:
-                    logger.info(
-                        "[ExportJob %s] Cancelled mid-export after %d rows.",
-                        job_id, exported_rows,
-                    )
-                    # xlsxwriter:close() 把已写部分落盘(封 zip)
-                    try:
-                        wb.close()
-                    except Exception:
-                        pass
-                    return {
-                        "exported_rows": exported_rows,
-                        "total_sheets": sheet_num,
-                        "done_batches": done_batches,
-                        "total_sql_chunks": total_sql_chunks if use_chunked else None,
-                        "file_size": (
-                            Path(output_path).stat().st_size
-                            if Path(output_path).exists() else 0
-                        ),
-                        "cancelled": True,
-                    }
+            max_too_many_retry = int(os.getenv("EXPORT_TOO_MANY_RETRY_MAX", "5"))
+            too_many_attempt = 0
+            while True:
+                try:
+                    with _get_export_query_semaphore(env):
+                        for batch in batch_source:
+                            # 检查取消
+                            cancelled = (on_cancel and on_cancel()) or _is_cancelling(job_id)
+                            if cancelled:
+                                logger.info(
+                                    "[ExportJob %s] Cancelled mid-export after %d rows.",
+                                    job_id, exported_rows,
+                                )
+                                # xlsxwriter:close() 把已写部分落盘(封 zip)
+                                try:
+                                    wb.close()
+                                except Exception:
+                                    pass
+                                return {
+                                    "exported_rows": exported_rows,
+                                    "total_sheets": sheet_num,
+                                    "done_batches": done_batches,
+                                    "total_sql_chunks": total_sql_chunks if use_chunked else None,
+                                    "file_size": (
+                                        Path(output_path).stat().st_size
+                                        if Path(output_path).exists() else 0
+                                    ),
+                                    "cancelled": True,
+                                }
 
-                for row in batch:
-                    if sheet_row_count >= MAX_ROWS_PER_SHEET:
-                        sheet_num += 1
-                        ws = wb.add_worksheet(f"{sheet_prefix}{sheet_num}")
-                        ws.write_row(0, 0, col_names)
-                        cur_row = 1
-                        sheet_row_count = 0
-                        _update_job(job_id, current_sheet=_format_sheet_label(sheet_num))
+                            for row in batch:
+                                if sheet_row_count >= MAX_ROWS_PER_SHEET:
+                                    sheet_num += 1
+                                    ws = wb.add_worksheet(f"{sheet_prefix}{sheet_num}")
+                                    ws.write_row(0, 0, col_names)
+                                    cur_row = 1
+                                    sheet_row_count = 0
+                                    _update_job(job_id, current_sheet=_format_sheet_label(sheet_num))
 
-                    formatted = [_format_cell(v, col_types[i]) for i, v in enumerate(row)]
-                    ws.write_row(cur_row, 0, formatted)
-                    cur_row += 1
-                    sheet_row_count += 1
-                    exported_rows += 1
+                                formatted = [_format_cell(v, col_types[i]) for i, v in enumerate(row)]
+                                ws.write_row(cur_row, 0, formatted)
+                                cur_row += 1
+                                sheet_row_count += 1
+                                exported_rows += 1
 
-                done_batches += 1
+                            done_batches += 1
 
-                if done_batches % PROGRESS_UPDATE_EVERY == 0:
-                    if progress_total is None:
-                        # 单文件模式：本函数全权管理进度字段
-                        if use_chunked:
-                            _update_job(
-                                job_id,
-                                exported_rows=exported_rows,
-                                done_batches=exported_rows // app_settings.export_chunk_size,
-                                total_batches=total_sql_chunks,
-                            )
-                        else:
-                            _update_job(
-                                job_id,
-                                exported_rows=exported_rows,
-                                done_batches=done_batches,
-                            )
-                    else:
-                        # 分块模式由父循环更新 done_batches；此处仅累加 exported_rows
-                        _update_job(
-                            job_id,
-                            exported_rows=progress_offset + exported_rows,
+                            if done_batches % PROGRESS_UPDATE_EVERY == 0:
+                                if progress_total is None:
+                                    # 单文件模式：本函数全权管理进度字段
+                                    if use_chunked:
+                                        _update_job(
+                                            job_id,
+                                            exported_rows=exported_rows,
+                                            done_batches=exported_rows // app_settings.export_chunk_size,
+                                            total_batches=total_sql_chunks,
+                                        )
+                                    else:
+                                        _update_job(
+                                            job_id,
+                                            exported_rows=exported_rows,
+                                            done_batches=done_batches,
+                                        )
+                                else:
+                                    # 分块模式由父循环更新 done_batches；此处仅累加 exported_rows
+                                    _update_job(
+                                        job_id,
+                                        exported_rows=progress_offset + exported_rows,
+                                    )
+                    break
+                except Exception as exc:
+                    if is_ch_too_many_queries_error(exc) and too_many_attempt < max_too_many_retry:
+                        too_many_attempt += 1
+                        sleep_s = min(60, int(os.getenv("EXPORT_TOO_MANY_RETRY_BACKOFF", "10")) * too_many_attempt)
+                        logger.warning(
+                            "[ExportJob %s] ClickHouse too many simultaneous queries, retry whole window in %ss "
+                            "(attempt %d/%d): %s",
+                            job_id, sleep_s, too_many_attempt, max_too_many_retry, exc,
                         )
+                        try:
+                            wb.close()
+                        except Exception:
+                            pass
+                        try:
+                            os.unlink(output_path)
+                        except Exception:
+                            pass
+                        time.sleep(sleep_s)
+                        # 重新抛给外层自动分裂更安全：避免同一个 xlsxwriter workbook 续写复杂性。
+                        raise
+                    raise
 
             wb.close()
             file_size = Path(output_path).stat().st_size
@@ -651,6 +1230,53 @@ def _mark_cancelled(job_id: str, exported: int = 0, done_b: int = 0, sheets: int
     )
 
 
+def _mark_partial_failed(
+    job_id: str,
+    summary: str,
+    exported: int,
+    done_b: int,
+    total_b: Optional[int],
+    sheets: int,
+    file_size: int,
+) -> None:
+    """v2.14.7:partial_failed 终态 — 部分块成功 + 部分块失败。"""
+    update_kw: Dict[str, Any] = dict(
+        status="partial_failed",
+        finished_at=datetime.utcnow(),
+        exported_rows=exported,
+        done_batches=done_b,
+        total_sheets=sheets,
+        file_size=file_size,
+        error_message=summary,
+    )
+    if total_b is not None:
+        update_kw["total_batches"] = total_b
+    _update_job(job_id, **update_kw)
+
+
+def _build_failure_summary(
+    failed_summaries: List[Dict[str, Any]],
+    *,
+    total_chunks: int,
+) -> str:
+    """格式化失败块明细成单行 summary,塞进 error_message。"""
+    n_failed = len(failed_summaries)
+    if n_failed == 0:
+        return ""
+    parts: List[str] = []
+    for f in failed_summaries[:5]:  # 最多列 5 个,余下用 ... 省略
+        idx = f.get("index", "?")
+        s, e = f.get("date_start", "?"), f.get("date_end", "?")
+        err = (f.get("error") or "未知错误")[:160]
+        parts.append(f"块 {idx + 1 if isinstance(idx, int) else idx} ({s}~{e}): {err}")
+    extra = "" if n_failed <= 5 else f" ... 共 {n_failed} 个失败块,仅列前 5 个"
+    return (
+        f"{total_chunks} 块中 {n_failed} 块失败:\n"
+        + "\n".join(parts)
+        + extra
+    )
+
+
 def _mark_completed(
     job_id: str,
     exported: int,
@@ -690,6 +1316,11 @@ def _run_single_job_sync(job_id: str, config: Dict[str, Any]) -> None:
     conn_type = config.get("connection_type", "clickhouse")
     batch_size = config.get("batch_size", DEFAULT_BATCH_SIZE)
     output_path = config["output_path"]
+    output_format = config.get("output_format", "xlsx")
+    xlsx_engine = config.get("xlsx_engine", "direct")
+    # v2.14.6: 单文件模式仅由 env var 控制(无 chunk_config 路径);chunked 模式还可
+    # 从 chunk_config.prefer_chunked 单独覆盖。
+    prefer_chunked = os.getenv("EXPORT_PREFER_CHUNKED", "0") == "1"
 
     if not _mark_running(job_id):
         return
@@ -704,11 +1335,36 @@ def _run_single_job_sync(job_id: str, config: Dict[str, Any]) -> None:
         _mark_failed(job_id, msg)
         return
 
+    from backend.services.export_clients.clickhouse import is_ch_too_many_queries_error
+
     try:
-        result = _run_single_export(
-            job_id=job_id, sql=sql, env=env, conn_type=conn_type,
-            batch_size=batch_size, output_path=output_path,
-        )
+        max_too_many_retry = int(os.getenv("EXPORT_TOO_MANY_RETRY_MAX", "5"))
+        for attempt in range(max_too_many_retry + 1):
+            try:
+                result = _run_single_export(
+                    job_id=job_id, sql=sql, env=env, conn_type=conn_type,
+                    batch_size=batch_size, output_path=output_path,
+                    output_format=output_format,
+                    xlsx_engine=xlsx_engine,
+                    query_id_prefix=f"dataagent_export:{job_id}:single:{attempt}",
+                    prefer_chunked=prefer_chunked,
+                )
+                break
+            except Exception as exc:
+                if is_ch_too_many_queries_error(exc) and attempt < max_too_many_retry:
+                    sleep_s = min(60, int(os.getenv("EXPORT_TOO_MANY_RETRY_BACKOFF", "10")) * (attempt + 1))
+                    logger.warning(
+                        "[ExportJob %s] Too many simultaneous queries, retry single export in %ss "
+                        "(attempt %d/%d): %s",
+                        job_id, sleep_s, attempt + 1, max_too_many_retry, exc,
+                    )
+                    try:
+                        os.unlink(output_path)
+                    except Exception:
+                        pass
+                    time.sleep(sleep_s)
+                    continue
+                raise
     except Exception as exc:
         msg = f"导出执行失败：{_humanize_error(exc)}"
         logger.error("[ExportJob %s] %s", job_id, msg, exc_info=True)
@@ -781,6 +1437,14 @@ def _run_chunked_export_sync(job_id: str, config: Dict[str, Any]) -> None:
     # 重试前的退避(秒):attempt 1 → 5s, attempt 2 → 10s …,上限 30s。
     INPLACE_RETRY_BACKOFF_BASE = 5
     INPLACE_RETRY_BACKOFF_MAX = 30
+    # v2.14.7:某块用尽所有重试 + 分裂仍失败时的行为开关。
+    # 默认(="0"):继续跑剩余块,Job 终态 partial_failed(若至少 1 块成功)或 failed(全失败)。
+    # opt-in 设为 "1":恢复老行为(整 Job 立即 failed),用于需要"全有或全无"语义的环境。
+    FAIL_FAST_ON_CHUNK_ERROR = (
+        os.getenv("EXPORT_FAIL_FAST_ON_CHUNK_ERROR", "0") == "1"
+    )
+    # 跨块累积失败记录,用于 partial_failed 终态生成 error_message
+    failed_chunks_summary: List[Dict[str, Any]] = []
 
     def _parse_iso_endpoint(s: str):
         """ISO 字符串 → date 或 datetime。datetime 形如 'YYYY-MM-DDTHH:MM:SS' 含 'T'。"""
@@ -804,6 +1468,12 @@ def _run_chunked_export_sync(job_id: str, config: Dict[str, Any]) -> None:
     output_dir = Path(config["output_dir"])
     job_name = config.get("job_name") or "export"
     raw_chunk_cfg = config["chunk_config"]
+    output_format = config.get("output_format", "xlsx")
+    xlsx_engine = config.get("xlsx_engine", "auto")
+    if xlsx_engine == "auto":
+        # 分块/大数据导出默认使用 CSV staging：ClickHouse 连接只负责快速落盘，
+        # 后续本地转换 XLSX，避免客户端 XLSX 写入慢拖长远端查询连接。
+        xlsx_engine = "csv_staging" if output_format == "xlsx" else "direct"
 
     if not _mark_running(job_id):
         return
@@ -817,6 +1487,21 @@ def _run_chunked_export_sync(job_id: str, config: Dict[str, Any]) -> None:
         logger.error("[ExportJob %s] %s", job_id, msg)
         _mark_failed(job_id, msg)
         return
+
+    # v2.14.6: 解析 prefer_chunked
+    #   ncfg.prefer_chunked is not None → 显式覆盖
+    #   None                            → 用环境变量 EXPORT_PREFER_CHUNKED 全局默认
+    prefer_chunked = (
+        ncfg.prefer_chunked
+        if ncfg.prefer_chunked is not None
+        else os.getenv("EXPORT_PREFER_CHUNKED", "0") == "1"
+    )
+    if prefer_chunked:
+        logger.info(
+            "[ExportJob %s] chunked + prefer_chunked=True:跳过每块单流首试,"
+            "直接走 %s",
+            job_id, "keyset" if ncfg.cursor_column else "LIMIT/OFFSET",
+        )
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -835,8 +1520,10 @@ def _run_chunked_export_sync(job_id: str, config: Dict[str, Any]) -> None:
         return
 
     # 初始化清单（以 list 形式，索引可变，支持中途插入子块）
+    extension = "csv" if output_format in {"csv", "csv_zip"} else "xlsx"
+
     def _make_entry(start_d, end_d, depth: int = 0) -> Dict[str, Any]:
-        fn = build_chunk_filename(job_name, start_d, end_d)
+        fn = build_chunk_filename(job_name, start_d, end_d, extension=extension)
         return {
             "index": -1,  # 动态分配（subdivision 时会重排）
             "date_start": start_d.isoformat(),
@@ -851,8 +1538,131 @@ def _run_chunked_export_sync(job_id: str, config: Dict[str, Any]) -> None:
             "_retry_count": 0,  # Task D:在原位的重试次数(达到上限才考虑分裂)
         }
 
+    def _duration_seconds(start_v, end_v) -> int:
+        if isinstance(start_v, datetime):
+            return int((end_v - start_v).total_seconds() + 1)
+        return int(((end_v - start_v).days + 1) * 86400)
+
+    def _fetch_auto_bucket_rows(count_sql: str) -> List[Tuple[Any, Any]]:
+        from backend.config.settings import settings as app_settings
+        from backend.services.export_clients.clickhouse import is_ch_too_many_queries_error
+
+        rows: List[Tuple[Any, Any]] = []
+        max_retry = int(os.getenv("EXPORT_TOO_MANY_RETRY_MAX", "5"))
+        base_sleep = int(os.getenv("EXPORT_TOO_MANY_RETRY_BACKOFF", "10"))
+        for attempt in range(max_retry + 1):
+            try:
+                with _get_export_query_semaphore(env):
+                    for batch in client.stream_batches(
+                        count_sql,
+                        batch_size=10_000,
+                        extra_settings={
+                            "max_execution_time": app_settings.export_query_max_execution_time,
+                        },
+                        query_id_prefix=f"dataagent_export:{job_id}:auto_pre_split",
+                    ):
+                        rows.extend(batch)
+                return rows
+            except Exception as exc:
+                if is_ch_too_many_queries_error(exc) and attempt < max_retry:
+                    sleep_s = min(60, base_sleep * (attempt + 1))
+                    logger.warning(
+                        "[ExportJob %s] Auto pre-split count hit ClickHouse too many queries, "
+                        "retry in %ss (attempt %d/%d): %s",
+                        job_id, sleep_s, attempt + 1, max_retry, exc,
+                    )
+                    if _sleep_with_cancel_check(sleep_s):
+                        raise RuntimeError("任务已取消")
+                    continue
+                raise
+        return rows
+
+    def _pre_split_ranges(start_v, end_v) -> List[Tuple[Any, Any]]:
+        raw_hours = raw_chunk_cfg.get("pre_split_hours") if isinstance(raw_chunk_cfg, dict) else None
+        if _is_auto_pre_split(raw_hours):
+            if ncfg.min_subdivide_unit not in ("hour", "minute"):
+                raise ValueError("pre_split_hours='auto' 仅在最小再细分粒度为 hour/minute 时可用")
+            auto_col = (
+                raw_chunk_cfg.get("auto_split_column")
+                or raw_chunk_cfg.get("pre_split_time_column")
+                or ncfg.date_column
+            )
+            auto_col = _validate_auto_split_column(auto_col or "")
+            try:
+                target_rows = int(raw_chunk_cfg.get("auto_split_target_rows") or MAX_ROWS_PER_SHEET)
+            except Exception:
+                target_rows = MAX_ROWS_PER_SHEET
+            target_rows = max(1, target_rows)
+
+            filtered_sql, _ = inject_date_filter(sql, ncfg.date_column, start_v, end_v)
+            count_sql = _build_auto_pre_split_count_sql(
+                filtered_sql,
+                time_column=auto_col,
+                unit=ncfg.min_subdivide_unit,
+            )
+            _update_job(
+                job_id,
+                current_sheet=(
+                    f"自动预分窗口统计中（{start_v}~{end_v}, "
+                    f"{ncfg.min_subdivide_unit}, target={target_rows:,} 行）"
+                ),
+            )
+            bucket_rows = _fetch_auto_bucket_rows(count_sql)
+            windows = _auto_bucket_rows_to_windows(
+                bucket_rows,
+                unit=ncfg.min_subdivide_unit,
+                target_rows=target_rows,
+            )
+            if not windows:
+                # auto 模式：本块整段范围都没有数据 → 不生成空文件(避免「仅表头」XLSX)。
+                # 上层 _pre_split_ranges 返回 [] 后,output_files 不会为这个 chunk
+                # 添加 entry;多 chunk 拼接时也只对应当前 chunk 跳过,其他 chunk 不受影响。
+                # 整个 Job 所有 chunk 都为空 → output_files=[] → _mark_completed(0,0,0,0,0),
+                # 调用方在前端看到 0 文件即可识别「无数据」。
+                logger.info(
+                    "[ExportJob %s] Auto pre-split: %s~%s 无数据,跳过该范围不生成文件",
+                    job_id, start_v, end_v,
+                )
+                return []
+            logger.info(
+                "[ExportJob %s] Auto pre-split %s~%s by %s counts: %d bucket(s) -> %d window(s), "
+                "target_rows=%d",
+                job_id, start_v, end_v, ncfg.min_subdivide_unit,
+                len(bucket_rows), len(windows), target_rows,
+            )
+            return [(s, e) for s, e, _rows in windows]
+
+        if raw_hours is None:
+            raw_hours = os.getenv("EXPORT_PRE_SPLIT_HOURS")
+        if raw_hours in (None, "", 0, "0"):
+            # 默认:只有用户启用 hour/minute 级再细分时，预拆成 6h 窗口，直接减少 5 分钟断流试错成本。
+            raw_hours = 6 if ncfg.min_subdivide_unit in ("hour", "minute") else 0
+        try:
+            max_seconds = int(float(raw_hours) * 3600)
+        except Exception:
+            max_seconds = 0
+        if max_seconds <= 0:
+            return [(start_v, end_v)]
+        pending = [(start_v, end_v)]
+        out: List[Tuple[Any, Any]] = []
+        while pending:
+            s, e = pending.pop(0)
+            if _duration_seconds(s, e) <= max_seconds:
+                out.append((s, e))
+                continue
+            subs = subdivide_range(s, e, min_unit=ncfg.min_subdivide_unit)
+            if len(subs) <= 1:
+                out.append((s, e))
+            else:
+                pending = list(subs) + pending
+        return out
+
+    initial_ranges: List[Tuple[Any, Any]] = []
+    for c in chunks:
+        initial_ranges.extend(_pre_split_ranges(c.start, c.end))
+
     output_files: List[Dict[str, Any]] = [
-        _make_entry(c.start, c.end) for c in chunks
+        _make_entry(s, e) for s, e in initial_ranges
     ]
     # 重排索引
     for i, entry in enumerate(output_files):
@@ -925,10 +1735,49 @@ def _run_chunked_export_sync(job_id: str, config: Dict[str, Any]) -> None:
                 progress_total=len(output_files),
                 chunk_label=chunk_label,
                 cursor_column=ncfg.cursor_column,
+                output_format=("csv" if output_format == "csv_zip" else output_format),
+                xlsx_engine=xlsx_engine,
+                query_id_prefix=f"dataagent_export:{job_id}:chunk:{cur_idx}",
+                prefer_chunked=prefer_chunked,
             )
         except Exception as exc:
             # ── 自动日期再细分（v2.13 + v2.14 sub-day + Task D in-place retry）─
             # 触发条件：流式断开 / Code 160 / 且仍有可分裂空间 / 未达递归上限
+            is_too_many = (
+                "TOO_MANY_SIMULTANEOUS_QUERIES" in str(exc)
+                or "Too many simultaneous queries" in str(exc)
+                or "Code: 202" in str(exc)
+            )
+            if is_too_many:
+                max_tm = int(os.getenv("EXPORT_TOO_MANY_RETRY_MAX", "5"))
+                cur_tm = entry.get("_too_many_retry_count", 0)
+                if cur_tm < max_tm:
+                    entry["_too_many_retry_count"] = cur_tm + 1
+                    backoff = min(
+                        60,
+                        int(os.getenv("EXPORT_TOO_MANY_RETRY_BACKOFF", "10")) * (cur_tm + 1),
+                    )
+                    logger.warning(
+                        "[ExportJob %s] Chunk %d (%s~%s) hit ClickHouse too many queries, "
+                        "%ds 后重试 (attempt %d/%d)",
+                        job_id, cur_idx + 1, chunk_start, chunk_end,
+                        backoff, cur_tm + 1, max_tm,
+                    )
+                    try:
+                        os.unlink(chunk_path)
+                    except Exception:
+                        pass
+                    entry["status"] = "pending"
+                    _update_job(job_id, output_files=list(output_files))
+                    if _sleep_with_cancel_check(backoff):
+                        _mark_cancelled(
+                            job_id, exported=cumulative_rows,
+                            done_b=completed_count, sheets=cumulative_sheets,
+                        )
+                        _update_job(job_id, output_files=list(output_files))
+                        return
+                    continue
+
             is_retryable = (
                 is_transient_stream_error(exc)
                 or is_ch_timeout_estimate_error(exc)
@@ -1016,20 +1865,44 @@ def _run_chunked_export_sync(job_id: str, config: Dict[str, Any]) -> None:
                 # 不前进 cur_idx，下次循环执行第一个子块
                 continue
 
-            # 不可重试 / 不可再分 → 整个 Job 失败
+            # 不可重试 / 不可再分 → 老行为是整 Job failed;v2.14.7 起默认改成
+            # 「跳过这块继续做剩下」,job 终态在 while 退出后按计数判定 partial_failed/failed/completed。
+            err_msg = _humanize_error(exc)
             msg = (
                 f"块 {cur_idx + 1}/{len(output_files)} "
-                f"({chunk_start}~{chunk_end}) 执行失败：{_humanize_error(exc)}"
+                f"({chunk_start}~{chunk_end}) 执行失败：{err_msg}"
             )
             logger.error("[ExportJob %s] %s", job_id, msg, exc_info=True)
             entry["status"] = "failed"
-            _mark_failed(
-                job_id, msg,
-                exported=cumulative_rows,
-                done_b=completed_count,
-            )
+            entry["error_summary"] = err_msg[:200]
+            failed_chunks_summary.append({
+                "index": entry["index"],
+                "date_start": entry["date_start"],
+                "date_end": entry["date_end"],
+                "error": err_msg[:200],
+            })
+            # 清理可能写出的部分文件,避免下载时下到半残 xlsx
+            try:
+                os.unlink(chunk_path)
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+
+            if FAIL_FAST_ON_CHUNK_ERROR:
+                # opt-in 老行为:立即整 Job failed
+                _mark_failed(
+                    job_id, msg,
+                    exported=cumulative_rows,
+                    done_b=completed_count,
+                )
+                _update_job(job_id, output_files=list(output_files))
+                return
+
+            # v2.14.7 默认:跳过此块继续做下一个
             _update_job(job_id, output_files=list(output_files))
-            return
+            cur_idx += 1
+            continue
 
         chunk_size_bytes = (
             Path(chunk_path).stat().st_size
@@ -1074,22 +1947,70 @@ def _run_chunked_export_sync(job_id: str, config: Dict[str, Any]) -> None:
         )
         cur_idx += 1
 
-    # 全部完成
-    total_size = sum(
-        (f.get("file_size") or 0) for f in output_files
-    )
-    _mark_completed(
-        job_id,
-        exported=cumulative_rows,
-        done_b=len(output_files),
-        total_b=len(output_files),
-        sheets=cumulative_sheets,
-        file_size=total_size,
-    )
-    _update_job(job_id, output_files=list(output_files))
-    logger.info(
-        "[ExportJob %s] Chunked export completed: %d files, %d rows total, %.1f MB"
-        " (含自动分裂的子块: %d)",
-        job_id, len(output_files), cumulative_rows, total_size / 1024 / 1024,
-        sum(1 for f in output_files if f.get("_depth", 0) > 0),
-    )
+    # 全部块跑完(成功 + 失败混合都算)。v2.14.7 起按计数判定终态。
+    n_completed = sum(1 for f in output_files if f.get("status") == "completed")
+    n_failed = sum(1 for f in output_files if f.get("status") == "failed")
+
+    total_size = sum((f.get("file_size") or 0) for f in output_files)
+    if output_format == "csv_zip":
+        # 仅打包已成功的块;partial_failed 时文件名前缀 partial_ 提醒不完整
+        zip_path = config.get("zip_output_path") or str(output_dir.with_suffix(".zip"))
+        zip_name = config.get("zip_output_filename") or Path(zip_path).name
+        if n_failed > 0 and n_completed > 0:
+            zp = Path(zip_path)
+            zip_path = str(zp.with_name(f"partial_{zp.name}"))
+            zip_name = f"partial_{zip_name}"
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            for f in output_files:
+                if f.get("status") == "completed" and f.get("file_path") and Path(f["file_path"]).exists():
+                    zf.write(f["file_path"], arcname=f.get("filename") or Path(f["file_path"]).name)
+        total_size = Path(zip_path).stat().st_size
+        _update_job(job_id, file_path=zip_path, output_filename=zip_name)
+
+    if n_failed == 0:
+        # 老行为:全成功
+        _mark_completed(
+            job_id,
+            exported=cumulative_rows,
+            done_b=len(output_files),
+            total_b=len(output_files),
+            sheets=cumulative_sheets,
+            file_size=total_size,
+        )
+        _update_job(job_id, output_files=list(output_files))
+        logger.info(
+            "[ExportJob %s] Chunked export completed: %d files, %d rows total, %.1f MB"
+            " (含自动分裂的子块: %d)",
+            job_id, len(output_files), cumulative_rows, total_size / 1024 / 1024,
+            sum(1 for f in output_files if f.get("_depth", 0) > 0),
+        )
+    elif n_completed == 0:
+        # 全部失败 → 老 failed 终态
+        summary = _build_failure_summary(failed_chunks_summary, total_chunks=len(output_files))
+        _mark_failed(
+            job_id, summary or "全部块均失败",
+            exported=cumulative_rows,
+            done_b=completed_count,
+        )
+        _update_job(job_id, output_files=list(output_files))
+        logger.error(
+            "[ExportJob %s] Chunked export failed: 全部 %d 块失败",
+            job_id, len(output_files),
+        )
+    else:
+        # partial_failed:部分成功 + 部分失败
+        summary = _build_failure_summary(failed_chunks_summary, total_chunks=len(output_files))
+        _mark_partial_failed(
+            job_id,
+            summary=summary,
+            exported=cumulative_rows,
+            done_b=completed_count,
+            total_b=len(output_files),
+            sheets=cumulative_sheets,
+            file_size=total_size,
+        )
+        _update_job(job_id, output_files=list(output_files))
+        logger.warning(
+            "[ExportJob %s] Chunked export partial_failed: %d/%d 块成功, %d 块失败",
+            job_id, n_completed, len(output_files), n_failed,
+        )

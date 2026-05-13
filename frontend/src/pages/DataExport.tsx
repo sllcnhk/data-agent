@@ -27,6 +27,7 @@ import {
   Select,
   Space,
   Spin,
+  Switch,
   Table,
   Tag,
   Tooltip,
@@ -38,6 +39,7 @@ import {
   CloseCircleOutlined,
   DeleteOutlined,
   DownloadOutlined,
+  ExclamationCircleOutlined,
   ExportOutlined,
   FileExcelOutlined,
   LoadingOutlined,
@@ -66,12 +68,14 @@ const ACTIVE_STATUSES = new Set(['pending', 'running', 'cancelling']);
 
 // 状态标签配置
 const STATUS_TAG: Record<string, { color: string; icon: React.ReactNode; label: string }> = {
-  pending:    { color: 'default',   icon: <SyncOutlined spin />,       label: '等待中' },
-  running:    { color: 'processing', icon: <LoadingOutlined spin />,   label: '导出中' },
-  completed:  { color: 'success',   icon: <CheckCircleOutlined />,     label: '已完成' },
-  failed:     { color: 'error',     icon: <CloseCircleOutlined />,     label: '失败' },
-  cancelling: { color: 'warning',   icon: <SyncOutlined spin />,       label: '取消中' },
-  cancelled:  { color: 'default',   icon: <StopOutlined />,            label: '已取消' },
+  pending:        { color: 'default',   icon: <SyncOutlined spin />,            label: '等待中' },
+  running:        { color: 'processing', icon: <LoadingOutlined spin />,        label: '导出中' },
+  completed:      { color: 'success',   icon: <CheckCircleOutlined />,          label: '已完成' },
+  failed:         { color: 'error',     icon: <CloseCircleOutlined />,          label: '失败' },
+  // v2.14.7: 分块模式部分成功 — 按 completed 等同对待(允许下载已成功块)
+  partial_failed: { color: 'orange',    icon: <ExclamationCircleOutlined />,    label: '部分完成' },
+  cancelling:     { color: 'warning',   icon: <SyncOutlined spin />,            label: '取消中' },
+  cancelled:      { color: 'default',   icon: <StopOutlined />,                 label: '已取消' },
 };
 
 function StatusTag({ status }: { status: string }) {
@@ -342,6 +346,13 @@ const DataExport: React.FC = () => {
           chunk_days: values.chunk_days || 10,
           min_subdivide_unit: values.min_subdivide_unit || 'day',
           cursor_column: values.cursor_column?.trim() || null,
+          pre_split_hours:
+            values.pre_split_mode === 'auto'
+              ? 'auto'
+              : (values.pre_split_hours || null),
+          auto_split_column: values.auto_split_column?.trim() || null,
+          auto_split_target_rows: values.auto_split_target_rows || null,
+          prefer_chunked: values.prefer_chunked ?? null,
         };
       }
       const result = await dataExportApi.executeExport({
@@ -349,6 +360,8 @@ const DataExport: React.FC = () => {
         connection_env: selectedEnv,
         job_name: values.job_name || '',
         batch_size: values.batch_size || 50000,
+        output_format: values.output_format || 'xlsx',
+        xlsx_engine: values.xlsx_engine || 'auto',
         chunk_config,
       });
       message.success(
@@ -486,6 +499,28 @@ const DataExport: React.FC = () => {
             </Text>
           );
         }
+        if (r.status === 'partial_failed') {
+          // v2.14.7: 部分成功 — 显示已导出行数 + 查看详情按钮
+          const okCount = r.output_files?.filter((f) => f.status === 'completed').length ?? 0;
+          const totalCount = r.output_files?.length ?? 0;
+          return (
+            <Space direction="vertical" size={0} style={{ width: '100%' }}>
+              <Button
+                type="link"
+                size="small"
+                style={{ padding: 0, height: 'auto', textAlign: 'left', color: '#fa8c16' }}
+                onClick={() => setErrorModalJob(r)}
+              >
+                <Text style={{ color: '#fa8c16' }}>
+                  部分完成 · {okCount}/{totalCount} 块 · 查看详情
+                </Text>
+              </Button>
+              <Text type="secondary" style={{ fontSize: 11 }}>
+                已导出 {r.exported_rows?.toLocaleString() ?? 0} 行
+              </Text>
+            </Space>
+          );
+        }
         if (r.status === 'failed') {
           return (
             <Space direction="vertical" size={0} style={{ width: '100%' }}>
@@ -572,12 +607,41 @@ const DataExport: React.FC = () => {
               />
             </Tooltip>
           )}
-          {r.status === 'completed' && r.export_mode === 'date_chunked' && (
-            <Tooltip title="展开行查看分块文件下载">
-              <Tag color="blue" icon={<FileExcelOutlined />}>
-                {r.output_files?.filter((f) => f.status === 'completed').length ?? 0} 个文件
-              </Tag>
-            </Tooltip>
+          {(r.status === 'completed' || r.status === 'partial_failed')
+            && r.export_mode === 'date_chunked' && (
+            r.output_format === 'csv_zip' ? (
+              <Tooltip title={
+                downloadingIds.has(r.job_id)
+                  ? '下载中…'
+                  : r.status === 'partial_failed'
+                    ? '下载 CSV ZIP (部分块,文件名含 partial_ 前缀)'
+                    : '下载 CSV ZIP'
+              }>
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<DownloadOutlined />}
+                  loading={downloadingIds.has(r.job_id)}
+                  onClick={() => handleDownload(r)}
+                />
+              </Tooltip>
+            ) : (
+              <Tooltip title={
+                r.status === 'partial_failed'
+                  ? '展开行查看可下载块(部分块成功)'
+                  : '展开行查看分块文件下载'
+              }>
+                <Tag
+                  color={r.status === 'partial_failed' ? 'orange' : 'blue'}
+                  icon={<FileExcelOutlined />}
+                >
+                  {r.output_files?.filter((f) => f.status === 'completed').length ?? 0}
+                  {r.status === 'partial_failed'
+                    ? ` / ${r.output_files?.length ?? 0} 块可下载`
+                    : ' 个文件'}
+                </Tag>
+              </Tooltip>
+            )
           )}
           {(r.status === 'pending' || r.status === 'running') && (
             <Popconfirm
@@ -743,9 +807,11 @@ const DataExport: React.FC = () => {
               onClick={() => {
                 exportForm.resetFields();
                 exportForm.setFieldsValue({
-                  export_mode: 'single',
-                  job_name: '',
-                  batch_size: 50000,
+            export_mode: 'single',
+            output_format: 'xlsx',
+            xlsx_engine: 'auto',
+            job_name: '',
+            batch_size: 50000,
                   chunk_days: 10,
                 });
                 setExportModalOpen(true);
@@ -834,6 +900,8 @@ const DataExport: React.FC = () => {
           layout="vertical"
           initialValues={{
             export_mode: 'single',
+            output_format: 'xlsx',
+            xlsx_engine: 'auto',
             chunk_days: 10,
             batch_size: 50000,
           }}
@@ -843,6 +911,41 @@ const DataExport: React.FC = () => {
               <Radio.Button value="single">单文件</Radio.Button>
               <Radio.Button value="date_chunked">按日期分块（多文件）</Radio.Button>
             </Radio.Group>
+          </Form.Item>
+
+          <Form.Item
+            name="output_format"
+            label="输出格式"
+            extra="CSV/CSV ZIP 为极速导出；XLSX 支持自动分 Sheet。分块 + CSV ZIP 会把全部 CSV 子文件打包为一个 ZIP 下载。"
+          >
+            <Radio.Group>
+              <Radio.Button value="xlsx">Excel (.xlsx)</Radio.Button>
+              <Radio.Button value="csv">CSV</Radio.Button>
+              <Radio.Button value="csv_zip">CSV ZIP</Radio.Button>
+            </Radio.Group>
+          </Form.Item>
+
+          <Form.Item
+            noStyle
+            shouldUpdate={(prev, cur) => prev.output_format !== cur.output_format}
+          >
+            {({ getFieldValue }) =>
+              getFieldValue('output_format') === 'xlsx' ? (
+                <Form.Item
+                  name="xlsx_engine"
+                  label="XLSX 写入策略"
+                  extra="auto：系统判断。分块/大数据默认先极速落 CSV 临时文件，再本地转 XLSX，减少远端查询连接占用；小任务可直接写 XLSX。"
+                >
+                  <Select
+                    options={[
+                      { value: 'auto', label: '自动（推荐）' },
+                      { value: 'csv_staging', label: 'CSV 临时落盘后转 XLSX（更稳）' },
+                      { value: 'direct', label: '直接写 XLSX（少中间文件）' },
+                    ]}
+                  />
+                </Form.Item>
+              ) : null
+            }
           </Form.Item>
 
           <Form.Item
@@ -914,7 +1017,89 @@ const DataExport: React.FC = () => {
                       ]}
                       placeholder="天（默认）"
                       style={{ width: '100%' }}
+                      onChange={(val: string | undefined) => {
+                        if (val !== 'hour' && val !== 'minute') {
+                          exportForm.setFieldsValue({
+                            pre_split_mode: undefined,
+                            auto_split_target_rows: undefined,
+                            auto_split_column: undefined,
+                          });
+                        }
+                      }}
                     />
+                  </Form.Item>
+                  <Form.Item
+                    noStyle
+                    shouldUpdate={(prev, cur) =>
+                      prev.min_subdivide_unit !== cur.min_subdivide_unit
+                      || prev.pre_split_mode !== cur.pre_split_mode
+                    }
+                  >
+                    {({ getFieldValue }) => {
+                      const unit = getFieldValue('min_subdivide_unit');
+                      const showAutoOption = unit === 'hour' || unit === 'minute';
+                      const mode = getFieldValue('pre_split_mode');
+                      return (
+                        <>
+                          {showAutoOption && (
+                            <Form.Item
+                              name="pre_split_mode"
+                              label="预分裂模式"
+                              extra='自动模式：先统计每时段行数，按目标行数自动切分窗口，无需手动设定小时数'
+                            >
+                              <Select
+                                allowClear
+                                placeholder="留空默认 6 小时"
+                                style={{ width: '100%' }}
+                                options={[
+                                  { value: 'fixed', label: '固定小时数' },
+                                  { value: 'auto', label: '自动（按数据量）' },
+                                ]}
+                              />
+                            </Form.Item>
+                          )}
+                          {(!showAutoOption || mode === 'fixed') && (
+                            <Form.Item
+                              name="pre_split_hours"
+                              label="预分裂窗口（小时）"
+                              extra={
+                                showAutoOption
+                                  ? '每个预分裂窗口的小时数（1-24），留空默认 6 小时'
+                                  : '启用小时/分钟级再细分时，留空默认 6 小时。提前拆小块，减少先跑大块约 5 分钟后断流再重试的浪费。'
+                              }
+                            >
+                              <InputNumber min={1} max={24} step={1} placeholder="默认 6" style={{ width: '100%' }} />
+                            </Form.Item>
+                          )}
+                          {showAutoOption && mode === 'auto' && (
+                            <>
+                              <Form.Item
+                                name="auto_split_target_rows"
+                                label="每窗口目标行数"
+                                extra="自动模式下后端按此阈值切分窗口（默认 1,000,000，即每窗口最多 100 万行）"
+                              >
+                                <InputNumber
+                                  min={100000}
+                                  max={10000000}
+                                  step={100000}
+                                  placeholder="1,000,000"
+                                  formatter={(v) => `${v}`.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}
+                                  parser={(v) => Number((v || '').replace(/,/g, '')) as unknown as 100000}
+                                  style={{ width: '100%' }}
+                                />
+                              </Form.Item>
+                              <Form.Item
+                                name="auto_split_column"
+                                label="统计时间列（可选）"
+                                extra='auto 模式统计行数的时间列。留空则使用上方"日期列名"。仅允许字母/数字/下划线。'
+                              >
+                                <Input placeholder="留空使用 date_column" maxLength={64} />
+                              </Form.Item>
+                            </>
+                          )}
+                        </>
+                      );
+                    }}
                   </Form.Item>
                   <Form.Item
                     name="cursor_column"
@@ -933,6 +1118,23 @@ const DataExport: React.FC = () => {
                     }
                   >
                     <Input placeholder="如：id、event_time、Call ID、订单_id" maxLength={64} />
+                  </Form.Item>
+                  <Form.Item
+                    name="prefer_chunked"
+                    valuePropName="checked"
+                    label="首选分批模式（跳过单流首试）"
+                    extra={
+                      <span>
+                        跨境/不稳网络下，单流常在 5 分钟左右被 LB/NAT 切断，每块先单流试错
+                        5 分钟再回退非常浪费。勾选后<b>跳过单流首试</b>，直接走
+                        keyset（若上方填了游标列）或 LIMIT/OFFSET。
+                        <br />
+                        <b>强烈建议同时填写游标列名</b>——无游标列时走 LIMIT/OFFSET，
+                        后期窗口 OFFSET 重扫开销大且 ClickHouse 并行扫描下结果可能非确定。
+                      </span>
+                    }
+                  >
+                    <Switch checkedChildren="跳过单流" unCheckedChildren="试单流" />
                   </Form.Item>
                 </>
               ) : null
@@ -955,6 +1157,7 @@ const DataExport: React.FC = () => {
               <ul style={{ margin: 0, paddingLeft: 16 }}>
                 <li>每超过 100 万行自动插入新 Sheet，每 Sheet 均含标题行</li>
                 <li>Int64 / UInt64 等大整数列自动转为字符串，避免科学计数法</li>
+                <li>CSV 会使用 UTF-8 BOM，Excel 直接打开中文不乱码；CSV 转 XLSX 使用标准 CSV 解析，避免引号内逗号/换行错误分列</li>
                 <li>分块模式：每块单独生成一个 Excel 文件；优先使用 SQL 占位符以获得最佳查询性能</li>
                 <li>导出过程可随时取消，已完成块/文件保留可下载</li>
               </ul>
@@ -1038,21 +1241,62 @@ const DataExport: React.FC = () => {
               && errorModalJob.output_files
               && errorModalJob.output_files.some(f => f.status === 'completed') && (
               <Alert
-                type="info"
+                type={errorModalJob.status === 'partial_failed' ? 'success' : 'info'}
                 showIcon
-                message="部分块已完成，可单独下载"
+                message={
+                  errorModalJob.status === 'partial_failed'
+                    ? '部分块已完成,可单独或打包下载'
+                    : '部分块已完成,可单独下载'
+                }
                 description={
                   <span>
-                    虽然整体任务失败，但已有
+                    已有
                     {' '}
                     <b>
                       {errorModalJob.output_files.filter(f => f.status === 'completed').length}
                     </b>
+                    {' / '}
+                    <b>{errorModalJob.output_files.length}</b>
                     {' '}
-                    个块完成。关闭此对话框后展开任务行可逐个下载。
+                    个块完成。关闭此对话框后展开任务行可逐个下载;CSV ZIP 模式可直接下载 partial 包(含已成功块)。
                   </span>
                 }
               />
+            )}
+            {/* v2.14.7: 失败块明细列表 */}
+            {errorModalJob.export_mode === 'date_chunked'
+              && errorModalJob.output_files
+              && errorModalJob.output_files.some(f => f.status === 'failed') && (
+              <div>
+                <Text strong>失败块明细：</Text>
+                <div
+                  style={{
+                    maxHeight: 200,
+                    overflowY: 'auto',
+                    fontFamily: 'monospace',
+                    fontSize: 12,
+                    background: '#fafafa',
+                    border: '1px solid #f0f0f0',
+                    borderRadius: 4,
+                    padding: 8,
+                    marginTop: 4,
+                  }}
+                >
+                  {errorModalJob.output_files
+                    .filter(f => f.status === 'failed')
+                    .map((f) => (
+                      <div key={f.index} style={{ marginBottom: 4 }}>
+                        <Tag color="error">块 {f.index + 1}</Tag>
+                        <span>{f.date_start} ~ {f.date_end}</span>
+                        {f.error_summary && (
+                          <div style={{ color: '#999', marginLeft: 16, fontSize: 11 }}>
+                            {f.error_summary}
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                </div>
+              </div>
             )}
           </Space>
         )}

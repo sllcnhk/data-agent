@@ -31,8 +31,9 @@ DATABASE_URL = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST
 # 创建引擎
 engine = create_engine(
     DATABASE_URL,
-    pool_size=int(os.getenv("POSTGRES_POOL_SIZE", "20")),
-    max_overflow=int(os.getenv("POSTGRES_MAX_OVERFLOW", "0")),
+    pool_size=int(os.getenv("POSTGRES_POOL_SIZE", "30")),
+    max_overflow=int(os.getenv("POSTGRES_MAX_OVERFLOW", "10")),
+    pool_timeout=int(os.getenv("POSTGRES_POOL_TIMEOUT", "5")),
     pool_pre_ping=True,  # 检查连接是否有效
     pool_recycle=3600,   # 1小时后回收连接
     echo=os.getenv("DEBUG", "false").lower() == "true",  # 开发环境打印SQL

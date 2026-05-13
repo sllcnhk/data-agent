@@ -19,6 +19,7 @@ import logging
 import os
 import socket
 import sys
+import uuid
 from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import requests
@@ -197,7 +198,7 @@ def _build_default_streaming_settings() -> Dict[str, str]:
     return {
         "send_progress_in_http_headers": "1",
         "http_headers_progress_interval_ms": os.getenv(
-            "CH_EXPORT_PROGRESS_INTERVAL_MS", "10000",
+            "CH_EXPORT_PROGRESS_INTERVAL_MS", "3000",
         ),
         "wait_end_of_query": "0",
     }
@@ -228,6 +229,16 @@ def is_ch_timeout_estimate_error(exc: Exception) -> bool:
     """
     msg = str(exc)
     return "Code: 160" in msg or "ESTIMATED_EXECUTION_TIMEOUT_EXCEEDED" in msg
+
+
+def is_ch_too_many_queries_error(exc: Exception) -> bool:
+    """判断是否为 ClickHouse Code 202: TOO_MANY_SIMULTANEOUS_QUERIES。"""
+    msg = str(exc)
+    return (
+        "Code: 202" in msg
+        or "TOO_MANY_SIMULTANEOUS_QUERIES" in msg
+        or "Too many simultaneous queries" in msg
+    )
 
 
 def is_transient_stream_error(exc: Exception, _seen: Optional[set] = None) -> bool:
@@ -398,11 +409,52 @@ class ClickHouseExportClient(BaseExportClient):
 
         return int(resp.text.strip())
 
+    @staticmethod
+    def _make_query_id(prefix: Optional[str], suffix: str) -> Optional[str]:
+        if not prefix:
+            return None
+        safe_prefix = "".join(c if c.isalnum() or c in "-_:." else "_" for c in prefix)[:140]
+        return f"{safe_prefix}:{suffix}:{uuid.uuid4().hex[:8]}"
+
+    @staticmethod
+    def _quote_sql_string(value: str) -> str:
+        return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+    def kill_query(self, query_id: str, *, sync: bool = True) -> None:
+        """Best-effort 终止指定 query_id，防止 HTTP 断开后服务端旧查询继续占用并发。"""
+        if not query_id:
+            return
+        kill_sql = (
+            "KILL QUERY WHERE query_id = "
+            f"{self._quote_sql_string(query_id)} {'SYNC' if sync else 'ASYNC'}"
+        )
+        params = self._base_params()
+        # KILL 本身必须尽快返回，避免清理路径再被长时间阻塞
+        try:
+            resp = _get_export_session().post(
+                self._base_url,
+                data=kill_sql.encode("utf-8"),
+                params=params,
+                timeout=30,
+                stream=False,
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    "KILL QUERY failed for query_id=%s status=%s body=%s",
+                    query_id, resp.status_code,
+                    resp.text[:300] if resp.text else "",
+                )
+            else:
+                logger.info("KILL QUERY issued for query_id=%s", query_id)
+        except Exception as exc:
+            logger.warning("KILL QUERY best-effort failed for query_id=%s: %s", query_id, exc)
+
     def stream_batches(
         self,
         sql: str,
         batch_size: int = 50_000,
         extra_settings: Optional[Dict[str, Any]] = None,
+        query_id_prefix: Optional[str] = None,
     ) -> Generator[List[Tuple], None, None]:
         """
         以 HTTP 流式方式执行 SQL，逐批 yield 数据行。
@@ -432,6 +484,9 @@ class ClickHouseExportClient(BaseExportClient):
         # 2. 调用方传入的 extra_settings 优先级更高，可覆盖默认
         if extra_settings:
             params.update(extra_settings)
+        query_id = self._make_query_id(query_id_prefix, "stream")
+        if query_id:
+            params["query_id"] = query_id
 
         try:
             resp = _get_export_session().post(
@@ -456,26 +511,92 @@ class ClickHouseExportClient(BaseExportClient):
 
         line_iter = resp.iter_lines(decode_unicode=True)
 
-        # 消费前两行（列名 + 列类型），不用于此处解析
         try:
-            next(line_iter)  # 列名行
-            next(line_iter)  # 列类型行
-        except StopIteration:
-            return  # 空结果（无行）
+            # 消费前两行（列名 + 列类型），不用于此处解析
+            try:
+                next(line_iter)  # 列名行
+                next(line_iter)  # 列类型行
+            except StopIteration:
+                return  # 空结果（无行）
 
-        batch: List[Tuple] = []
-        for line in line_iter:
-            if line == "":
-                continue
-            cells = line.split("\t")
-            row = tuple(_parse_tsv_cell(c) for c in cells)
-            batch.append(row)
-            if len(batch) >= batch_size:
+            batch: List[Tuple] = []
+            for line in line_iter:
+                if line == "":
+                    continue
+                cells = line.split("\t")
+                row = tuple(_parse_tsv_cell(c) for c in cells)
+                batch.append(row)
+                if len(batch) >= batch_size:
+                    yield batch
+                    batch = []
+
+            if batch:
                 yield batch
-                batch = []
+        except Exception:
+            if query_id:
+                self.kill_query(query_id)
+            raise
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
 
-        if batch:
-            yield batch
+    def stream_raw(
+        self,
+        sql: str,
+        *,
+        format_name: str = "CSVWithNames",
+        chunk_bytes: int = 1024 * 1024,
+        extra_settings: Optional[Dict[str, Any]] = None,
+        query_id_prefix: Optional[str] = None,
+    ) -> Generator[bytes, None, None]:
+        """直接流式输出 ClickHouse FORMAT 原始字节，用于 CSV/Parquet 等极速导出路径。"""
+        stripped = sql.rstrip().rstrip(";")
+        stream_sql = f"{stripped} FORMAT {format_name}"
+
+        params = self._base_params()
+        params.update(_build_default_streaming_settings())
+        if extra_settings:
+            params.update(extra_settings)
+        query_id = self._make_query_id(query_id_prefix, f"raw_{format_name.lower()}")
+        if query_id:
+            params["query_id"] = query_id
+
+        try:
+            resp = _get_export_session().post(
+                self._base_url,
+                data=stream_sql.encode("utf-8"),
+                params=params,
+                timeout=self.timeout,
+                stream=True,
+            )
+        except requests.ConnectionError as exc:
+            raise ConnectionError(
+                f"ClickHouse 连接失败 {self.host}:{self.port}: {exc}"
+            ) from exc
+        except requests.Timeout as exc:
+            raise TimeoutError(
+                f"ClickHouse 原始流式查询超时 {self.host}:{self.port}"
+            ) from exc
+
+        if resp.status_code != 200:
+            body = resp.content.decode("utf-8", errors="replace")[:500]
+            raise RuntimeError(f"ClickHouse 错误 {resp.status_code}: {body}")
+
+        try:
+            for chunk in resp.iter_content(chunk_size=chunk_bytes):
+                if chunk:
+                    yield chunk
+        except Exception:
+            if query_id:
+                self.kill_query(query_id)
+            raise
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
 
     def stream_batches_chunked(
         self,
@@ -484,6 +605,7 @@ class ClickHouseExportClient(BaseExportClient):
         total_rows: int,
         batch_size: int = 50_000,
         extra_settings: Optional[Dict[str, Any]] = None,
+        query_id_prefix: Optional[str] = None,
     ) -> Generator[List[Tuple], None, None]:
         """
         LIMIT/OFFSET 分批提取，规避 ClickHouse max_execution_time 估算拒绝（Code 160）。
@@ -528,6 +650,7 @@ class ClickHouseExportClient(BaseExportClient):
                 chunk_sql,
                 batch_size=batch_size,
                 extra_settings=extra_settings,
+                query_id_prefix=query_id_prefix,
             )
 
             offset += chunk_size
@@ -539,6 +662,7 @@ class ClickHouseExportClient(BaseExportClient):
         cursor_column: str,
         batch_size: int = 50_000,
         extra_settings: Optional[Dict[str, Any]] = None,
+        query_id_prefix: Optional[str] = None,
     ) -> Generator[List[Tuple], None, None]:
         """
         键集分页（keyset pagination / cursor pagination）替代 LIMIT/OFFSET。
@@ -622,6 +746,8 @@ class ClickHouseExportClient(BaseExportClient):
                 window_sql, batch_size=batch_size,
                 extra_settings=extra_settings,
                 extra_url_params=extra_params,
+                query_id_prefix=query_id_prefix,
+                query_id_suffix=f"keyset_{window_idx}",
             ):
                 if cursor_col_idx is None and col_names is not None:
                     try:
@@ -672,6 +798,8 @@ class ClickHouseExportClient(BaseExportClient):
         batch_size: int = 50_000,
         extra_settings: Optional[Dict[str, Any]] = None,
         extra_url_params: Optional[Dict[str, str]] = None,
+        query_id_prefix: Optional[str] = None,
+        query_id_suffix: str = "keyset",
     ) -> Generator[Tuple[List[Tuple], Optional[List[str]]], None, None]:
         """
         发一次 HTTP 请求,逐批 yield (rows, col_names)。
@@ -685,6 +813,9 @@ class ClickHouseExportClient(BaseExportClient):
             params.update(extra_settings)
         if extra_url_params:
             params.update(extra_url_params)
+        query_id = self._make_query_id(query_id_prefix, query_id_suffix)
+        if query_id:
+            params["query_id"] = query_id
 
         try:
             resp = _get_export_session().post(
@@ -714,20 +845,34 @@ class ClickHouseExportClient(BaseExportClient):
             next(line_iter)  # 列类型行(丢弃)
             col_names = names_line.split("\t")
         except StopIteration:
+            try:
+                resp.close()
+            except Exception:
+                pass
             return
 
-        batch: List[Tuple] = []
-        emitted_first = False
-        for line in line_iter:
-            if line == "":
-                continue
-            cells = line.split("\t")
-            row = tuple(_parse_tsv_cell(c) for c in cells)
-            batch.append(row)
-            if len(batch) >= batch_size:
-                yield (batch, col_names if not emitted_first else None)
-                emitted_first = True
-                batch = []
+        try:
+            batch: List[Tuple] = []
+            emitted_first = False
+            for line in line_iter:
+                if line == "":
+                    continue
+                cells = line.split("\t")
+                row = tuple(_parse_tsv_cell(c) for c in cells)
+                batch.append(row)
+                if len(batch) >= batch_size:
+                    yield (batch, col_names if not emitted_first else None)
+                    emitted_first = True
+                    batch = []
 
-        if batch:
-            yield (batch, col_names if not emitted_first else None)
+            if batch:
+                yield (batch, col_names if not emitted_first else None)
+        except Exception:
+            if query_id:
+                self.kill_query(query_id)
+            raise
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass

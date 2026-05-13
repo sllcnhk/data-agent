@@ -2017,13 +2017,16 @@ DELETE /api/v1/data-import/jobs/{job_id}
 
 ### 13.1 功能概述
 
-在页面输入任意 SELECT SQL，选择 ClickHouse 连接，预览前 N 行结果后一键导出为本地 Excel（`.xlsx`）文件。支持：
+在页面输入任意 SELECT SQL，选择 ClickHouse 连接，预览前 N 行结果后一键导出为本地 Excel（`.xlsx`）、CSV（`.csv`）或 CSV 压缩包（`.zip`）文件。支持：
 
-- **流式导出**：服务端 HTTP 流式响应 + `xlsxwriter` constant_memory 模式（v2.14.3 起;v2.13 使用 openpyxl write_only），峰值内存与 `batch_size` 无关,每行写完即丢;C 加速字符串处理 + 流式 zip,典型场景写入速度 3-5x 优于 openpyxl,大幅减少跨境长连接因客户端处理慢被中断的概率
+- **稳定流式导出（v2.15）**：每个 ClickHouse 导出查询都带唯一 `query_id`；HTTP 断流/取消时系统会 best-effort `KILL QUERY` 清理服务端残留查询；同一 ClickHouse env 默认只允许 1 个导出查询并发（`EXPORT_MAX_CONCURRENT_QUERIES_PER_ENV`），并对 `TOO_MANY_SIMULTANEOUS_QUERIES` 自动退避重试，避免旧查询堆积占满用户并发上限
+- **XLSX 直接写入**：服务端 HTTP 流式响应 + `xlsxwriter` constant_memory 模式（v2.14.3 起;v2.13 使用 openpyxl write_only），峰值内存与 `batch_size` 无关,每行写完即丢
+- **CSV 极速导出（v2.15）**：选择 CSV/CSV ZIP 时，ClickHouse 直接 `FORMAT CSVWithNames` 原始字节流写入文件，绕过逐单元格解析与 XLSX XML/ZIP 写入，适合百万/千万行明细快速交付
+- **XLSX CSV staging（v2.15）**：XLSX 写入策略支持 `auto/direct/csv_staging`。`auto` 下分块/大数据任务默认先极速落 UTF-8 CSV 临时文件，再本地转换 XLSX；这样 ClickHouse 连接只承担快速落盘，后续 XLSX 转换不再占用远端查询连接
 - **多 Sheet 自动分割**：每满 100 万数据行自动创建新 Sheet（Sheet1、Sheet2…），每个 Sheet 均带标题行
 - **按日期分块多文件导出**（v2.13 新增，见 13.7 节）：单 SQL → N 个日期窗口 → N 个 xlsx 文件，针对千万行月明细等大数据量场景，避免单文件过大、便于按时间段拆分交付
 - **大整数安全**：`Int64`/`UInt64`/`Int128`/`UInt128`/`Int256`/`UInt256` 类型自动转为字符串，避免 Excel 打开时显示科学计数法
-- **中文无乱码**：`.xlsx` 格式（zip+XML），openpyxl 原生 UTF-8，无需编码转换
+- **中文无乱码**：`.xlsx` 格式原生 Unicode；CSV 文件写入 UTF-8 BOM，Excel 直接打开中文不乱码；CSV→XLSX 使用 Python 标准 `csv.reader(newline="")` 解析，正确处理引号内逗号/换行，避免错误分列
 - **任务取消**：导出中途可取消；取消后已写入部分保存为残余文件（可手动删除）
 - **历史记录**：任务列表保存所有导出记录，终止状态下可删除
 
@@ -2045,6 +2048,8 @@ DELETE /api/v1/data-import/jobs/{job_id}
 
    | 字段 | 说明 |
    |------|------|
+   | 输出格式 | `Excel(.xlsx)` / `CSV` / `CSV ZIP`；CSV/ZIP 为极速导出，XLSX 支持自动分 Sheet |
+   | XLSX 写入策略 | 仅输出格式为 XLSX 时显示：`自动（推荐）` / `CSV 临时落盘后转 XLSX（更稳）` / `直接写 XLSX（少中间文件）` |
    | 任务名称 | 选填；用于文件名前缀（会自动净化特殊字符）；留空则使用 `export` |
    | 批大小 | 每批从 ClickHouse 拉取的行数（默认 50000，范围 1000–200000） |
 
@@ -2061,11 +2066,11 @@ DELETE /api/v1/data-import/jobs/{job_id}
 | 状态徽标 | `等待中` / `进行中` / `取消中` / `已取消` / `已完成` / `失败` |
 | 已导出行数 | 累计写入 Excel 的数据行数（不含标题行）|
 | Sheet 数 | 总 Sheet 数（每 100 万行新增一张）|
-| 文件大小 | 完成后显示 `.xlsx` 文件大小 |
+| 文件大小 | 完成后显示 `.xlsx` / `.csv` / `.zip` 文件大小 |
 
 **操作按钮**：
 
-- **下载**（仅 `已完成`）：点击触发浏览器「另存为」对话框，下载本地 `.xlsx` 文件。
+- **下载**（仅 `已完成`）：点击触发浏览器「另存为」对话框，下载本地 `.xlsx` / `.csv` / `.zip` 文件。
 - **取消**（仅 `等待中`/`进行中`）：协作式取消；后台协程在下一批次检测到信号后停止；`等待中` 任务直接置为 `已取消`。
 - **删除**（仅终止状态：`已完成`/`已取消`/`失败`）：删除 DB 记录和本地文件。
 
@@ -2096,10 +2101,11 @@ ClickHouse 的 `Int64`/`UInt64` 及更大整数类型（`Int128`/`UInt128`/`Int2
 | SQL 类型 | 仅支持 `SELECT` 查询；不执行 INSERT/UPDATE/DROP 等写操作 |
 | 连接类型 | 当前支持 ClickHouse；架构预留 MySQL 等扩展点（`BaseExportClient` 抽象层）|
 | 单 Sheet 行上限 | 系统限制 100 万数据行/Sheet，超出自动新建；Excel 实际单 Sheet 上限约 104 万行 |
-| 并发导出 | 无系统级并发限制，但大量并发会占用 ClickHouse 连接，建议顺序提交 |
+| 并发导出 | v2.15 起同一 ClickHouse env 默认最多 1 个导出查询并发；可用 `EXPORT_MAX_CONCURRENT_QUERIES_PER_ENV` 调整 |
 | 取消后文件 | 取消后已写入部分不会自动删除；需手动点「删除」清理 |
 | 文件存储路径 | 服务端存储于 `customer_data/{username}/exports/`；下载完成后可通过「删除」清理 |
 | 批大小 | 默认 50000 行/批；内存峰值约为 `batch_size × 行宽`；网络较慢时可适当降低 |
+| CSV staging 策略 | `auto` 下：单文件小任务默认直接写 XLSX；分块/大数据任务默认 CSV 临时落盘后转 XLSX。用户可在导出 Modal 中强制 `direct` 或 `csv_staging` |
 
 ### 13.6 API 快速参考（程序化调用）
 
@@ -2116,19 +2122,28 @@ POST /api/v1/data-export/preview
 # 提交导出任务（单文件模式）
 POST /api/v1/data-export/execute
 {"query_sql": "SELECT * FROM orders", "connection_env": "sg",
- "job_name": "orders_2026", "batch_size": 50000}
+ "job_name": "orders_2026", "batch_size": 50000,
+ "output_format": "xlsx", "xlsx_engine": "auto"}
 → 返回: {"job_id": "...", "status": "pending",
         "output_filename": "orders_2026_20260407_120000.xlsx",
         "export_mode": "single"}
+
+# 提交导出任务（CSV 极速模式）
+POST /api/v1/data-export/execute
+{"query_sql": "SELECT * FROM orders", "connection_env": "sg",
+ "job_name": "orders_2026", "output_format": "csv"}
+→ 返回: {"output_filename": "orders_2026_20260407_120000.csv", ...}
 
 # 提交导出任务（按日期分块模式，详见 13.7 节）
 POST /api/v1/data-export/execute
 {"query_sql": "SELECT * FROM events WHERE dt >= '{{date_start}}' AND dt <= '{{date_end}}'",
  "connection_env": "sg", "job_name": "events_apr",
+ "output_format": "csv_zip",
  "chunk_config": {"date_start": "2025-04-01", "date_end": "2025-04-30",
-                  "chunk_days": 10}}
+                  "chunk_days": 10, "min_subdivide_unit": "hour",
+                  "pre_split_hours": 6}}
 → 返回: {"job_id": "...", "status": "pending",
-        "output_filename": "events_apr_20260507_120000",  # 目录名
+        "output_filename": "events_apr_20260507_120000.zip",
         "export_mode": "date_chunked"}
 
 # 轮询进度（分块模式时响应含 output_files 数组）
@@ -2143,8 +2158,11 @@ POST /api/v1/data-export/jobs/{job_id}/cancel
 # 下载文件 — 单文件模式
 GET /api/v1/data-export/jobs/{job_id}/download
 
-# 下载文件 — 分块模式（必须带 file_index，从 0 起）
+# 下载文件 — 分块模式（普通 xlsx/csv 子文件，必须带 file_index，从 0 起）
 GET /api/v1/data-export/jobs/{job_id}/download?file_index=0
+
+# 下载文件 — 分块 CSV ZIP 模式（不带 file_index，下载整包）
+GET /api/v1/data-export/jobs/{job_id}/download
 
 # 删除记录（仅终止状态；分块模式递归删除整个输出目录）
 DELETE /api/v1/data-export/jobs/{job_id}
@@ -2221,10 +2239,13 @@ ORDER BY event_date
    | 日期范围（含起止日） | ✅ | 闭区间 RangePicker，例如 2025-04-01 ~ 2025-04-30 |
    | 单块天数 | ✅ | 每个 Excel 文件覆盖的天数，范围 **1~90**（默认 10）|
    | 日期列名 | 占位符模式可省 | 仅占用包装模式：填表中的日期列名（仅字母/数字/下划线，**严禁特殊字符**，防 SQL 注入）|
+   | 最小再细分粒度 | 可选 | `天/小时/分钟`。选择小时/分钟时，失败自动下钻到 sub-day；同时 v2.15 默认启用 **6 小时预分裂**，减少先跑大块约 5 分钟后断流再分裂的浪费 |
+   | 预分裂窗口（小时） | 可选 | 留空默认 6 小时（仅 hour/minute 再细分时生效）；可填 1~24。适合高峰日数据量极大、跨境连接容易 5 分钟断流的场景 |
 
 5. 点击「**开始导出**」，系统按规则切分日期范围为 N 块：
    - 例：`2025-04-01 ~ 2025-04-30, chunk_days=10` → `[04-01~04-10], [04-11~04-20], [04-21~04-30]` 共 3 块
    - 例：`2025-04-01 ~ 2025-04-25, chunk_days=10` → `[04-01~04-10], [04-11~04-20], [04-21~04-25]` 共 3 块（最后一块自适应缩短）
+   - 例：`chunk_days=1 + 最小再细分粒度=小时 + 预分裂窗口=6` → 单天会在任务开始前预拆为 4 个 6 小时子块，避免先执行整天大查询后再因断流重试
 
 ##### 步骤三：监控进度 + 分块下载
 

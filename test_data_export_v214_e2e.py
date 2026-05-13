@@ -25,7 +25,7 @@ import sys
 import uuid
 from datetime import date, datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -107,6 +107,48 @@ def _make_pending_chunked_job(
 # =============================================================================
 # M · v2.14 API 契约 — 新字段往返
 # =============================================================================
+
+
+
+def _attach_csv_stream_raw(mc) -> None:
+    """
+    给 Mock 的 export_client 补一个 stream_raw 实现,使其在 csv_staging 引擎下也能工作。
+
+    背景：v2.14.x 起 chunked 模式 xlsx_engine="auto" 默认走 csv_staging,
+          会调用 export_client.stream_raw(sql, format_name="CSVWithNames")
+          直接取 CSV 字节流落盘。老 Mock 只 stub 了 stream_batches → 缺方法。
+
+    本 helper 用同一个 stream_batches 的 side_effect 重放出 CSV 字节流,
+    格式为 CSVWithNames：第 1 行列名,后续每行 row 值,逗号分隔,逗号/引号/换行需转义。
+    side_effect 中的副作用(如 sqls_seen.append)会在 csv_staging 模式下从 stream_raw
+    触发,语义等价于 direct 模式下从 stream_batches 触发(都是「每个 SQL 一次」)。
+    """
+    cols = mc.get_columns.return_value
+    try:
+        col_names: List[str] = [c.name for c in cols] if cols else []
+    except TypeError:
+        # Mock 默认 return_value 不可迭代 / get_columns 用 side_effect 抛错的场景 →
+        # 列预检会在外层失败,此处提供退化列名让 helper 不抛(否则 _mk_client 自身崩溃)
+        col_names = []
+    sb_side = mc.stream_batches.side_effect  # 捕获原闭包
+
+    def _csv_escape(v: Any) -> str:
+        if v is None:
+            return ""
+        s = str(v)
+        if "," in s or '"' in s or "\n" in s or "\r" in s:
+            s = '"' + s.replace('"', '""') + '"'
+        return s
+
+    def _stream_raw(sql, format_name="CSVWithNames", **kw):
+        yield (",".join(col_names) + "\n").encode("utf-8")
+        gen = sb_side(sql) if sb_side else iter([])
+        for batch in gen:
+            for row in batch:
+                yield (",".join(_csv_escape(v) for v in row) + "\n").encode("utf-8")
+
+    mc.stream_raw.side_effect = _stream_raw
+
 
 class TestApiContractV214:
 
@@ -307,6 +349,8 @@ class TestCombinationV214:
                 "date_start": "2025-04-01", "date_end": "2025-04-01",
                 "chunk_days": 1, "min_subdivide_unit": "hour",
                 "cursor_column": "id",
+                # 关闭 6h 默认预分裂,让「整 1 天块失败 → 12h+12h」副本拆分语义成立
+                "pre_split_hours": 24,
             },
             out_dir,
         )
@@ -341,16 +385,22 @@ class TestCombinationV214:
 
             mc.stream_batches.side_effect = _stream
             mc.stream_batches_keyset.side_effect = _keyset
+            _attach_csv_stream_raw(mc)
             return mc
 
         config = {
             "query_sql": "SELECT id, name, ts FROM t WHERE ts >= '{{date_start}}' AND ts <= '{{date_end}}'",
             "connection_env": "test", "connection_type": "clickhouse",
             "batch_size": 1000, "export_mode": "date_chunked",
+            # 测试目标是「stream 失败 → fallback keyset」组合 sub-day 拆分,只在 xlsxwriter
+            # direct 路径完整;csv_staging 不接 keyset fallback。
+            "xlsx_engine": "direct",
             "chunk_config": {
                 "date_start": "2025-04-01", "date_end": "2025-04-01",
                 "chunk_days": 1, "min_subdivide_unit": "hour",
                 "cursor_column": "id",
+                # 关闭 6h 默认预分裂(同 _make_pending_chunked_job)
+                "pre_split_hours": 24,
             },
             "output_dir": str(out_dir), "job_name": "p1job",
         }
@@ -406,6 +456,7 @@ class TestCancelRaceV214:
         def _mk_client(*args, **kw):
             mc = Mock()
             mc.get_columns.return_value = _make_columns()
+            _attach_csv_stream_raw(mc)
             return mc
 
         # is_cancelling stub:首次 False(块前检查),后续 True(重试退避内)

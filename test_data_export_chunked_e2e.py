@@ -67,6 +67,48 @@ def _wait_until_done(app_client, job_id: str, timeout: float = 10.0):
 # N · 前端字段 → API 契约
 # =============================================================================
 
+
+
+def _attach_csv_stream_raw(mc) -> None:
+    """
+    给 Mock 的 export_client 补一个 stream_raw 实现,使其在 csv_staging 引擎下也能工作。
+
+    背景：v2.14.x 起 chunked 模式 xlsx_engine="auto" 默认走 csv_staging,
+          会调用 export_client.stream_raw(sql, format_name="CSVWithNames")
+          直接取 CSV 字节流落盘。老 Mock 只 stub 了 stream_batches → 缺方法。
+
+    本 helper 用同一个 stream_batches 的 side_effect 重放出 CSV 字节流,
+    格式为 CSVWithNames：第 1 行列名,后续每行 row 值,逗号分隔,逗号/引号/换行需转义。
+    side_effect 中的副作用(如 sqls_seen.append)会在 csv_staging 模式下从 stream_raw
+    触发,语义等价于 direct 模式下从 stream_batches 触发(都是「每个 SQL 一次」)。
+    """
+    cols = mc.get_columns.return_value
+    try:
+        col_names: List[str] = [c.name for c in cols] if cols else []
+    except TypeError:
+        # Mock 默认 return_value 不可迭代 / get_columns 用 side_effect 抛错的场景 →
+        # 列预检会在外层失败,此处提供退化列名让 helper 不抛(否则 _mk_client 自身崩溃)
+        col_names = []
+    sb_side = mc.stream_batches.side_effect  # 捕获原闭包
+
+    def _csv_escape(v: Any) -> str:
+        if v is None:
+            return ""
+        s = str(v)
+        if "," in s or '"' in s or "\n" in s or "\r" in s:
+            s = '"' + s.replace('"', '""') + '"'
+        return s
+
+    def _stream_raw(sql, format_name="CSVWithNames", **kw):
+        yield (",".join(col_names) + "\n").encode("utf-8")
+        gen = sb_side(sql) if sb_side else iter([])
+        for batch in gen:
+            for row in batch:
+                yield (",".join(_csv_escape(v) for v in row) + "\n").encode("utf-8")
+
+    mc.stream_raw.side_effect = _stream_raw
+
+
 class TestFrontendFieldContract:
     """N1-N3：模拟前端表单提交格式"""
 
@@ -213,6 +255,7 @@ class TestFullChunkedFlow:
                 sqls_seen.append(sql)
                 yield _make_batch(3)
             mc.stream_batches.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
@@ -267,6 +310,7 @@ class TestFullChunkedFlow:
             def _stream(sql, **kwargs):
                 yield _make_batch(2)
             mc.stream_batches.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):
@@ -360,6 +404,7 @@ class TestPlaceholderPathE2E:
                 seen.append(sql)
                 yield _make_batch(1)
             mc.stream_batches.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         with patch("backend.services.data_export_service._build_export_client", side_effect=_mk_client):

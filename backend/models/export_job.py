@@ -118,4 +118,6 @@ class ExportJob(Base):
             "export_mode": getattr(self, "export_mode", None) or "single",
             "chunk_config": self.chunk_config,
             "output_files": self.output_files,
+            "output_format": (self.config_snapshot or {}).get("output_format", "xlsx"),
+            "xlsx_engine": (self.config_snapshot or {}).get("xlsx_engine", "auto"),
         }

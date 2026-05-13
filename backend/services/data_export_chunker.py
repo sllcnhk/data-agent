@@ -465,6 +465,7 @@ class NormalizedChunkConfig:
     mode: InjectMode  # 根据 SQL 自动决定
     min_subdivide_unit: SubdivideUnit = "day"  # 用户 opt-in:sub-day 再细分粒度
     cursor_column: Optional[str] = None        # 用户 opt-in:键集分页游标列（Task B 启用）
+    prefer_chunked: Optional[bool] = None      # v2.14.6: 跳过单流首试,直接走分批路径
 
 
 def validate_chunk_config(raw: dict, sql: str) -> NormalizedChunkConfig:
@@ -548,6 +549,13 @@ def validate_chunk_config(raw: dict, sql: str) -> NormalizedChunkConfig:
 
     mode: InjectMode = "placeholder" if use_placeholder else "wrapper"
 
+    # prefer_chunked: 仅校验类型,None 表示「沿用环境变量默认」(在 data_export_service 解析)
+    prefer_chunked = raw.get("prefer_chunked", None)
+    if prefer_chunked is not None and not isinstance(prefer_chunked, bool):
+        raise ValueError(
+            f"prefer_chunked 必须是布尔或 None,收到 {type(prefer_chunked).__name__}"
+        )
+
     return NormalizedChunkConfig(
         date_column=date_column,
         date_start=date_start,
@@ -556,4 +564,5 @@ def validate_chunk_config(raw: dict, sql: str) -> NormalizedChunkConfig:
         mode=mode,
         min_subdivide_unit=min_subdivide_unit,
         cursor_column=cursor_column,
+        prefer_chunked=prefer_chunked,
     )

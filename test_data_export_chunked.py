@@ -47,6 +47,46 @@ def _make_batch(n: int, base: int = 0):
     return [(str(base + i), f"name_{base + i}") for i in range(n)]
 
 
+def _attach_csv_stream_raw(mc) -> None:
+    """
+    给 Mock 的 export_client 补一个 stream_raw 实现,使其在 csv_staging 引擎下也能工作。
+
+    背景：v2.14.x 起 chunked 模式 xlsx_engine="auto" 默认走 csv_staging,
+          会调用 export_client.stream_raw(sql, format_name="CSVWithNames")
+          直接取 CSV 字节流落盘。老 Mock 只 stub 了 stream_batches → 缺方法。
+
+    本 helper 用同一个 stream_batches 的 side_effect 重放出 CSV 字节流,
+    格式为 CSVWithNames：第 1 行列名,后续每行 row 值,逗号分隔,逗号/引号/换行需转义。
+    side_effect 中的副作用(如 sqls_seen.append)会在 csv_staging 模式下从 stream_raw
+    触发,语义等价于 direct 模式下从 stream_batches 触发(都是「每个 SQL 一次」)。
+    """
+    cols = mc.get_columns.return_value
+    try:
+        col_names: List[str] = [c.name for c in cols] if cols else []
+    except TypeError:
+        # Mock 默认 return_value 不可迭代 / get_columns 用 side_effect 抛错的场景 →
+        # 列预检会在外层失败,此处提供退化列名让 helper 不抛(否则 _mk_client 自身崩溃)
+        col_names = []
+    sb_side = mc.stream_batches.side_effect  # 捕获原闭包
+
+    def _csv_escape(v: Any) -> str:
+        if v is None:
+            return ""
+        s = str(v)
+        if "," in s or '"' in s or "\n" in s or "\r" in s:
+            s = '"' + s.replace('"', '""') + '"'
+        return s
+
+    def _stream_raw(sql, format_name="CSVWithNames", **kw):
+        yield (",".join(col_names) + "\n").encode("utf-8")
+        gen = sb_side(sql) if sb_side else iter([])
+        for batch in gen:
+            for row in batch:
+                yield (",".join(_csv_escape(v) for v in row) + "\n").encode("utf-8")
+
+    mc.stream_raw.side_effect = _stream_raw
+
+
 def _make_chunked_job(db, username: str, output_dir: Path, status: str = "pending") -> str:
     """直接在 DB 创建一个 date_chunked 模式的 ExportJob 记录（绕过 API）"""
     from backend.models.export_job import ExportJob
@@ -197,6 +237,7 @@ class TestChunkedExecution:
                 sqls_seen.append(sql)
                 yield _make_batch(2, base=len(sqls_seen) * 100)
             mc.stream_batches.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         config = {
@@ -262,6 +303,7 @@ class TestChunkedExecution:
                 idx["n"] += 1
                 yield _make_batch(rows_per_chunk[i])
             mc.stream_batches.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         config = {
@@ -290,11 +332,18 @@ class TestChunkedExecution:
 
 class TestChunkedFailure:
 
-    def test_g1_second_chunk_fails_first_kept(self, tmp_path):
-        """G1: 第 2 块失败 → Job failed，第 1 块文件保留"""
+    def test_g1_second_chunk_fails_first_kept(self, tmp_path, monkeypatch):
+        """G1(v2.14.7): 第 2 块失败 → Job partial_failed,第 1 块文件保留,第 3 块继续执行成功
+
+        旧行为(整 Job failed + 第 3 块 pending)由 EXPORT_FAIL_FAST_ON_CHUNK_ERROR=1
+        保留,见 TestPartialFailure::test_p6。
+        """
         from backend.config.database import SessionLocal
         from backend.models.export_job import ExportJob
         import backend.services.data_export_service as svc
+
+        # 确保使用默认新行为(partial_failed)
+        monkeypatch.delenv("EXPORT_FAIL_FAST_ON_CHUNK_ERROR", raising=False)
 
         db = SessionLocal()
         out_dir = tmp_path / "g1_output"
@@ -312,6 +361,7 @@ class TestChunkedFailure:
                     raise RuntimeError("simulated CH failure")
                 yield _make_batch(2)
             mc.stream_batches.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         config = {
@@ -328,14 +378,17 @@ class TestChunkedFailure:
         db = SessionLocal()
         try:
             j = db.query(ExportJob).filter(ExportJob.id == job_id).first()
-            assert j.status == "failed"
+            # 新行为:partial_failed(2 完成 + 1 失败)
+            assert j.status == "partial_failed", f"期望 partial_failed,实际 {j.status}"
             assert "simulated CH failure" in (j.error_message or "")
             files = j.output_files
             assert files[0]["status"] == "completed"
             assert Path(files[0]["file_path"]).exists()
             assert files[1]["status"] == "failed"
-            # 第 3 块未启动
-            assert files[2]["status"] == "pending"
+            # 第 3 块不再 pending,继续跑完成
+            assert files[2]["status"] == "completed", (
+                f"v2.14.7 新行为:第 3 块应继续执行,实际 status={files[2]['status']}"
+            )
         finally:
             db.close()
 
@@ -401,12 +454,16 @@ class TestChunkedCancellation:
                     db2.commit()
                     db2.close()
             mc.stream_batches.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         config = {
             "query_sql": "SELECT id, name FROM t WHERE d >= '{{date_start}}' AND d <= '{{date_end}}'",
             "connection_env": "test", "connection_type": "clickhouse",
             "batch_size": 1000, "export_mode": "date_chunked",
+            # 取消时序按 direct 模式语义(批次粒度)断言;csv_staging 在 CSV→XLSX 转换
+            # 起始就会检测 cancelling,会把 chunk1 标 cancelled 而非 completed。
+            "xlsx_engine": "direct",
             "chunk_config": {"date_start": "2025-04-01", "date_end": "2025-04-30", "chunk_days": 10},
             "output_dir": str(out_dir), "job_name": "h2job",
         }
@@ -583,6 +640,7 @@ class TestSQLInjectionPaths:
                 seen_sqls.append(sql)
                 yield _make_batch(1)
             mc.stream_batches.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         config = {
@@ -633,6 +691,7 @@ class TestSQLInjectionPaths:
                 seen_sqls.append(sql)
                 yield _make_batch(1)
             mc.stream_batches.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         config = {
@@ -696,6 +755,7 @@ class TestSheetSplitInChunkedMode:
                 # 12 行 → 应分为 3 个 Sheet (5+5+2)
                 yield _make_batch(12)
             mc.stream_batches.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         config = {
@@ -807,6 +867,7 @@ class TestSubDaySubdivision:
             mc.count_rows.return_value = 3
             mc.stream_batches.side_effect = _stream
             mc.stream_batches_chunked.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         config = {
@@ -816,6 +877,8 @@ class TestSubDaySubdivision:
             "chunk_config": {
                 "date_start": "2025-04-01", "date_end": "2025-04-01",
                 "chunk_days": 1, "min_subdivide_unit": "hour",
+                # 关闭 6h 默认预分裂(让"原始 1 天块失败 → 12h 子块"的语义成立)
+                "pre_split_hours": 24,
             },
             "output_dir": str(out_dir), "job_name": "kn1job",
         }
@@ -900,6 +963,7 @@ class TestSubDaySubdivision:
             mc.count_rows.return_value = 3
             mc.stream_batches.side_effect = _stream
             mc.stream_batches_chunked.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         config = {
@@ -909,6 +973,8 @@ class TestSubDaySubdivision:
             "chunk_config": {
                 "date_start": "2025-04-01", "date_end": "2025-04-01",
                 "chunk_days": 1, "min_subdivide_unit": "hour",
+                # 关闭 6h 默认预分裂,验证「整 1 天块失败 → 12h 子块」衔接路径
+                "pre_split_hours": 24,
             },
             "output_dir": str(out_dir), "job_name": "kn3job",
         }
@@ -987,6 +1053,7 @@ class TestSubDaySubdivision:
             # Code 160 fallback 路径(stream_batches_chunked)也注入失败,避免误回退
             mc.count_rows.return_value = 100
             mc.stream_batches_chunked.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         config = {
@@ -1056,6 +1123,7 @@ class TestInplaceRetryBeforeSubdivide:
         def _mk_client(*args, **kw):
             mc = Mock()
             mc.get_columns.return_value = _make_columns()
+            _attach_csv_stream_raw(mc)
             return mc
 
         # 让 Path(chunk_path).stat() 不抛 — 但是 _run_single_export 被 patch 后
@@ -1127,6 +1195,7 @@ class TestInplaceRetryBeforeSubdivide:
             mc.stream_batches.side_effect = _stream
             mc.count_rows.return_value = 1
             mc.stream_batches_chunked.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         config = {
@@ -1179,6 +1248,7 @@ class TestInplaceRetryBeforeSubdivide:
             mc.stream_batches.side_effect = _stream
             mc.count_rows.return_value = 1
             mc.stream_batches_chunked.side_effect = _stream
+            _attach_csv_stream_raw(mc)
             return mc
 
         # 重试退避期间 _is_cancelling 返回 True(模拟用户取消)
