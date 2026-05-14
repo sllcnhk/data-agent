@@ -238,6 +238,14 @@ const DataExport: React.FC = () => {
   // ── 错误详情 Modal ──────────────────────────────────────────────────────────
   const [errorModalJob, setErrorModalJob] = useState<ExportJob | null>(null);
 
+  // ── 失败子任务重试 Modal ────────────────────────────────────────────────────
+  const [retryModal, setRetryModal] = useState<{
+    visible: boolean;
+    job: ExportJob | null;
+    batchSize: number;
+    loading: boolean;
+  }>({ visible: false, job: null, batchSize: 50000, loading: false });
+
   // ── 加载连接列表 ─────────────────────────────────────────────────────────────
   const loadConnections = useCallback(async () => {
     setLoadingConns(true);
@@ -397,6 +405,29 @@ const DataExport: React.FC = () => {
       await loadJobList(listPage);
     } catch (e: any) {
       message.error(`删除失败: ${e?.response?.data?.detail ?? e.message}`);
+    }
+  };
+
+  // ── 失败子任务重试 ───────────────────────────────────────────────────────────
+  const handleOpenRetryModal = (job: ExportJob) => {
+    const defaultBatchSize = (job as any).config_snapshot?.batch_size ?? 50000;
+    setRetryModal({ visible: true, job, batchSize: defaultBatchSize, loading: false });
+  };
+
+  const handleRetryConfirm = async () => {
+    const { job, batchSize } = retryModal;
+    if (!job) return;
+    setRetryModal(prev => ({ ...prev, loading: true }));
+    try {
+      const r = await dataExportApi.retryFailedChunks(job.job_id, batchSize);
+      setRetryModal({ visible: false, job: null, batchSize: 50000, loading: false });
+      message.success(`已提交 ${r.failed_chunk_count} 个失败子任务重试，将串行执行...`);
+      await loadJobList(listPage, true);
+    } catch (e: any) {
+      const detail = e?.response?.data?.detail ?? e.message;
+      const isConflict = e?.response?.status === 409;
+      message.error(isConflict ? '任务正在执行中，请等待后再试' : `重试提交失败: ${detail}`);
+      setRetryModal(prev => ({ ...prev, loading: false }));
     }
   };
 
@@ -642,6 +673,18 @@ const DataExport: React.FC = () => {
                 </Tag>
               </Tooltip>
             )
+          )}
+          {r.export_mode === 'date_chunked'
+            && (r.status === 'partial_failed' || r.status === 'failed')
+            && (r.output_files?.some(f => f.status === 'failed') ?? false) && (
+            <Tooltip title="重试所有失败子任务（串行执行）">
+              <Button
+                type="link"
+                size="small"
+                icon={<ReloadOutlined />}
+                onClick={() => handleOpenRetryModal(r)}
+              />
+            </Tooltip>
           )}
           {(r.status === 'pending' || r.status === 'running') && (
             <Popconfirm
@@ -1298,6 +1341,67 @@ const DataExport: React.FC = () => {
                 </div>
               </div>
             )}
+          </Space>
+        )}
+      </Modal>
+
+      {/* ── 失败子任务重试 Modal ──────────────────────────────────────────────── */}
+      <Modal
+        title="重试失败子任务"
+        open={retryModal.visible}
+        onCancel={() => !retryModal.loading && setRetryModal(prev => ({ ...prev, visible: false }))}
+        footer={[
+          <Button
+            key="cancel"
+            disabled={retryModal.loading}
+            onClick={() => setRetryModal(prev => ({ ...prev, visible: false }))}
+          >
+            取消
+          </Button>,
+          <Button
+            key="confirm"
+            type="primary"
+            loading={retryModal.loading}
+            onClick={handleRetryConfirm}
+          >
+            确认重试
+          </Button>,
+        ]}
+      >
+        {retryModal.job && (
+          <Space direction="vertical" size={16} style={{ width: '100%' }}>
+            <Alert
+              type="info"
+              showIcon
+              message={
+                <>
+                  共{' '}
+                  <b>{retryModal.job.output_files?.filter(f => f.status === 'failed').length ?? 0}</b>
+                  {' '}个失败子任务将按原始顺序串行重试。
+                </>
+              }
+              description={
+                retryModal.job.output_files?.some(f => f.status === 'completed')
+                  ? `已完成块（${retryModal.job.output_files.filter(f => f.status === 'completed').length} 个）不受影响，仅重试失败块。`
+                  : undefined
+              }
+            />
+            <div>
+              <div style={{ marginBottom: 4 }}>
+                <Text strong>批次大小（高级）</Text>
+              </div>
+              <InputNumber
+                style={{ width: '100%' }}
+                min={1000}
+                max={500000}
+                step={1000}
+                value={retryModal.batchSize}
+                onChange={(v) => setRetryModal(prev => ({ ...prev, batchSize: v ?? 50000 }))}
+              />
+              <div style={{ marginTop: 4 }}>
+                <Text type="secondary">每批从数据库读取的行数，影响内存与速度，默认 50,000 行</Text>
+              </div>
+            </div>
           </Space>
         )}
       </Modal>

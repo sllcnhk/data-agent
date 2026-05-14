@@ -234,6 +234,20 @@ export const dataExportApi = {
   },
 
   /**
+   * 对指定 date_chunked 任务下所有 failed 子块发起串行重试。
+   * batchSize 可与原始不同，重试时生效。
+   */
+  retryFailedChunks: async (
+    jobId: string,
+    batchSize: number,
+  ): Promise<{ status: string; failed_chunk_count: number; batch_size: number }> => {
+    const res = await apiClient.post(`/data-export/jobs/${jobId}/retry-failed-chunks`, {
+      batch_size: batchSize,
+    });
+    return res.data?.data;
+  },
+
+  /**
    * 以 blob 方式下载导出文件。
    * 通过 axios 发起请求，自动携带 Authorization Bearer token，
    * 避免原生 <a href> 导航绕过认证拦截器导致 401。

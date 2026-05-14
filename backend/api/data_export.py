@@ -34,6 +34,7 @@ from backend.services.data_export_service import (
     PREVIEW_LIMIT,
     preview_query,
     run_export_job,
+    retry_failed_chunks_async,
 )
 from backend.services.data_import_service import list_writable_connections
 
@@ -148,6 +149,15 @@ class ChunkConfigSchema(BaseModel):
                 raise ValueError("pre_split_hours 整数值须在 [1, 24] 范围内")
             return v
         raise ValueError("pre_split_hours 须为整数(1-24)或字符串 'auto'")
+
+
+class RetryFailedChunksRequest(BaseModel):
+    batch_size: int = Field(
+        default=DEFAULT_BATCH_SIZE,
+        ge=1000,
+        le=500_000,
+        description="每批从数据库读取的行数，影响内存与速度，默认 50,000 行",
+    )
 
 
 class ExecuteExportRequest(BaseModel):
@@ -641,3 +651,63 @@ async def download_job(
         media_type=_media_type(output_format),
         filename=filename,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. 失败子任务批量重试
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/jobs/{job_id}/retry-failed-chunks", status_code=202)
+async def retry_failed_chunks(
+    job_id: str,
+    req: RetryFailedChunksRequest,
+    current_user=Depends(require_permission("data", "export")),
+    db: Session = Depends(get_db),
+):
+    """
+    对指定 date_chunked 任务下所有 failed 子块发起串行重试。
+
+    - 仅接受 partial_failed 或 failed 状态的任务
+    - 若任务已处于 running 状态（另一次重试或正常导出进行中），返回 409
+    - 立即返回 202，后台串行执行所有失败块
+    - 重试使用指定的 batch_size（可与原始不同）
+    """
+    from backend.models.export_job import ExportJob
+
+    job = db.query(ExportJob).filter(ExportJob.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"任务不存在: {job_id}")
+
+    if job.export_mode != "date_chunked":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="仅 date_chunked 模式支持失败子任务重试",
+        )
+    if job.status == "running":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="任务正在执行中，请等待当前操作完成后再重试",
+        )
+    if job.status not in ("partial_failed", "failed"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"当前状态 '{job.status}' 不支持重试（需为 partial_failed 或 failed）",
+        )
+
+    failed_chunks = [e for e in (job.output_files or []) if e.get("status") == "failed"]
+    if not failed_chunks:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="没有状态为 failed 的子任务",
+        )
+
+    asyncio.create_task(retry_failed_chunks_async(job_id, req.batch_size))
+
+    return {
+        "success": True,
+        "data": {
+            "status": "retrying",
+            "failed_chunk_count": len(failed_chunks),
+            "batch_size": req.batch_size,
+        },
+    }

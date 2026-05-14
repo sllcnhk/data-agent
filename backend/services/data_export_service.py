@@ -725,6 +725,13 @@ def _run_csv_export(
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def _parse_iso_endpoint(s: str):
+    """ISO 字符串 → date 或 datetime。datetime 形如 'YYYY-MM-DDTHH:MM:SS' 含 'T'。"""
+    if "T" in s:
+        return datetime.fromisoformat(s)
+    return date.fromisoformat(s)
+
+
 def _is_cancelling(job_id: str) -> bool:
     from backend.config.database import SessionLocal
     from backend.models.export_job import ExportJob
@@ -1412,8 +1419,6 @@ def _run_chunked_export_sync(job_id: str, config: Dict[str, Any]) -> None:
       5. 任一块失败 → 整体 failed（已完成块文件保留，便于排查）
       6. 中途 cancelling → 当前块写到一半保留，后续块跳过 → cancelled
     """
-    from datetime import date as _date
-
     from backend.services.data_export_chunker import (
         build_chunk_filename,
         inject_date_filter,
@@ -1445,12 +1450,6 @@ def _run_chunked_export_sync(job_id: str, config: Dict[str, Any]) -> None:
     )
     # 跨块累积失败记录,用于 partial_failed 终态生成 error_message
     failed_chunks_summary: List[Dict[str, Any]] = []
-
-    def _parse_iso_endpoint(s: str):
-        """ISO 字符串 → date 或 datetime。datetime 形如 'YYYY-MM-DDTHH:MM:SS' 含 'T'。"""
-        if "T" in s:
-            return datetime.fromisoformat(s)
-        return _date.fromisoformat(s)
 
     def _sleep_with_cancel_check(seconds: int) -> bool:
         """按秒为粒度睡眠;每秒检查一次 cancel。返回 True 表示被取消(应中断)。"""
@@ -2014,3 +2013,300 @@ def _run_chunked_export_sync(job_id: str, config: Dict[str, Any]) -> None:
             "[ExportJob %s] Chunked export partial_failed: %d/%d 块成功, %d 块失败",
             job_id, n_completed, len(output_files), n_failed,
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. 失败子任务批量重试
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _retry_failed_chunks_sync(job_id: str, batch_size: int) -> None:
+    """
+    对整个 date_chunked 任务下所有 failed 块串行重试（线程池中运行）。
+
+    状态流转：
+      job: partial_failed / failed → running → completed / partial_failed / failed
+      chunk: failed → running → completed / failed
+    """
+    from backend.config.database import SessionLocal
+    from backend.models.export_job import ExportJob
+    from backend.services.data_export_chunker import inject_date_filter
+
+    # ── 1. 加载并加锁 ────────────────────────────────────────────────────────
+    db = SessionLocal()
+    try:
+        job = db.query(ExportJob).filter(ExportJob.id == job_id).first()
+        if not job:
+            logger.error("[RetryChunks %s] Job not found, aborting.", job_id)
+            return
+        if job.status == "running":
+            logger.warning("[RetryChunks %s] Job already running, skipping retry.", job_id)
+            return
+        if job.status not in ("partial_failed", "failed"):
+            logger.warning(
+                "[RetryChunks %s] Job status '%s' not retryable, skipping.",
+                job_id, job.status,
+            )
+            return
+        # 原子加锁：设为 running，防止并发重试
+        job.status = "running"
+        job.finished_at = None
+        job.updated_at = datetime.utcnow()
+        db.commit()
+    finally:
+        db.close()
+
+    # ── 2. 读取重试所需参数 ───────────────────────────────────────────────────
+    db = SessionLocal()
+    try:
+        job = db.query(ExportJob).filter(ExportJob.id == job_id).first()
+        sql = job.query_sql
+        env = job.connection_env
+        conn_type = job.connection_type or "clickhouse"
+        job_name = job.job_name or "export"
+        chunk_cfg = job.chunk_config or {}
+        date_column = chunk_cfg.get("date_column")
+        cfg_snapshot = job.config_snapshot or {}
+        output_format = cfg_snapshot.get("output_format", "xlsx")
+        xlsx_engine = cfg_snapshot.get("xlsx_engine", "auto")
+        if xlsx_engine == "auto":
+            xlsx_engine = "csv_staging"
+        cursor_column = chunk_cfg.get("cursor_column")
+        prefer_chunked_env = os.getenv("EXPORT_PREFER_CHUNKED", "0") == "1"
+        prefer_chunked = chunk_cfg.get("prefer_chunked")
+        if prefer_chunked is None:
+            prefer_chunked = prefer_chunked_env
+
+        output_files: List[Dict[str, Any]] = list(job.output_files or [])
+    finally:
+        db.close()
+
+    # ── 3. 收集失败块（按 index 升序） ───────────────────────────────────────
+    failed_entries = sorted(
+        [e for e in output_files if e.get("status") == "failed"],
+        key=lambda e: e.get("index", 0),
+    )
+    if not failed_entries:
+        logger.info("[RetryChunks %s] No failed chunks found, restoring status.", job_id)
+        n_comp = sum(1 for e in output_files if e.get("status") == "completed")
+        if n_comp == len(output_files):
+            _mark_completed(
+                job_id,
+                exported=sum(e.get("rows", 0) for e in output_files),
+                done_b=len(output_files),
+                total_b=len(output_files),
+                sheets=sum(e.get("sheets", 0) for e in output_files),
+                file_size=sum((e.get("file_size") or 0) for e in output_files),
+            )
+        else:
+            _mark_partial_failed(
+                job_id,
+                summary="无失败块（重试时已为空）",
+                exported=sum(e.get("rows", 0) for e in output_files),
+                done_b=n_comp,
+                total_b=len(output_files),
+                sheets=sum(e.get("sheets", 0) for e in output_files),
+                file_size=sum((e.get("file_size") or 0) for e in output_files),
+            )
+        return
+
+    # output_dir 从任意块的 file_path 推导（所有块同目录）
+    output_dir = Path(failed_entries[0]["file_path"]).parent
+
+    logger.info(
+        "[RetryChunks %s] 开始串行重试 %d 个失败块 (batch_size=%d)",
+        job_id, len(failed_entries), batch_size,
+    )
+
+    # ── 4. 逐块串行重试 ──────────────────────────────────────────────────────
+    for entry in failed_entries:
+        # 4a. 检查取消信号
+        if _is_cancelling(job_id):
+            logger.info("[RetryChunks %s] Cancelled during retry.", job_id)
+            _mark_cancelled(
+                job_id,
+                exported=sum(e.get("rows", 0) for e in output_files if e.get("status") == "completed"),
+                done_b=sum(1 for e in output_files if e.get("status") == "completed"),
+                sheets=sum(e.get("sheets", 0) for e in output_files if e.get("status") == "completed"),
+            )
+            _update_job(job_id, output_files=list(output_files))
+            return
+
+        chunk_start = _parse_iso_endpoint(entry["date_start"])
+        chunk_end = _parse_iso_endpoint(entry["date_end"])
+        chunk_label = f"重试块 {entry['index'] + 1}/{len(output_files)} ({chunk_start}~{chunk_end})"
+        chunk_path = entry["file_path"]
+
+        # 4b. 标记为 running，持久化
+        entry["status"] = "running"
+        entry.pop("error_summary", None)
+        _update_job(
+            job_id,
+            current_sheet=chunk_label,
+            output_files=list(output_files),
+        )
+
+        # 4c. 构建该块 SQL（注入日期过滤）
+        try:
+            chunk_sql, _ = inject_date_filter(sql, date_column, chunk_start, chunk_end)
+        except Exception as exc:
+            logger.error("[RetryChunks %s] inject_date_filter failed for chunk %d: %s", job_id, entry["index"], exc)
+            entry["status"] = "failed"
+            entry["error_summary"] = f"日期过滤注入失败: {exc}"[:200]
+            _update_job(job_id, output_files=list(output_files))
+            continue
+
+        # 4d. 清理可能残留的部分文件
+        try:
+            Path(chunk_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        # 4e. progress_offset = 已完成块的行数之和（排除当前块）
+        progress_offset = sum(
+            e.get("rows", 0) for e in output_files if e.get("status") == "completed"
+        )
+
+        # 4f. 执行单块导出
+        try:
+            result = _run_single_export(
+                job_id=job_id,
+                sql=chunk_sql,
+                env=env,
+                conn_type=conn_type,
+                batch_size=batch_size,
+                output_path=chunk_path,
+                sheet_prefix="Sheet",
+                progress_offset=progress_offset,
+                progress_total=len(output_files),
+                chunk_label=chunk_label,
+                cursor_column=cursor_column,
+                output_format=("csv" if output_format == "csv_zip" else output_format),
+                xlsx_engine=xlsx_engine,
+                query_id_prefix=f"dataagent_export:{job_id}:retry:{entry['index']}",
+                prefer_chunked=prefer_chunked,
+            )
+            # 成功
+            entry["status"] = "completed"
+            entry["rows"] = result.get("exported_rows", 0)
+            entry["sheets"] = result.get("total_sheets", 0)
+            try:
+                entry["file_size"] = Path(chunk_path).stat().st_size
+            except Exception:
+                entry["file_size"] = None
+            logger.info(
+                "[RetryChunks %s] Chunk %d 重试成功: %d 行",
+                job_id, entry["index"], entry["rows"],
+            )
+        except Exception as exc:
+            err_msg = _humanize_error(exc)
+            entry["status"] = "failed"
+            entry["error_summary"] = err_msg[:200]
+            logger.warning(
+                "[RetryChunks %s] Chunk %d 重试失败: %s",
+                job_id, entry["index"], err_msg,
+            )
+
+        # 4g. 每块完成后持久化进度
+        n_comp_now = sum(1 for e in output_files if e.get("status") == "completed")
+        cum_rows = sum(e.get("rows", 0) for e in output_files if e.get("status") == "completed")
+        cum_sheets = sum(e.get("sheets", 0) for e in output_files if e.get("status") == "completed")
+        _update_job(
+            job_id,
+            exported_rows=cum_rows,
+            done_batches=n_comp_now,
+            total_sheets=cum_sheets,
+            output_files=list(output_files),
+        )
+
+    # ── 5. 全部失败块处理完毕，重新统计终态 ──────────────────────────────────
+    n_completed = sum(1 for e in output_files if e.get("status") == "completed")
+    n_failed = sum(1 for e in output_files if e.get("status") == "failed")
+    total_size = sum((e.get("file_size") or 0) for e in output_files)
+    cum_rows = sum(e.get("rows", 0) for e in output_files if e.get("status") == "completed")
+    cum_sheets = sum(e.get("sheets", 0) for e in output_files if e.get("status") == "completed")
+
+    # csv_zip 模式：重新打包（覆盖旧 zip）
+    if output_format == "csv_zip":
+        import zipfile as _zipfile
+        zip_path = str(output_dir.parent / (output_dir.name + ".zip"))
+        zip_name = output_dir.name + ".zip"
+        if n_failed > 0 and n_completed > 0:
+            zip_path = str(output_dir.parent / f"partial_{output_dir.name}.zip")
+            zip_name = f"partial_{output_dir.name}.zip"
+        with _zipfile.ZipFile(zip_path, "w", compression=_zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            for e in output_files:
+                if e.get("status") == "completed" and e.get("file_path") and Path(e["file_path"]).exists():
+                    zf.write(e["file_path"], arcname=e.get("filename") or Path(e["file_path"]).name)
+        total_size = Path(zip_path).stat().st_size
+        _update_job(job_id, file_path=zip_path, output_filename=zip_name)
+
+    _update_job(job_id, output_files=list(output_files))
+
+    if n_failed == 0:
+        _mark_completed(
+            job_id,
+            exported=cum_rows,
+            done_b=n_completed,
+            total_b=len(output_files),
+            sheets=cum_sheets,
+            file_size=total_size,
+        )
+        _update_job(job_id, error_message=None)
+        logger.info(
+            "[RetryChunks %s] 全部块重试成功: %d 个块, %d 行",
+            job_id, n_completed, cum_rows,
+        )
+    elif n_completed == 0:
+        failed_summaries = [
+            {"index": e.get("index"), "date_start": e.get("date_start"),
+             "date_end": e.get("date_end"), "error": e.get("error_summary", "")}
+            for e in output_files if e.get("status") == "failed"
+        ]
+        summary = _build_failure_summary(failed_summaries, total_chunks=len(output_files))
+        _mark_failed(job_id, summary or "全部块重试均失败", exported=0, done_b=0)
+        logger.error("[RetryChunks %s] 全部块重试失败", job_id)
+    else:
+        failed_summaries = [
+            {"index": e.get("index"), "date_start": e.get("date_start"),
+             "date_end": e.get("date_end"), "error": e.get("error_summary", "")}
+            for e in output_files if e.get("status") == "failed"
+        ]
+        summary = _build_failure_summary(failed_summaries, total_chunks=len(output_files))
+        _mark_partial_failed(
+            job_id,
+            summary=summary,
+            exported=cum_rows,
+            done_b=n_completed,
+            total_b=len(output_files),
+            sheets=cum_sheets,
+            file_size=total_size,
+        )
+        logger.warning(
+            "[RetryChunks %s] 部分块重试成功: %d/%d 成功, %d 失败",
+            job_id, n_completed, len(output_files), n_failed,
+        )
+
+
+async def retry_failed_chunks_async(job_id: str, batch_size: int) -> None:
+    """异步包装：前置快速校验后提交线程池执行。"""
+    from backend.config.database import SessionLocal
+    from backend.models.export_job import ExportJob
+
+    # 快速只读校验（避免无效入队）
+    db = SessionLocal()
+    try:
+        job = db.query(ExportJob).filter(ExportJob.id == job_id).first()
+        if not job:
+            raise ValueError(f"任务不存在: {job_id}")
+        if job.export_mode != "date_chunked":
+            raise ValueError("仅 date_chunked 模式支持失败子任务重试")
+        if job.status not in ("partial_failed", "failed"):
+            raise ValueError(f"当前状态 '{job.status}' 不支持重试（需为 partial_failed 或 failed）")
+        has_failed = any(e.get("status") == "failed" for e in (job.output_files or []))
+        if not has_failed:
+            raise ValueError("没有状态为 failed 的子任务")
+    finally:
+        db.close()
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(_EXPORT_EXECUTOR, _retry_failed_chunks_sync, job_id, batch_size)
