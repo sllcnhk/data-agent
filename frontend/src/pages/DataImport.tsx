@@ -68,6 +68,7 @@ interface SheetFormRow extends SheetPreview {
   table: string;
   has_header: boolean;
   enabled: boolean;
+  import_type: 'standard' | 'call_record_imported';
   databases: string[];   // 已加载的 DB 列表
   tables: string[];      // 已加载的 Table 列表
   loadingDbs: boolean;
@@ -163,6 +164,7 @@ const DataImportPage: React.FC = () => {
         table: '',
         has_header: true,
         enabled: true,
+        import_type: 'standard',
         databases: [],
         tables: [],
         loadingDbs: false,
@@ -238,6 +240,7 @@ const DataImportPage: React.FC = () => {
         table: s.table,
         has_header: s.has_header,
         enabled: s.enabled,
+        import_type: s.import_type,
       }));
       const result = await dataImportApi.executeImport({
         upload_id: uploadId,
@@ -573,6 +576,25 @@ const DataImportPage: React.FC = () => {
                         onChange={(v) => updateSheet(idx, { has_header: v })}
                       />
                     </Space>
+                  </Col>
+                  <Col>
+                    <Space>
+                      <Text>导入类型：</Text>
+                      <Select
+                        style={{ width: 200 }}
+                        disabled={!sheet.enabled}
+                        value={sheet.import_type}
+                        onChange={(v) => updateSheet(idx, { import_type: v })}
+                      >
+                        <Option value="standard">标准导入</Option>
+                        <Option value="call_record_imported">呼叫记录导入（RHB）</Option>
+                      </Select>
+                    </Space>
+                    {sheet.import_type === 'call_record_imported' && (
+                      <div style={{ marginTop: 4, color: '#888', fontSize: 12 }}>
+                        自动映射 15 个固定字段，其余非空列打包进 tag_array
+                      </div>
+                    )}
                   </Col>
                   <Col>
                     <Space>

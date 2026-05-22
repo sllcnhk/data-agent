@@ -57,6 +57,7 @@ class SheetConfig(BaseModel):
     table: str
     has_header: bool = True
     enabled: bool = True
+    import_type: str = "standard"   # "standard" | "call_record_imported"
 
 
 class ExecuteImportRequest(BaseModel):

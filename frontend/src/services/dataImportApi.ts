@@ -53,12 +53,15 @@ export interface UploadResult {
   sheets: SheetPreview[];
 }
 
+export type ImportType = 'standard' | 'call_record_imported';
+
 export interface SheetConfig {
   sheet_name: string;
   database: string;
   table: string;
   has_header: boolean;
   enabled: boolean;
+  import_type?: ImportType;
 }
 
 export interface ExecuteImportRequest {

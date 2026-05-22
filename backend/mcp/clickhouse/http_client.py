@@ -149,6 +149,54 @@ class ClickHouseHTTPClient:
             return rows, col_types
         return rows
 
+    def insert_json_rows(
+        self,
+        database: str,
+        table: str,
+        col_names: List[str],
+        rows: List[Dict[str, Any]],
+    ) -> None:
+        """
+        使用 FORMAT JSONEachRow 批量插入，支持 Array/Nullable 等复杂类型。
+
+        每行为 dict {col_name: value}，Array(String) 直接传 Python list。
+        比 insert_tsv 更适合含 Array 字段的目标表。
+        """
+        import json
+
+        lines = []
+        for row in rows:
+            obj = {k: row.get(k) for k in col_names}
+            lines.append(json.dumps(obj, ensure_ascii=False, default=str))
+        body = "\n".join(lines) + "\n"
+
+        params: Dict[str, Any] = {
+            "user": self.user,
+            "password": self.password,
+            "database": self.database,
+            "query": f"INSERT INTO `{database}`.`{table}` FORMAT JSONEachRow",
+        }
+
+        try:
+            resp = self._session.post(
+                self._base_url,
+                data=body.encode("utf-8"),
+                params=params,
+                timeout=self.timeout,
+            )
+        except requests.ConnectionError as exc:
+            raise ConnectionError(
+                f"ClickHouse HTTP 连接失败 {self.host}:{self.port}: {exc}"
+            ) from exc
+        except requests.Timeout as exc:
+            raise TimeoutError(f"ClickHouse HTTP 超时 {self.host}:{self.port}") from exc
+
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"ClickHouse INSERT 失败 {resp.status_code} "
+                f"({self.host}:{self.port}): {resp.text[:500]}"
+            )
+
     def insert_tsv(self, database: str, table: str, rows: List[Tuple]) -> None:
         """
         高性能批量插入：使用 FORMAT TabSeparated，比 VALUES 快 3-5 倍。

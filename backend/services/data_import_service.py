@@ -24,6 +24,113 @@ MAX_FILE_SIZE = 100 * 1024 * 1024
 # 预览行数
 PREVIEW_ROWS = 5
 
+# ─────────────────────────────────────────────────────────────────────────────
+# call_record_imported 常量
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 这 15 列在目标表中有独立字段，其余列打包进 tag_array
+_CR_FIXED_COLS = [
+    "Task Name", "Dialogue Name", "Contact ID", "Audio Name", "Call ID",
+    "Result", "Call Time", "Call Duration", "Agent Call Duration",
+    "Dialogue Round", "Have Read", "Agent", "Tags", "Transfer Status",
+    "Call Record Text Detail Masked",
+]
+_CR_FIXED_SET = set(_CR_FIXED_COLS)
+
+# 目标表显式插入列（不插 id/import_time，有 DEFAULT）
+_CR_TARGET_COLS = [
+    "import_job_id", "source_file",
+    "task_name", "dialogue_name", "contact_id", "audio_name", "call_id",
+    "result", "call_start_time", "call_duration", "agent_call_duration",
+    "dialogue_round", "have_read", "agent", "tags", "transfer_status",
+    "call_record_text_detail_masked", "tag_array",
+]
+
+
+def _parse_call_time(raw) -> Optional[str]:
+    """DD/MM/YYYY HH:MM:SS → 'YYYY-MM-DD HH:MM:SS'，解析失败返回 None。"""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    for fmt in ("%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+    return None
+
+
+def _safe_int(v) -> Optional[int]:
+    """转 int，失败返回 None。"""
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_str(v) -> str:
+    """转 str，None/NaN → 空串。"""
+    if v is None:
+        return ""
+    s = str(v).strip()
+    return "" if s.lower() == "nan" else s
+
+
+def transform_call_record_batch(
+    rows: List[Tuple],
+    headers: List[str],
+    job_id: str,
+    source_file: str,
+) -> List[Dict[str, Any]]:
+    """
+    将 call_record_imported 类型的一批原始 Excel 行转换为目标表 dict 列表。
+
+    - 固定 15 列 → 独立字段（Call Time 解析为 DateTime）
+    - 其余非空列 → tag_array（格式 "ColName=value"）
+    - 返回 list[dict]，key 与 _CR_TARGET_COLS 一致
+    """
+    # 按列名定位索引（容错列序）
+    col_idx: Dict[str, int] = {h: i for i, h in enumerate(headers)}
+
+    def _get(row, col_name) -> Any:
+        idx = col_idx.get(col_name)
+        return row[idx] if idx is not None and idx < len(row) else None
+
+    extra_cols = [h for h in headers if h not in _CR_FIXED_SET]
+
+    result = []
+    for row in rows:
+        tag_array = []
+        for col in extra_cols:
+            val = _get(row, col)
+            s = _safe_str(val)
+            if s:
+                tag_array.append(f"{col}={s}")
+
+        result.append({
+            "import_job_id": job_id,
+            "source_file":   source_file,
+            "task_name":     _safe_str(_get(row, "Task Name")),
+            "dialogue_name": _safe_str(_get(row, "Dialogue Name")),
+            "contact_id":    _safe_str(_get(row, "Contact ID")),
+            "audio_name":    _safe_str(_get(row, "Audio Name")),
+            "call_id":       _safe_str(_get(row, "Call ID")),
+            "result":        _safe_str(_get(row, "Result")),
+            "call_start_time":               _parse_call_time(_get(row, "Call Time")),
+            "call_duration":                 _safe_int(_get(row, "Call Duration")),
+            "agent_call_duration":           _safe_int(_get(row, "Agent Call Duration")),
+            "dialogue_round":                _safe_int(_get(row, "Dialogue Round")),
+            "have_read":                     _safe_str(_get(row, "Have Read")),
+            "agent":                         _safe_str(_get(row, "Agent")),
+            "tags":                          _safe_str(_get(row, "Tags")),
+            "transfer_status":               _safe_str(_get(row, "Transfer Status")),
+            "call_record_text_detail_masked": _safe_str(_get(row, "Call Record Text Detail Masked")),
+            "tag_array": tag_array,
+        })
+    return result
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 辅助：构建 ClickHouseHTTPClient
@@ -309,6 +416,7 @@ async def run_import_job(job_id: str, config: Dict[str, Any]) -> None:
         database = sc["database"]
         table = sc["table"]
         has_header = sc.get("has_header", True)
+        import_type = sc.get("import_type", "standard")
 
         # 每个 sheet 开始前检查取消
         if _is_cancelling():
@@ -325,7 +433,20 @@ async def run_import_job(job_id: str, config: Dict[str, Any]) -> None:
         finally:
             db.close()
 
-        logger.info("[ImportJob %s] Starting sheet '%s' → %s.%s", job_id, sheet_name, database, table)
+        logger.info("[ImportJob %s] Starting sheet '%s' → %s.%s [type=%s]",
+                    job_id, sheet_name, database, table, import_type)
+
+        # ── 批次插入辅助（根据 import_type 选择路径）────────────────────────
+        cr_headers: List[str] = []   # call_record_imported 时保存表头列名
+
+        def _do_insert(batch: List[Tuple]) -> None:
+            if import_type == "call_record_imported":
+                transformed = transform_call_record_batch(
+                    batch, cr_headers, job_id, os.path.basename(file_path)
+                )
+                client.insert_json_rows(database, table, _CR_TARGET_COLS, transformed)
+            else:
+                client.insert_tsv(database, table, batch)
 
         try:
             wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
@@ -337,9 +458,11 @@ async def run_import_job(job_id: str, config: Dict[str, Any]) -> None:
             _row_iter = ws.iter_rows(values_only=True)
 
             for row in _row_iter:
-                # 跳过表头
+                # 处理表头行
                 if is_first_row and has_header:
                     is_first_row = False
+                    if import_type == "call_record_imported":
+                        cr_headers = [str(c) if c is not None else "" for c in row]
                     continue
                 is_first_row = False
 
@@ -348,7 +471,7 @@ async def run_import_job(job_id: str, config: Dict[str, Any]) -> None:
                 if len(batch_rows) >= batch_size:
                     sheet_batch_num += 1
                     try:
-                        client.insert_tsv(database, table, batch_rows)
+                        _do_insert(batch_rows)
                         sheet_imported += len(batch_rows)
                         total_imported += len(batch_rows)
                         done_batches_all += 1
@@ -410,7 +533,7 @@ async def run_import_job(job_id: str, config: Dict[str, Any]) -> None:
             if batch_rows:
                 sheet_batch_num += 1
                 try:
-                    client.insert_tsv(database, table, batch_rows)
+                    _do_insert(batch_rows)
                     sheet_imported += len(batch_rows)
                     total_imported += len(batch_rows)
                     done_batches_all += 1
