@@ -592,35 +592,55 @@ class Settings(BaseSettings):
                 return bool(kv)
         return False
 
+    def get_all_mysql_envs(self) -> list:
+        """
+        自动发现所有已定义的 MySQL 环境名称（与 get_all_clickhouse_envs 同模式）。
+
+        扫描两处来源：
+          1. pydantic model_fields — 已声明 mysql_{env}_host 字段的已知环境（prod/staging）
+          2. os.environ — 直接在 .env 中添加 MYSQL_{ENV}_HOST 的新环境
+
+        返回值不过滤 host 是否非空；是否实际注册由 initialize_all() 中的 host 检查决定。
+        """
+        import re as _re
+        envs: set = set()
+        for field_name in self.model_fields:
+            m = _re.match(r'^mysql_(\w+)_host$', field_name)
+            if m:
+                envs.add(m.group(1))
+        for key in os.environ:
+            m = _re.match(r'^MYSQL_(\w+)_HOST$', key)
+            if m:
+                envs.add(m.group(1).lower())
+        return sorted(envs)
+
     def get_mysql_config(self, env: str) -> dict:
         """
-        获取MySQL配置
+        获取MySQL配置（支持任意 env，无需预声明 pydantic 字段）。
 
         Args:
-            env: 环境名称（prod, staging）
-
-        Returns:
-            MySQL配置字典
+            env: 环境名称（prod/staging 或任意新增环境）
         """
         env = env.lower()
-        if env == "prod":
+        # 先尝试 pydantic 字段（prod/staging 等已声明的已知环境）
+        host_attr = f"mysql_{env}_host"
+        if hasattr(self, host_attr) and getattr(self, host_attr, None) is not None:
             return {
-                "host": self.mysql_prod_host,
-                "port": self.mysql_prod_port,
-                "database": self.mysql_prod_database,
-                "user": self.mysql_prod_user,
-                "password": self.mysql_prod_password,
+                "host": getattr(self, host_attr, ""),
+                "port": getattr(self, f"mysql_{env}_port", 3306),
+                "database": getattr(self, f"mysql_{env}_database", ""),
+                "user": getattr(self, f"mysql_{env}_user", ""),
+                "password": getattr(self, f"mysql_{env}_password", ""),
             }
-        elif env == "staging":
-            return {
-                "host": self.mysql_staging_host,
-                "port": self.mysql_staging_port,
-                "database": self.mysql_staging_database,
-                "user": self.mysql_staging_user,
-                "password": self.mysql_staging_password,
-            }
-        else:
-            raise ValueError(f"未知的MySQL环境: {env}")
+        # 再从 os.environ 读取动态新增环境（如 MYSQL_ANALYTICS_HOST）
+        env_upper = env.upper()
+        return {
+            "host": os.environ.get(f"MYSQL_{env_upper}_HOST", ""),
+            "port": int(os.environ.get(f"MYSQL_{env_upper}_PORT", "3306") or 3306),
+            "database": os.environ.get(f"MYSQL_{env_upper}_DATABASE", ""),
+            "user": os.environ.get(f"MYSQL_{env_upper}_USER", ""),
+            "password": os.environ.get(f"MYSQL_{env_upper}_PASSWORD", ""),
+        }
 
     def get_proxy_config(self, provider: str) -> Optional[dict]:
         """

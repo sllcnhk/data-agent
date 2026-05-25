@@ -1872,6 +1872,204 @@ ENABLE_AUTH=false                       ENABLE_AUTH=true
 
 ---
 
+## 4.26 对话上下文管理机制（Context Management）
+
+本节说明一个 Chat 会话从消息存储、上下文组装、压缩策略到 LLM 调用的完整链路，以及中途切换模型时的行为。
+
+---
+
+### 4.26.1 存储层（数据库）
+
+```
+conversations
+  ├── id (UUID PK)
+  ├── current_model          -- 当前使用的模型 key（实时更新）
+  ├── model_history (JSONB)  -- 模型切换历史（字段存在但代码暂未写入）
+  ├── extra_metadata (JSONB) -- system_prompt / context_summary（LLM 摘要缓存）/ auto_continue_state
+  └── messages (1:N) →
+
+messages
+  ├── role          -- user / assistant / system / continuation
+  ├── content       -- 消息文本
+  ├── model         -- 生成该消息所用的模型
+  ├── tool_calls    -- MCP 调用记录（元数据用途，非上下文重建用）
+  ├── extra_metadata.thinking_events  -- 工具调用 + 结果事件（用于前端"思考"展示）
+  └── prompt_tokens / completion_tokens / total_tokens
+```
+
+工具调用结果**不**存在 `tool_results` 字段，而是序列化到 `extra_metadata.thinking_events`（截断到 2000 字符/条）。
+
+---
+
+### 4.26.2 上下文组装流程
+
+每次用户发消息，`send_message_stream()` 按以下顺序组装上下文：
+
+```
+[1] 保存用户消息到 DB
+      ↓
+[2] _maybe_summarize()
+    条件：messages 数量 > max_context_messages（默认 30）
+    行为：LLM 对"中间段"消息生成结构化摘要 → 缓存到 conversation.extra_metadata['context_summary']
+          仅在消息数量变化时重新生成（有缓存则复用）
+      ↓
+[3] _build_context(conversation_id, llm_summary)
+    - 从 DB 读取最多 10,000 条消息（无截断上限）
+    - 将 role="continuation" 映射为 "user"（对 LLM 透明）
+    - 历史附件注入可读标注：[附件: filename (mime_type, N bytes)]
+    - 调用 HybridContextManager 压缩（见下节）
+    - 返回 {history, system_prompt, context_info, username, ...}
+      ↓
+[4] 传入 MasterAgent → AgenticLoop（5 阶段循环）
+```
+
+---
+
+### 4.26.3 三层压缩策略
+
+**第一层：HybridContextManager**（`backend/core/context_manager.py`）
+
+由 `CONTEXT_STRATEGY` 配置项控制（默认 `smart`）：
+
+| 策略 | 行为 |
+|------|------|
+| `full` | 保留全部消息 |
+| `sliding_window` | 仅保留最近 N 条（`CONTEXT_WINDOW_SIZE`） |
+| `smart` / `compressed` | 保留前 2 条 + 最近 10 条；中间段替换为 LLM 生成的摘要 |
+| `semantic` | 语义检索（未完全实现） |
+
+`smart` 策略摘要格式（结构化 Markdown）：
+```
+- 用户目标
+- 已完成的操作
+- 关键发现
+- 当前状态
+```
+
+**第二层：循环内压缩**（`agentic_loop.py` `_compress_loop_messages()`）
+
+AgenticLoop 在每轮工具调用后检测消息总字符数，超过 **60,000 字符** 阈值时：
+- 保留最后 5 个 tool_result 完整内容
+- 更早的 tool_result 截断到前 120 字符 + `[历史结果已压缩]`
+
+**第三层：工具结果截断**
+
+- MCP 工具结果 > **8,000 字符** → 截断 + `[结果已截断...原始长度 N 字符]`
+- DB 存储时 thinking_events 中每条结果截断到 **2,000 字符**
+
+---
+
+### 4.26.4 中途切换 LLM 模型
+
+切换模型时（前端 SendMessageRequest.model_key 变化）：
+
+```python
+# backend/api/conversations.py
+if request.model_key != conversation.current_model:
+    conversation.current_model = model_key   # 立即持久化新模型
+    db.commit()
+```
+
+**新模型收到的上下文**：
+- `_build_context()` 读取**全部历史消息**，不按 model 字段过滤
+- 压缩策略与之前相同，摘要缓存不清空
+- 历史消息中 GPT-4 生成的 assistant 回复和 Claude 生成的回复平等并列
+- 新模型的 `LLMAdapter` 由 `MasterAgent.process_stream()` 根据 `model_key` 重新实例化
+
+**结论**：切换模型不会丢失任何历史。新模型看到的是完整（可能被压缩）的对话历史，包括前一个模型的全部回复。`model_history` 字段目前未被写入，无法从 DB 查询历史模型切换记录。
+
+---
+
+### 4.26.5 Claude API 无状态原理 + 与 Claude Code 的等价性
+
+#### Claude API 是无状态的
+
+**Anthropic 的 Claude API（`/v1/messages`）本身没有"session"或"chat"概念**。每次 API 调用都是独立的：
+
+```
+[data-agent 每次发消息]
+    ↓
+POST /v1/messages  {
+    "model": "claude-xxx",
+    "messages": [           ← 完整历史数组（客户端组装）
+        {"role": "user",      "content": "第1条消息"},
+        {"role": "assistant", "content": "第1条回复"},
+        {"role": "user",      "content": "第2条消息"},
+        ...
+        {"role": "user",      "content": "本次新消息"}
+    ]
+}
+    ↓
+Claude 处理后返回，连接即关闭
+下一条消息 → 重新发起新的 HTTP 请求，再次携带完整历史
+```
+
+"对话连续性"完全由**客户端**（data-agent 的 PostgreSQL）负责维护。Claude 每次只看传入的 messages 数组，不感知这是第几轮、是否同一用户。
+
+#### data-agent 与 VS Code Claude Code 插件的等价性
+
+若 data-agent 的某个 Chat 全程使用 Claude 模型，其 API 调用方式与 VS Code Claude Code 插件**在 Claude 侧完全等价**：
+
+| 维度 | data-agent（Claude 模型） | VS Code Claude Code 插件 |
+|------|--------------------------|--------------------------|
+| **Claude API 调用** | `AgenticLoop` 每轮调用一次 `/v1/messages` | 每次发消息调用一次 `/v1/messages` |
+| **messages 数组** | `_build_context()` 从 PostgreSQL 组装 | Claude Code 从本地 session 组装 |
+| **Claude 侧视角** | 收到 messages 数组 → 处理 → 返回 | 收到 messages 数组 → 处理 → 返回 |
+| **历史维护者** | data-agent PostgreSQL | Claude Code 本地文件/内存 |
+| **上下文压缩** | smart 策略（消息数>30 自动触发） | `/compact` 命令（手动或自动触发） |
+| **Claude 侧是否有 session** | **否** | **否** |
+
+**结论**：只要每次调用传入的 messages 数组是完整连贯的，Claude 的处理效果就和在 VS Code 里不断发消息一模一样。两者的差异仅在于客户端的历史管理方式。
+
+#### 值得注意的差异
+
+data-agent 的 smart 压缩策略在消息数超过 `max_context_messages`（默认 30）后**自动**用 LLM 摘要替换中间段，效果等同于 Claude Code 的 `/compact`，但对用户无感知。若需要对长对话保留精确的中间推理链，可将 `CONTEXT_STRATEGY=full` 或调大 `max_context_messages`（见 `backend/config/settings.py`）。
+
+---
+
+### 4.26.6 完整上下文数据流（一图总览）
+
+```
+用户发消息
+    │
+    ▼
+[DB] 保存 user message
+    │
+    ▼
+消息数 > 30?──是──► LLM 摘要中间段 → 缓存到 extra_metadata.context_summary
+    │
+    ▼
+_build_context()
+  ├─ DB 读全量消息（≤10,000）
+  ├─ continuation→user 角色映射
+  ├─ 历史附件标注注入
+  └─ HybridContextManager.compress()
+       ├─ smart: 头2条 + LLM摘要 + 尾10条
+       ├─ sliding_window: 最近N条
+       └─ full: 全量
+    │
+    ▼
+MasterAgent（路由到 AgenticLoop / ETLAgent / AnalystAgent）
+    │
+    ▼
+AgenticLoop 5阶段循环:
+  1. _perceive(): 将 history 转为 LLM messages 格式
+  2. 获取 MCP 工具列表
+  3. LLM call (messages + tools)
+  4. 执行工具 → 结果截断(>8000字符)
+  5. 结果追加为 user message → 循环内压缩(>60000字符)
+     └─ 重复直到 stop_reason=end_turn
+    │
+    ▼
+[DB] 保存 assistant message
+      + extra_metadata.thinking_events (工具调用序列，截断2000字符/条)
+    │
+    ▼
+SSE 流式推送前端
+```
+
+---
+
 ## 11. 启动方式
 
 ```bash

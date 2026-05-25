@@ -249,6 +249,24 @@ class MySQLMCPServer(BaseMCPServer):
             mime_type="application/json"
         )
 
+    def _ensure_connection(self):
+        """确保连接有效，断开时自动重连"""
+        try:
+            self.connection.ping(reconnect=True)
+        except Exception:
+            self.connection = pymysql.connect(
+                host=self.config["host"],
+                port=self.config["port"],
+                user=self.config["user"],
+                password=self.config["password"],
+                database=self.config["database"],
+                charset="utf8mb4",
+                cursorclass=DictCursor,
+                autocommit=True,
+                read_timeout=30,
+                write_timeout=30,
+            )
+
     def _execute_query(
         self,
         query: str,
@@ -264,6 +282,7 @@ class MySQLMCPServer(BaseMCPServer):
                     "query": query
                 }
 
+            self._ensure_connection()
             # 执行查询
             with self.connection.cursor() as cursor:
                 cursor.execute(query)
@@ -299,6 +318,7 @@ class MySQLMCPServer(BaseMCPServer):
     def _list_databases(self) -> Dict[str, Any]:
         """列出所有数据库"""
         try:
+            self._ensure_connection()
             with self.connection.cursor() as cursor:
                 cursor.execute("SHOW DATABASES")
                 databases = [row["Database"] for row in cursor.fetchall()]
@@ -319,6 +339,7 @@ class MySQLMCPServer(BaseMCPServer):
             if not database:
                 database = self.config["database"]
 
+            self._ensure_connection()
             with self.connection.cursor() as cursor:
                 query = f"SHOW TABLES FROM `{database}`"
                 cursor.execute(query)
@@ -345,6 +366,7 @@ class MySQLMCPServer(BaseMCPServer):
             if not database:
                 database = self.config["database"]
 
+            self._ensure_connection()
             with self.connection.cursor() as cursor:
                 query = f"DESCRIBE `{database}`.`{table}`"
                 cursor.execute(query)
@@ -383,6 +405,7 @@ class MySQLMCPServer(BaseMCPServer):
             if not database:
                 database = self.config["database"]
 
+            self._ensure_connection()
             with self.connection.cursor() as cursor:
                 # 获取行数
                 count_query = f"SELECT COUNT(*) as cnt FROM `{database}`.`{table}`"
@@ -444,6 +467,7 @@ class MySQLMCPServer(BaseMCPServer):
     def _test_connection(self) -> Dict[str, Any]:
         """测试连接"""
         try:
+            self._ensure_connection()
             with self.connection.cursor() as cursor:
                 cursor.execute("SELECT 1 as test")
                 result = cursor.fetchone()
@@ -470,6 +494,7 @@ class MySQLMCPServer(BaseMCPServer):
     def _get_server_info(self) -> Dict[str, Any]:
         """获取服务器信息"""
         try:
+            self._ensure_connection()
             with self.connection.cursor() as cursor:
                 # 获取版本信息
                 cursor.execute("SELECT VERSION() as version")
@@ -511,6 +536,7 @@ class MySQLMCPServer(BaseMCPServer):
             if not database:
                 database = self.config["database"]
 
+            self._ensure_connection()
             with self.connection.cursor() as cursor:
                 query = f"SHOW INDEX FROM `{database}`.`{table}`"
                 cursor.execute(query)

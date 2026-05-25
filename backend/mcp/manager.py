@@ -50,13 +50,14 @@ class MCPServerManager:
                         logger.warning("[MCPManager] Failed to register clickhouse-%s-ro: %s", env, e)
 
         if settings.enable_mcp_mysql:
-            for env in ("prod", "staging"):
+            for env in settings.get_all_mysql_envs():
                 try:
                     mysql_cfg = settings.get_mysql_config(env)
                     if not mysql_cfg.get("host"):
                         logger.info("[MCPManager] Skipping mysql-%s: host not configured", env)
                         continue
                     await self.create_mysql_server(env)
+                    logger.info("[MCPManager] Registered mysql-%s", env)
                 except Exception as e:
                     logger.warning("[MCPManager] Failed to register mysql-%s: %s", env, e)
 
