@@ -1185,11 +1185,30 @@ const DataExport: React.FC = () => {
           </Form.Item>
 
           <Form.Item
-            name="batch_size"
-            label="批次大小（高级）"
-            extra="每批从数据库读取的行数，影响内存与速度，默认 50,000 行"
+            noStyle
+            shouldUpdate={(prev, cur) => prev.export_mode !== cur.export_mode}
           >
-            <InputNumber min={1000} max={200000} step={1000} style={{ width: '100%' }} />
+            {({ getFieldValue }) => (
+              <Form.Item
+                name="batch_size"
+                label="批次大小（高级）"
+                extra={
+                  <span>
+                    每批从数据库读取的行数，影响内存与速度，默认 50,000 行
+                    {getFieldValue('export_mode') !== 'date_chunked' && (
+                      <>
+                        <br />
+                        <span style={{ color: '#fa8c16', fontWeight: 500 }}>
+                          ⚠ 普通导出模式下，若 SQL 未加 ORDER BY，网络抖动触发分批回退时可能出现数据重复或遗漏，建议在 SQL 末尾加 ORDER BY {'<'}主键列{'>'}
+                        </span>
+                      </>
+                    )}
+                  </span>
+                }
+              >
+                <InputNumber min={1000} max={200000} step={1000} style={{ width: '100%' }} />
+              </Form.Item>
+            )}
           </Form.Item>
 
           <Alert
