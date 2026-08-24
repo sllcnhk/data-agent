@@ -20,7 +20,7 @@
 10. [用户认证与多用户管理（RBAC）](#10-用户认证与多用户管理rbac)（含 10.9 Session 过期行为说明）
 11. [快速参考卡](#11-快速参考卡)
 12. [Excel → ClickHouse 数据导入（superadmin 专属）](#12-excel--clickhouse-数据导入superadmin-专属)
-13. [SQL → Excel 数据导出（superadmin 专属）](#13-sql--excel-数据导出superadmin-专属)
+13. [数据导出（superadmin 专属）](#13-数据导出superadmin-专属) — 操作手册见 [DATA_EXPORT_GUIDE.md](DATA_EXPORT_GUIDE.md)
 14. [多图表 HTML 报告生成](#14-多图表-html-报告生成)
 15. [数据管理中心](#15-数据管理中心)（含 15.4 推送任务 + 15.5 Co-pilot 技能 + 15.7 AI Pilot 实时助手 + Pilot 一对一绑定）
     - 14.9 图表控件 ⋮ 菜单（Force Refresh / Fullscreen / View Query / Download）
@@ -2009,542 +2009,189 @@ DELETE /api/v1/data-import/jobs/{job_id}
 
 ---
 
-## 13. SQL → Excel 数据导出（superadmin 专属）
+## 13. 数据导出（superadmin 专属）
 
-> **权限要求**：仅 `superadmin` 用户可使用此功能（`data:export` 权限）。
+> **权限要求**：仅 `superadmin`（`data:export` 权限）。`ENABLE_AUTH=false` 时匿名用户默认为 superadmin。
 >
-> **入口**：侧边栏导航 → **「数据导出」**（`ExportOutlined` 图标，位于「数据导入」旁边）。`ENABLE_AUTH=false` 时（单用户模式），匿名用户默认为 superadmin，可直接使用。
+> **入口**：侧边栏 → **「数据导出」**（`ExportOutlined`，在「数据导入」旁）。
 
-### 13.1 功能概述
+### 13.1 操作手册见独立文档
 
-在页面输入任意 SELECT SQL，选择 ClickHouse 连接，预览前 N 行结果后一键导出为本地 Excel（`.xlsx`）、CSV（`.csv`）或 CSV 压缩包（`.zip`）文件。支持：
+**面向使用者的完整操作手册已独立成篇：[DATA_EXPORT_GUIDE.md](DATA_EXPORT_GUIDE.md)**
 
-- **稳定流式导出（v2.15）**：每个 ClickHouse 导出查询都带唯一 `query_id`；HTTP 断流/取消时系统会 best-effort `KILL QUERY` 清理服务端残留查询；同一 ClickHouse env 默认只允许 1 个导出查询并发（`EXPORT_MAX_CONCURRENT_QUERIES_PER_ENV`），并对 `TOO_MANY_SIMULTANEOUS_QUERIES` 自动退避重试，避免旧查询堆积占满用户并发上限
-- **XLSX 直接写入**：服务端 HTTP 流式响应 + `xlsxwriter` constant_memory 模式（v2.14.3 起;v2.13 使用 openpyxl write_only），峰值内存与 `batch_size` 无关,每行写完即丢
-- **CSV 极速导出（v2.15）**：选择 CSV/CSV ZIP 时，ClickHouse 直接 `FORMAT CSVWithNames` 原始字节流写入文件，绕过逐单元格解析与 XLSX XML/ZIP 写入，适合百万/千万行明细快速交付
-- **XLSX CSV staging（v2.15）**：XLSX 写入策略支持 `auto/direct/csv_staging`。`auto` 下分块/大数据任务默认先极速落 UTF-8 CSV 临时文件，再本地转换 XLSX；这样 ClickHouse 连接只承担快速落盘，后续 XLSX 转换不再占用远端查询连接
-- **多 Sheet 自动分割**：每满 100 万数据行自动创建新 Sheet（Sheet1、Sheet2…），每个 Sheet 均带标题行
-- **按日期分块多文件导出**（v2.13 新增，见 13.7 节）：单 SQL → N 个日期窗口 → N 个 xlsx 文件，针对千万行月明细等大数据量场景，避免单文件过大、便于按时间段拆分交付
-- **大整数安全**：`Int64`/`UInt64`/`Int128`/`UInt128`/`Int256`/`UInt256` 类型自动转为字符串，避免 Excel 打开时显示科学计数法
-- **中文无乱码**：`.xlsx` 格式原生 Unicode；CSV 文件写入 UTF-8 BOM，Excel 直接打开中文不乱码；CSV→XLSX 使用 Python 标准 `csv.reader(newline="")` 解析，正确处理引号内逗号/换行，避免错误分列
-- **任务取消**：导出中途可取消；取消后已写入部分保存为残余文件（可手动删除）
-- **历史记录**：任务列表保存所有导出记录，终止状态下可删除
+那份文档覆盖：格式选择决策表、三种格式的真实差异、游标列怎么选、CSV 下游必读、
+占位符写法、报错对照表、已知限制、最佳实践配置。**遇到具体操作问题请看那里**，
+本节只保留架构与 API 参考。
 
-### 13.2 操作步骤
+### 13.2 能力边界速览（v2.16）
 
-#### 步骤一：输入 SQL + 选择连接 + 预览
+导出的真实行为随「导出模式 × 输出格式 × 写入策略 × 是否填游标列」变化。
+**这份判定的单一事实源是 [`backend/services/data_export_capabilities.py`](../backend/services/data_export_capabilities.py)**，
+经 `GET /api/v1/data-export/capabilities` 下发给前端渲染提示，
+并由 `test_export_capabilities.py` 逐条与真实代码路径对账。
 
-1. 进入数据导出页面，上方区域输入 SELECT SQL 语句（支持复杂查询，无需手动加 `LIMIT`）。
-2. 在「选择连接」下拉框选择目标 ClickHouse 连接（仅显示可写连接，只读连接不在列表中）。
-3. 点击「**查询**」按钮（或 `Ctrl+Enter`），后端执行 `SELECT * FROM (...) LIMIT N` 返回前 N 行预览数据。
-4. 预览表格显示列名、数据类型和前 N 行内容（`NULL` 值高亮显示）。
+三条互斥的数据通路：
 
-> **预览限制**：默认返回前 100 行，可通过 `limit` 参数调整（最大 500）；预览不会触发导出任务。
+| 通路 | 触发条件 | 断流应对 | 读 batch_size |
+|------|---------|---------|--------------|
+| `stream_batches`（逐行批次） | xlsx + `direct` | 自动回退：填了游标列走 keyset，否则 LIMIT/OFFSET | ✅ 每批行数 |
+| `fetch_raw_keyset_window`（keyset 多窗口） | (csv / csv_zip / xlsx+`csv_staging`) **且填了游标列** | **窗口级续传**：截回上一条完整记录，从断点游标重发同一窗口 | ✅ 窗口行数 |
+| `stream_raw`（单流原始字节） | 上述之外 | **无回退无续传**，断流即整体失败 | ❌ |
 
-#### 步骤二：导出配置 + 提交
+`auto` 引擎的解析是**按模式固定**的，不看数据量：
 
-1. 确认预览数据无误后，点击预览区域**右上角**的「**导出**」按钮。
-2. 弹出配置对话框：
+- 单文件 → `direct`（`_run_single_job_sync` 原样透传，`_run_single_export` 只判断 `== csv_staging`）
+- 分块 → `csv_staging`（`_run_chunked_export_sync` 显式解析）
 
-   | 字段 | 说明 |
-   |------|------|
-   | 输出格式 | `Excel(.xlsx)` / `CSV` / `CSV ZIP`；CSV/ZIP 为极速导出，XLSX 支持自动分 Sheet |
-   | XLSX 写入策略 | 仅输出格式为 XLSX 时显示：`自动（推荐）` / `CSV 临时落盘后转 XLSX（更稳）` / `直接写 XLSX（少中间文件）` |
-   | 任务名称 | 选填；用于文件名前缀（会自动净化特殊字符）；留空则使用 `export` |
-   | 批大小 | 每批从 ClickHouse 拉取的行数（默认 50000，范围 1000–200000） |
+### 13.3 实测确认的行为（v2.16，IDN 环境）
 
-3. 点击「**开始导出**」后：
-   - 后端创建导出任务（`status=pending`），返回 `job_id`
-   - 后台协程立即开始流式读取 + 写入 Excel
+以下几条是常被误解的地方，均经实测而非推断：
 
-#### 步骤三：监控进度 + 下载 / 取消 / 删除
-
-历史任务列表（页面下方）显示所有导出记录，每 2 秒自动轮询活跃任务状态：
-
-| 指标 | 说明 |
+| 事实 | 说明 |
 |------|------|
-| 状态徽标 | `等待中` / `进行中` / `取消中` / `已取消` / `已完成` / `失败` |
-| 已导出行数 | 累计写入 Excel 的数据行数（不含标题行）|
-| Sheet 数 | 总 Sheet 数（每 100 万行新增一张）|
-| 文件大小 | 完成后显示 `.xlsx` / `.csv` / `.zip` 文件大小 |
+| **XLSX 所有单元格都是文本** | 含 Float/Date/小整数。上游 `_parse_tsv_cell` 一律返回 str，xlsxwriter 又以 `strings_to_numbers=False` 打开。两条引擎行为一致，**无开关可改** |
+| `_format_cell` 的大整数分支当前不触发 | `output_format_json_quote_64bit_integers=1`（默认）使预览路径也拿到 str。**这是尚未触发的安全网，不是死代码** —— 若该设置改为 0，大整数会以真 int 到达，必须转 str 防 JS 精度丢失 |
+| CSV 的 NULL 是字面量 `\N` | `format_csv_null_representation` 服务端值 = 默认 `\N`。XLSX 路径写空单元格，两者不一致 |
+| CSV 大整数原样输出 | Excel 双击打开变科学计数法并丢精度；喂程序无此问题 |
+| CSV 遵循 RFC4180 | 含逗号/引号/换行的字段被引号包裹、`"` 转义为 `""`；**一条记录可跨多个物理行**，`wc -l` 不可用于核对行数 |
+| 预览「默认昨日」按 UTC 算 | `datetime.utcnow()`，东八区实际取到前天 |
+| CSV 里制表符不转义 | 与 TSV 路径不同（那里转成 `\t`） |
 
-**操作按钮**：
+### 13.4 CSV keyset 续传实现（v2.16）
 
-- **下载**（仅 `已完成`）：点击触发浏览器「另存为」对话框，下载本地 `.xlsx` / `.csv` / `.zip` 文件。
-- **取消**（仅 `等待中`/`进行中`）：协作式取消；后台协程在下一批次检测到信号后停止；`等待中` 任务直接置为 `已取消`。
-- **删除**（仅终止状态：`已完成`/`已取消`/`失败`）：删除 DB 记录和本地文件。
+**为什么「先单流、断流后从已下载位置继续」在数学上不成立**：
 
-> **取消注意**：取消后已写入部分会保存为残余文件；点击「删除」可一并清除。
+单流 `SELECT ... FORMAT CSVWithNames` 没有 `ORDER BY`，ClickHouse 并行扫描下输出
+顺序任意。断流时已落盘的 N 行只是任意子集，**不是**「cursor ≤ X 的全部行」。此时
+`WHERE cursor > X` 会同时漏行（已落盘集合未覆盖、cursor ≤ X 的行）和重复（已落盘
+集合里 cursor > X 的行）。所以唯一自洽的设计是**全程 keyset**。
 
-### 13.3 多 Sheet 自动分割说明
+实现分工：
 
-当导出行数超过 100 万（Excel 单 Sheet 硬上限约 104 万行）时，系统自动创建新工作表：
-
-```
-Sheet1: 标题行 + 第 1–1,000,000 行数据
-Sheet2: 标题行 + 第 1,000,001–2,000,000 行数据
-Sheet3: 标题行 + 第 2,000,001–... 行数据
-```
-
-每个 Sheet 均保留相同的标题行，可直接跨 Sheet 使用 Excel 筛选/排序。
-
-### 13.4 大整数处理说明
-
-ClickHouse 的 `Int64`/`UInt64` 及更大整数类型（`Int128`/`UInt128`/`Int256`/`UInt256`）在 Excel 中会被当作浮点数显示，导致末尾精度丢失或科学计数法。系统自动将上述类型转换为**字符串**写入 Excel 单元格，保留完整精度。
-
-示例：`12345678901234567` → Excel 单元格文本值 `"12345678901234567"`（而非 `1.23457E+16`）。
-
-### 13.5 注意事项与限制
-
-| 项目 | 说明 |
+| 模块 | 职责 |
 |------|------|
-| SQL 类型 | 仅支持 `SELECT` 查询；不执行 INSERT/UPDATE/DROP 等写操作 |
-| 连接类型 | 当前支持 ClickHouse；架构预留 MySQL 等扩展点（`BaseExportClient` 抽象层）|
-| 单 Sheet 行上限 | 系统限制 100 万数据行/Sheet，超出自动新建；Excel 实际单 Sheet 上限约 104 万行 |
-| 并发导出 | v2.15 起同一 ClickHouse env 默认最多 1 个导出查询并发；可用 `EXPORT_MAX_CONCURRENT_QUERIES_PER_ENV` 调整 |
-| 取消后文件 | 取消后已写入部分不会自动删除；需手动点「删除」清理 |
-| 文件存储路径 | 服务端存储于 `customer_data/{username}/exports/`；下载完成后可通过「删除」清理 |
-| 批大小 | 默认 50000 行/批；内存峰值约为 `batch_size × 行宽`；网络较慢时可适当降低 |
-| CSV staging 策略 | `auto` 下：单文件小任务默认直接写 XLSX；分块/大数据任务默认 CSV 临时落盘后转 XLSX。用户可在导出 Modal 中强制 `direct` 或 `csv_staging` |
+| [`backend/services/csv_tail.py`](../backend/services/csv_tail.py) | RFC4180 感知的记录边界扫描（`CsvRecordBoundaryScanner`）+ 游标提取。纯逻辑无 IO，`test_csv_tail.py` 穷举断点 |
+| `ClickHouseExportClient.fetch_raw_keyset_window` | 取**一个**窗口的原始字节。窗口 SQL / 参数化 / 游标校验与 `stream_batches_keyset` 共用 |
+| `_stream_sql_to_csv_file_keyset` | 拥有文件状态：窗口推进、断流截断、退避重发、游标提取、NULL/死循环 fast-fail |
 
-### 13.6 API 快速参考（程序化调用）
+断流处理三步：① `truncate` 回窗口起点（= 上一条完整记录边界）② 扫描器 `restore()`
+回滚计数 ③ 用**同一个** `last_cursor` 重发该窗口（默认最多 3 次，
+`EXPORT_CSV_KEYSET_RETRY_MAX`）。
+
+**性能前提**：每窗口都带 `ORDER BY cursor`。游标列若是表 `ORDER BY` 键的前缀，
+ClickHouse 走 read-in-order 几乎零成本；否则每窗口真排序，压力可能比单流更大。
+
+### 13.5 任务终态
+
+| 状态 | 触发 |
+|------|------|
+| `completed` | 全部成功 |
+| `partial_failed` | **分块模式**下部分块成功 + 部分块失败。这是 v2.14.7 起的**默认**行为（旧版是整 Job `failed`）；设 `EXPORT_FAIL_FAST_ON_CHUNK_ERROR=1` 可恢复旧语义 |
+| `failed` | 单文件失败，或分块模式全部块失败 |
+| `cancelled` | 用户取消。分块模式已完成块可下载；**单文件模式取消后不可下载**（`download_job` 只接受 `completed`） |
+
+分块模式支持 `POST /jobs/{id}/retry-failed-chunks` 对所有 `failed` 块串行重跑，
+已完成块不受影响。
+
+### 13.6 API 快速参考
 
 ```bash
-# 获取可写连接列表
+# 可写连接列表
 GET /api/v1/data-export/connections
-Authorization: Bearer <superadmin_token>
 
-# SQL 预览（不触发导出任务）
+# 能力矩阵（36 条，前端提示的单一事实源）
+GET /api/v1/data-export/capabilities
+
+# SQL 预览（不触发导出）
 POST /api/v1/data-export/preview
-{"query_sql": "SELECT id, name FROM users", "connection_env": "sg", "limit": 100}
-→ 返回: {"columns": [{"name":"id","type":"Int64"},...], "rows": [...], "row_count": N}
+{"query_sql": "SELECT id, name FROM users", "connection_env": "idn", "limit": 100}
+→ {"columns": [{"name":"id","type":"Int64"},...], "rows": [...],
+   "row_count": N, "preview_date": "2026-08-23"}
 
-# 提交导出任务（单文件模式）
+# 单文件导出（v2.16：顶层 cursor_column 启用 CSV keyset 续传）
 POST /api/v1/data-export/execute
-{"query_sql": "SELECT * FROM orders", "connection_env": "sg",
- "job_name": "orders_2026", "batch_size": 50000,
- "output_format": "xlsx", "xlsx_engine": "auto"}
-→ 返回: {"job_id": "...", "status": "pending",
-        "output_filename": "orders_2026_20260407_120000.xlsx",
-        "export_mode": "single"}
+{"query_sql": "SELECT * FROM orders", "connection_env": "idn",
+ "job_name": "orders", "batch_size": 50000,
+ "output_format": "csv", "cursor_column": "order_id"}
 
-# 提交导出任务（CSV 极速模式）
+# 分块导出（游标列在 chunk_config 内）
 POST /api/v1/data-export/execute
-{"query_sql": "SELECT * FROM orders", "connection_env": "sg",
- "job_name": "orders_2026", "output_format": "csv"}
-→ 返回: {"output_filename": "orders_2026_20260407_120000.csv", ...}
-
-# 提交导出任务（按日期分块模式，详见 13.7 节）
-POST /api/v1/data-export/execute
-{"query_sql": "SELECT * FROM events WHERE dt >= '{{date_start}}' AND dt <= '{{date_end}}'",
- "connection_env": "sg", "job_name": "events_apr",
+{"query_sql": "SELECT * FROM events WHERE dt >= parseDateTimeBestEffort('{{ts_start}}') AND dt < parseDateTimeBestEffort('{{ts_end}}')",
+ "connection_env": "idn", "job_name": "events",
  "output_format": "csv_zip",
- "chunk_config": {"date_start": "2025-04-01", "date_end": "2025-04-30",
-                  "chunk_days": 10, "min_subdivide_unit": "hour",
-                  "pre_split_hours": 6}}
-→ 返回: {"job_id": "...", "status": "pending",
-        "output_filename": "events_apr_20260507_120000.zip",
-        "export_mode": "date_chunked"}
+ "chunk_config": {"date_start": "2026-07-01", "date_end": "2026-07-31",
+                  "chunk_days": 1, "cursor_column": "event_id",
+                  "min_subdivide_unit": "hour", "pre_split_hours": 6}}
 
-# 轮询进度（分块模式时响应含 output_files 数组）
+# 轮询（分块模式响应含 output_files 数组）
 GET /api/v1/data-export/jobs/{job_id}
-
-# 历史任务列表
 GET /api/v1/data-export/jobs?page=1&page_size=10
-
-# 取消任务
 POST /api/v1/data-export/jobs/{job_id}/cancel
+POST /api/v1/data-export/jobs/{job_id}/retry-failed-chunks   {"batch_size": 20000}
 
-# 下载文件 — 单文件模式
+# 下载：单文件 / 分块子文件 / 分块 CSV ZIP 整包
 GET /api/v1/data-export/jobs/{job_id}/download
-
-# 下载文件 — 分块模式（普通 xlsx/csv 子文件，必须带 file_index，从 0 起）
 GET /api/v1/data-export/jobs/{job_id}/download?file_index=0
-
-# 下载文件 — 分块 CSV ZIP 模式（不带 file_index，下载整包）
-GET /api/v1/data-export/jobs/{job_id}/download
-
-# 删除记录（仅终止状态；分块模式递归删除整个输出目录）
 DELETE /api/v1/data-export/jobs/{job_id}
 ```
 
----
+### 13.7 占位符语义
 
-### 13.7 按日期分块批量导出（v2.13）
+| 占位符 | 区间 | day 模式输出 | sub-day 模式输出 |
+|--------|------|-------------|-----------------|
+| `{{ts_start}}` / `{{ts_end}}`（**推荐**） | 半开 `[start, end)` | `'YYYY-MM-DD 00:00:00'` / 次日 `00:00:00` | 始终 datetime，`ts_end` = 下一窗口起点 |
+| `{{date_start}}` / `{{date_end}}`（经典） | 闭 `[start, end]` | `'YYYY-MM-DD'` | `'YYYY-MM-DD HH:MM:SS'` |
 
-> **适用场景**：单次导出数据量极大（如千万行级别月明细）、单文件难以处理、希望按时间段拆分交付。例如：导出 1 个月（约 1200 万行）的订单明细，按每 10 天一个 Excel 文件拆分为 3 个交付物，便于按周阅读和归档。
+**启用小时/分钟级再细分时必须用 `ts` 那套**。经典占位符在 sub-day 下无论怎么写都会
+错：`addDays(toDate('{{date_end}}'), 1)` 会让整天数据被两个 12h 子块各取一遍（翻倍）；
+`addDays(parseDateTimeBestEffort(...), 1) + INTERVAL 1 SECOND` 会让窗口变成 36 小时
+（重叠）。`ts` 占位符始终输出 datetime 且 `ts_end` 恒等于下一窗口起点，配合 `>=` / `<`
+天然无重叠无遗漏。
 
-#### 13.7.1 何时使用分块模式
+两套占位符可共存（各自替换），但**每套必须成对出现**，只写一个会被校验层 400 拒绝。
 
-| 场景 | 推荐模式 |
-|------|----------|
-| 单次导出 < 500 万行 | 单文件模式（13.2 节）|
-| 单次导出 500 万 ~ 5000 万行，按时间维度交付 | **分块模式**（本节）|
-| 数据无明显时间维度 / 需聚合后导出 | 单文件模式 + 业务侧拆分 |
-| 必须 1 个文件交付（合规要求等） | 单文件模式（多 Sheet 自动拆分）|
-
-#### 13.7.2 操作步骤
-
-##### 步骤一：撰写 SQL（推荐占位符写法）
-
-为获得最佳查询性能（让 ClickHouse 直接谓词下推到源表），强烈推荐在 SQL 中使用 `{{date_start}}` 与 `{{date_end}}` **占位符**，系统会按每个日期块替换为字面量字符串：
-
-```sql
--- ✅ 推荐：占位符写法（性能最佳）
-SELECT order_id, user_id, amount, event_date, region
-FROM events.order_detail
-WHERE event_date >= '{{date_start}}'
-  AND event_date <= '{{date_end}}'
-  AND status = 'paid'
-ORDER BY event_date
-```
-
-每块执行时，`{{date_start}}` / `{{date_end}}` 会被替换为该块的实际日期：
-- 块 1（4-01~4-10）→ `WHERE event_date >= '2025-04-01' AND event_date <= '2025-04-10'`
-- 块 2（4-11~4-20）→ `WHERE event_date >= '2025-04-11' AND event_date <= '2025-04-20'`
-- 块 3（4-21~4-30）→ `WHERE event_date >= '2025-04-21' AND event_date <= '2025-04-30'`
-
-> **校验保护**：必须**两个占位符成对出现**，仅写一个会被校验层拒绝（避免未替换的占位符送给 ClickHouse 触发语法错误）。
-
-如果不便修改 SQL，也可使用**包装模式**（兜底），由系统自动外包一层日期过滤子查询；但复杂查询（含 GROUP BY / JOIN）时谓词无法下推，性能可能较差，仅推荐用于简单 SELECT：
-
-```sql
--- ⚠️ 包装模式：SQL 不含占位符，必须在配置中提供「日期列名」
-SELECT order_id, user_id, amount, event_date, region
-FROM events.order_detail
-WHERE status = 'paid'
-ORDER BY event_date
-```
-
-> **占位符 SQL 的预览处理**（v2.13 新增）：含 `{{date_start}}` / `{{date_end}}` 的 SQL 不能直接执行（ClickHouse 会把 `'{{date_start}}'` 当作字面量解析失败）。系统在**预览时会自动用「样本日期」替换占位符**让预览能正常运行：
->
-> - **未指定样本日期**：默认使用**昨日**（避免今日数据可能尚未完整写入）；
-> - **手动指定**：当 SQL 中检测到占位符时，预览区域会出现提示框 + 「预览样本日期」DatePicker，可选某天作为预览样本（如 `2025-04-15`），该日期会替换 SQL 中的两个占位符；
-> - **替换说明**：预览模式下 `{{date_start}}` 与 `{{date_end}}` 都被替换为同一个样本日期（即查询当天数据）；正式导出时则按实际配置的日期范围按块替换；
-> - **预览结果标记**：预览表格标题会显示「占位符替换为 YYYY-MM-DD」便于核对；
-> - **常见 SQL 模式**：
->   - `WHERE dt >= '{{date_start}}' AND dt <= '{{date_end}}'` — 适用于 `Date` 类型列
->   - `WHERE call_start_time >= toDate('{{date_start}}') AND call_start_time < addDays(toDate('{{date_end}}'), 1)` — 适用于 `DateTime` 类型列（按天闭区间，含整天数据）
->   - `prewhere ... ` 同样支持
-
-##### 步骤二：在导出配置 Modal 切换至「按日期分块」
-
-1. 输入 SQL 并预览（同 13.2 步骤一）；
-2. 点击预览区右上角「**导出**」按钮；
-3. 在弹出的「导出配置」对话框顶部，切换「**导出模式**」为「**按日期分块（多文件）**」；
-4. 出现分块配置区，依次填写：
-
-   | 字段 | 必填 | 说明 |
-   |------|------|------|
-   | 日期范围（含起止日） | ✅ | 闭区间 RangePicker，例如 2025-04-01 ~ 2025-04-30 |
-   | 单块天数 | ✅ | 每个 Excel 文件覆盖的天数，范围 **1~90**（默认 10）|
-   | 日期列名 | 占位符模式可省 | 仅占用包装模式：填表中的日期列名（仅字母/数字/下划线，**严禁特殊字符**，防 SQL 注入）|
-   | 最小再细分粒度 | 可选 | `天/小时/分钟`。选择小时/分钟时，失败自动下钻到 sub-day；同时 v2.15 默认启用 **6 小时预分裂**，减少先跑大块约 5 分钟后断流再分裂的浪费 |
-   | 预分裂窗口（小时） | 可选 | 留空默认 6 小时（仅 hour/minute 再细分时生效）；可填 1~24。适合高峰日数据量极大、跨境连接容易 5 分钟断流的场景 |
-
-5. 点击「**开始导出**」，系统按规则切分日期范围为 N 块：
-   - 例：`2025-04-01 ~ 2025-04-30, chunk_days=10` → `[04-01~04-10], [04-11~04-20], [04-21~04-30]` 共 3 块
-   - 例：`2025-04-01 ~ 2025-04-25, chunk_days=10` → `[04-01~04-10], [04-11~04-20], [04-21~04-25]` 共 3 块（最后一块自适应缩短）
-   - 例：`chunk_days=1 + 最小再细分粒度=小时 + 预分裂窗口=6` → 单天会在任务开始前预拆为 4 个 6 小时子块，避免先执行整天大查询后再因断流重试
-
-##### 步骤三：监控进度 + 分块下载
-
-历史任务列表中的分块任务行有以下变化：
-
-- **进度列**：显示「已完成块数 / 总块数」，如 `2 / 3`，进度条按块累计；
-- **当前 Sheet 列**：显示形如 `块 2/3 (2025-04-11~2025-04-20) - Sheet1`，即「块进度 + 该块内 Sheet 名」；
-- **操作列**：完成后**不**显示单个下载按钮，而是显示蓝色 Tag「**N 个文件**」；
-- **可展开行**：点击行左侧 `>` 展开符，显示该任务的子文件清单：
-
-   | # | 日期范围 | 文件名 | 行数 | Sheet 数 | 大小 | 状态 | 操作 |
-   |---|---------|--------|------|----------|------|------|------|
-   | 0 | 2025-04-01 ~ 2025-04-10 | events_apr_20250401_to_20250410.xlsx | 4,012,300 | 5 | 415 MB | 已完成 | **下载** |
-   | 1 | 2025-04-11 ~ 2025-04-20 | events_apr_20250411_to_20250420.xlsx | 4,008,100 | 5 | 414 MB | 已完成 | **下载** |
-   | 2 | 2025-04-21 ~ 2025-04-30 | events_apr_20250421_to_20250430.xlsx | 4,001,700 | 5 | 413 MB | 已完成 | **下载** |
-
-   每行独立的下载按钮触发该子文件的浏览器另存为对话框。
-
-##### 步骤四：取消 / 删除（语义同单文件模式但更精细）
-
-- **取消**：
-  - 启动前取消 → 整体 `已取消`，无文件生成；
-  - 块间取消（块 1 完成后、块 2 启动前）→ 块 1 文件保留为「已完成」状态可下载，块 2/块 3 标记为「pending」，整体 `已取消`；
-  - 块内取消（块 N 写入中途）→ 当前块文件保留已写入部分（标 `cancelled`），后续块跳过，整体 `已取消`；
-- **删除**：递归删除整个输出目录（含所有子文件）；同样要求任务处于终止状态（`completed`/`cancelled`/`failed`）。
-
-> **故障态部分下载**：即使整体 Job 状态为 `failed`（中途某块失败），已成功完成的块仍可独立下载，便于挽回部分成果。
-
-#### 13.7.3 输出目录与文件命名
-
-服务端存储路径：
-
-```
-customer_data/{username}/exports/{job_name}_{timestamp}/
-    ├── {job_name}_{YYYYMMDD}_to_{YYYYMMDD}.xlsx   ← 块 0
-    ├── {job_name}_{YYYYMMDD}_to_{YYYYMMDD}.xlsx   ← 块 1
-    └── ...
-```
-
-例：`job_name="events_apr"`，时间戳 `20260507_120000`，日期范围 4-01~4-30，chunk_days=10：
-
-```
-customer_data/superadmin/exports/events_apr_20260507_120000/
-    ├── events_apr_20250401_to_20250410.xlsx
-    ├── events_apr_20250411_to_20250420.xlsx
-    └── events_apr_20250421_to_20250430.xlsx
-```
-
-> **中文文件名**：`job_name` 含中文（如「用户行为」）会保留在文件名中（特殊字符自动净化为下划线）。
-
-#### 13.7.4 块内仍按 100 万行/Sheet 自动拆分
-
-每个块内若超过 100 万行，仍会自动新建 Sheet。例如某块覆盖 10 天，期间产生 230 万行 → 块内文件含 3 个 Sheet（Sheet1: 100 万 + Sheet2: 100 万 + Sheet3: 30 万）。前端文件清单的「Sheet 数」列显示该块的最终 Sheet 数。
-
-#### 13.7.5 注意事项
-
-| 项目 | 说明 |
-|------|------|
-| 单块天数范围 | 必须在 1~90 区间内（Pydantic + chunker 双层校验）|
-| 占位符成对 | `{{date_start}}` 和 `{{date_end}}` 必须**同时存在**或**同时不存在**；仅写一个会被校验层 400 拒绝 |
-| 日期列名安全 | 包装模式下 `date_column` 仅允许字母/数字/下划线，并以字母或下划线起首，防 SQL 注入 |
-| 块执行模式 | 单 Job 内 N 块**串行**执行；跨 Job 并行（系统级最多 4 个并发导出 worker）|
-| 失败块处理 | 任一块失败 → Job 标 `failed`，已完成块文件保留可下载；后续未启动块跳过 |
-| 占位符大小写 | 严格匹配 `{{date_start}}` 与 `{{date_end}}`（大小写敏感）|
-| 不支持嵌套占位符 | 占位符只在 SQL 文本中替换，不支持 Jinja2 表达式或条件分支 |
-| 部分下载 | Job 状态 `failed`/`cancelled` 下，状态为 `completed` 的块文件仍可下载 |
-| 删除递归 | 删除分块任务会递归删除整个输出目录及全部子文件，操作前请下载所需文件 |
-
-#### 13.7.7 跨境/云上长查询连接断开问题与解决
-
-**故障现象**：
-导出失败，错误信息含以下关键字之一：
-- `Connection broken: IncompleteRead(0 bytes read, 2 more expected)`
-- `Response ended prematurely`
-- `urllib3.exceptions.ProtocolError`
-- `requests.exceptions.ChunkedEncodingError`
-
-**典型场景**：
-- 跨境网络（如中国 ↔ 海外区域）
-- 云上 ClickHouse 实例前有 LB / NAT / 反向代理
-- SQL 含 `decrypt`、`JSONExtract`、`arrayMap`/`arrayFilter` 等高 CPU 操作，服务端长时间内部计算无字节流出
-
-**根因**：ClickHouse 服务端先内部跑数分钟做计算，HTTP 连接此期间没有数据流动，中间链路（云 LB / NAT / 代理）默认 ~5 分钟空闲超时切断连接。
-
-**系统已自动启用以下七层防御（v2.13 五层 + v2.14 两层增强）**：
-
-1. **HTTP 层心跳**（服务端，已默认启用）：
-   - `send_progress_in_http_headers=1` — ClickHouse 周期发送 `X-ClickHouse-Progress` HTTP 头
-   - `http_headers_progress_interval_ms=10000` — 间隔 10 秒
-   - `wait_end_of_query=0` — 立即流式发送，不在服务端缓冲
-
-   这些设置作为 per-query 参数附加到导出查询的 HTTP URL，**不修改 ClickHouse 服务器配置**。心跳头让 LB/NAT 认为连接活跃。
-
-2. **TCP 层心跳**（客户端 OS 内核，已默认启用，**v2.14 修复 Windows**）：
-   - Linux/macOS：`SO_KEEPALIVE` + `TCP_KEEPIDLE=30` + `TCP_KEEPINTVL=10` + `TCP_KEEPCNT=6`（setsockopt 方式）
-   - **Windows**（v2.14 修复）：`SIO_KEEPALIVE_VALS` ioctl 在连接建立后设置（毫秒级 idle/interval），重试次数由系统固定为 10。**v2.13 在 Windows 上只挂了基础 `SO_KEEPALIVE`，间隔由注册表默认 2 小时控制等同于无效**；v2.14 真正生效。
-   - 即使服务端长时间内部计算无任何 HTTP 输出，OS 内核也会每 10 秒发送 TCP keepalive 包；防御 HTTP 心跳不够频繁或被中间链路过滤的极端场景。
-
-3. **流式断开 LIMIT/OFFSET 回退**：
-   - 触发 `ChunkedEncodingError` / `IncompleteRead` / `Response ended prematurely` 时，自动切到 LIMIT/OFFSET 模式。
-   - **v2.14 沿异常链探测**：包装层（如 `RuntimeError("分批模式预扫描行数失败")`）底下的瞬时错误也能识别，外层 retry 正确触发（修 v2.13 隐式 bug：包装异常吞掉指纹）。
-
-4. **★ 失败先原位重试一次再分裂**（v2.14 新增）：
-   - 单块流式断开 / Code 160 失败后，**先在原位重试 1 次**（5s 退避）。瞬时网络抖动场景下避免立即产出额外子文件。
-   - 重试也失败才进入对半分裂分支；重试退避期间支持取消。
-   - 上限通过环境变量 `EXPORT_INPLACE_RETRY_MAX` 控制（默认 1）。
-
-5. **★ 自动按日期对半分裂 + 小时/分钟级再细分（opt-in）**：
-   - 若重试也失败，系统**自动把失败块的日期范围对半分裂为更小子块**。
-   - 例：5 天块（01-01~01-05）失败 → 自动分裂为 2 天（01-01~01-02）+ 3 天（01-03~01-05）两个子块。
-   - **v2.13 floor 为 1 天**；**v2.14 用户可 opt-in 到小时/分钟级再细分**（见 13.7.8 节）：1 天块若失败可继续拆 12h+12h → 6h+6h... 直到 1 小时或 1 分钟阈值。
-   - 用户**无需手动修改 chunk_days**，系统自适应；最终输出的文件数可能比原计划多，但每个文件仍按日期范围命名清晰可辨。
-
-6. **★ 键集分页替代 LIMIT/OFFSET（v2.14 opt-in，正确性 + 性能双优）**：
-   - 用户提供 `cursor_column`（单调可排序列，通常是主键或时间戳）后，**流式断开回退路径用 keyset 而非 LIMIT/OFFSET**。
-   - 修两件事：
-     - **正确性**：ClickHouse 并行扫描下 `LIMIT N OFFSET M` 在无 ORDER BY 时窗口间可能重叠/漏行（隐藏 bug），keyset `WHERE cursor > last ORDER BY cursor LIMIT N` 保证互斥连续。
-     - **性能**：`LIMIT N OFFSET 1000万` 仍扫 1000 万行后丢弃；keyset 直接 `WHERE cursor > last` 从游标位置起扫，亿级行后期窗口可数量级加速。
-   - 不适用于 `GROUP BY / DISTINCT` 等聚合 SQL（行不在原表中，cursor 推进语义无效）。
-
-7. **可读错误提示**：
-   - 失败任务点击「查看详情」可见可读错误说明 + 处置建议 + 可复制的完整技术细节。
-   - **v2.14 沿异常链聚合 message**：`RuntimeError 包装 ChunkedEncodingError` 等多层异常下仍能识别底层错误类型，给出针对性建议。
-
-**自动子块分裂的用户体验**：
-
-> 若 5 天块需要分裂，最终任务列表里会出现多个文件（如下例）：
-
-| 原计划 | 自动分裂后 |
-|--------|------------|
-| 块 1：`events_20260101_to_20260105.xlsx` 失败 ❌ | 块 1a：`events_20260101_to_20260102.xlsx` ✓<br>块 1b：`events_20260103_to_20260105.xlsx` ✓ |
-
-用户在任务列表展开行可看到所有产出的子文件（含日期范围），**总共导出的数据完整覆盖原始时间区间**，仅文件数量增加。
-
-**仍然失败的极端场景与手动调优**：
-
-| 手段 | 操作 |
-|------|------|
-| 主动减小单块天数 | 在导出 Modal 把 `chunk_days` 从 5 改为 2~3（避免触发自动分裂的尝试时间）|
-| 简化 SQL | 用 `MATERIALIZED VIEW` 把 `decrypt`/`JSONExtract` 这类高 CPU 计算预存 |
-| 调高云 LB 超时 | 联系运维把云 LB / NAT 的空闲超时从 300s 调到 1800s+ |
-| 自定义心跳间隔 | 在 `.env` 设置 `CH_EXPORT_PROGRESS_INTERVAL_MS=5000` 缩短心跳间隔 |
-| 调整 TCP keepalive | 缩短 `CH_EXPORT_TCP_KEEPIDLE=15`（默认 30） |
-| 关闭心跳设置（极端） | 若 ClickHouse 版本不支持，设置 `CH_EXPORT_HTTP_KEEPALIVE=0` 全局关闭 |
-
-**环境变量完整清单**：
+### 13.8 环境变量
 
 ```bash
-# .env 文件
+# HTTP 层心跳（服务端 per-query 参数，不改服务器配置）
+CH_EXPORT_HTTP_KEEPALIVE=1                # 1=启用（默认）
+CH_EXPORT_PROGRESS_INTERVAL_MS=3000       # 心跳间隔 ms，默认 3000
 
-# HTTP 层心跳（服务端）
-CH_EXPORT_HTTP_KEEPALIVE=1                # 1=启用（默认），0=禁用
-CH_EXPORT_PROGRESS_INTERVAL_MS=10000      # 心跳间隔（ms），默认 10 秒
-
-# TCP 层心跳（客户端 OS 内核；v2.14 Windows 上真正生效）
-CH_EXPORT_TCP_KEEPALIVE=1                 # 1=启用（默认），0=禁用
-CH_EXPORT_TCP_KEEPIDLE=30                 # 空闲多少秒开始 TCP keepalive，默认 30
-CH_EXPORT_TCP_KEEPINTVL=10                # keepalive 包间隔，默认 10
-CH_EXPORT_TCP_KEEPCNT=6                   # 失败次数阈值，默认 6（Windows 上由系统固定 10，此变量被忽略）
+# TCP 层心跳（客户端 OS 内核；Windows 走 SIO_KEEPALIVE_VALS ioctl）
+CH_EXPORT_TCP_KEEPALIVE=1
+CH_EXPORT_TCP_KEEPIDLE=30
+CH_EXPORT_TCP_KEEPINTVL=10
+CH_EXPORT_TCP_KEEPCNT=6                   # Windows 上被系统固定为 10，此变量忽略
 
 # 查询层
-EXPORT_QUERY_MAX_EXECUTION_TIME=300       # 单查询最大执行秒数，跨境可调高
+EXPORT_QUERY_MAX_EXECUTION_TIME=300       # 单查询最大执行秒数
 EXPORT_CHUNK_SIZE=200000                  # LIMIT/OFFSET 回退每窗口行数
+EXPORT_MAX_CONCURRENT_QUERIES_PER_ENV=1   # 同一 env 的导出查询并发上限
 
-# v2.14 新增
-EXPORT_INPLACE_RETRY_MAX=1                # 单块失败后原位重试次数（默认 1,达上限才进入分裂）
+# 重试与分裂
+EXPORT_INPLACE_RETRY_MAX=1                # 块失败后原位重试次数
+EXPORT_TOO_MANY_RETRY_MAX=5               # Code 202 退避重试次数
+EXPORT_TOO_MANY_RETRY_BACKOFF=10          # Code 202 退避基数（秒）
+EXPORT_CSV_KEYSET_RETRY_MAX=3             # v2.16: CSV keyset 窗口断流重发次数
+EXPORT_PREFER_CHUNKED=0                   # 1=全局跳过单流首试
+EXPORT_FAIL_FAST_ON_CHUNK_ERROR=0         # 1=任一块失败即整 Job failed（旧语义）
+
+# 进度 / 取消检查节流
+CSV_STREAM_PROGRESS_EVERY_MB=64
+CSV_STREAM_CANCEL_CHECK_EVERY_MB=16
+CSV_XLSX_PROGRESS_EVERY_ROWS=20000
+CSV_XLSX_CANCEL_CHECK_EVERY_ROWS=5000
 ```
 
-#### 13.7.8 v2.14 高级配置:小时级再细分 + 键集分页(opt-in)
+### 13.9 测试覆盖
 
-针对**导出几小时级、千万行级、重型 SQL**（含 `decrypt` / `JSONExtract` / `arrayMap` 等高 CPU 操作）的极端场景，v2.14 提供两个 opt-in 字段进一步提升成功率与速度。
-
-**默认行为零变化** —— 不传新字段时，行为与 v2.13 完全一致。
-
-##### 字段 1:`min_subdivide_unit`（Task A，最小再细分粒度）
-
-| 取值 | 行为 |
-|------|------|
-| `day`（默认） | 与 v2.13 一致:对半分裂最深到 1 天，1 天块失败后整个 Job 失败 |
-| `hour` | 1 天块失败后**继续拆 12h+12h → 6h+6h → 3h+3h → 1.5h+1.5h → ≈45min（hour floor）** |
-| `minute` | 进一步下钻到 1 分钟 floor |
-
-**前置条件**：用户 SQL 的过滤列（占位符或 `date_column`）必须是 **DateTime 类型**。`Date` 列下 sub-day 字面量会被 ClickHouse 自动截断到 Date，子块返回相同行集合 → 重复失败 → 自动停在递归上限（最多 10 层）。
-
-**前端操作**：导出 Modal 切换「按日期分块」→ 高级区下拉框「最小再细分粒度」→ 选择「小时」或「分钟」。
-
-##### ★ 重要提醒(v2.14.4):占位符语义 + sub-day 兼容性
-
-经典 `{{date_start}}` / `{{date_end}}` 占位符是**闭区间** `[start, end]`,而且 day 模式输出 `'YYYY-MM-DD'`、sub-day 模式输出 `'YYYY-MM-DD HH:MM:SS'` — 这使**同一份 SQL 难以同时兼容 day 与 sub-day**:
-
-- 如果用户 SQL 写 `addDays(toDate('{{date_end}}'), 1)`(day 模式正确):
-  - sub-day 时 `toDate('2026-03-01 11:59:59')` 会截断到 `2026-03-01` → **整天数据被两个 12h 子块各取一遍 → 数据重复 2 倍** ❌
-- 如果写 `addDays(parseDateTimeBestEffort('{{date_end}}'), 1) + INTERVAL 1 SECOND`:
-  - day 模式 end=`'2026-03-01'` → `addDays(... ,1) + 1s = '2026-03-02 00:00:01'` → 多取下一天的 1 秒(与下一天 chunk 重叠)❌
-  - sub-day 时 end=`'2026-03-01 11:59:59'` → `addDays(... ,1) + 1s = '2026-03-02 12:00:00'` → **过滤窗口变成 36 小时,与第二半子块严重重叠**!❌❌
-
-**v2.14.4 推荐方案 — 使用新占位符 `{{ts_start}}` / `{{ts_end}}`(半开区间 + 始终 datetime)**:
-
-无论 day 还是 sub-day,占位符**始终输出 datetime 字面量,且 `{{ts_end}}` 等于「下一窗口起点」(exclusive end)**:
-
-| 占位符 | day(2026-03-01) | sub-day 12h 第一半 | sub-day 12h 第二半 |
-|--------|------------------|---------------------|---------------------|
-| `{{ts_start}}`(inclusive) | `'2026-03-01 00:00:00'` | `'2026-03-01 00:00:00'` | `'2026-03-01 12:00:00'` |
-| `{{ts_end}}`(**exclusive**) | `'2026-03-02 00:00:00'` | `'2026-03-01 12:00:00'` | `'2026-03-02 00:00:00'` |
-
-**用户 SQL 统一写法**(day / sub-day 完美兼容,无重叠无遗漏):
-
-```sql
-prewhere call_start_time >= parseDateTimeBestEffort('{{ts_start}}')
-    and  call_start_time <  parseDateTimeBestEffort('{{ts_end}}')
-```
-
-注意:
-- 用 `<` 而非 `<=`(半开区间);新占位符叫 `ts_end` 表示 exclusive end,语义清晰
-- `parseDateTimeBestEffort` 兼容 `Date` / `DateTime` / `DateTime64` 列(自动类型提升)
-- DateTime64 亚秒精度数据(如 11:59:59.500)在第一半 `< '12:00:00'` 内,**不会丢**
-
-**向后兼容**:经典 `{{date_start}}` / `{{date_end}}` 占位符**保留不变**,现有 SQL 无需改动;两套占位符可在同一 SQL 共存(各自替换各自)。但**强烈建议 sub-day 场景下迁移到 ts 占位符**。
-
-##### 字段 2:`cursor_column`（Task B，键集分页游标列）
-
-提供此字段后，**流式断开自动回退路径用键集分页代替 LIMIT/OFFSET**，同时解决正确性 + 性能两个问题。
-
-| 维度 | LIMIT/OFFSET（无 cursor） | 键集分页（cursor_column） |
-|------|---------------------------|---------------------------|
-| 正确性 | ⚠️ 并行扫描下窗口可能重叠/漏行 | ✓ `WHERE cursor > last` 保证互斥连续 |
-| 后期窗口扫描量 | O(M+N)（OFFSET 越大越慢） | O(N)（与窗口位置无关） |
-| 适用 SQL | 任意 | 不含 `GROUP BY / DISTINCT` 等聚合 |
-
-**选列建议**：
-- 优先选**主键**（确保唯一 + 单调）
-- 时间戳列也可（高并发同微秒插入可能漏极少数行，对导出场景一般可接受）
-- **避免 NULL（重要,常见踩坑）**:`Nullable(Int64)` 主键在异常调用 / 初始化失败的行可能为 NULL。ClickHouse 默认 `ORDER BY cursor ASC` 把 NULL 排最末 → 窗口末行 cursor=NULL → `WHERE cursor > NULL` 永远 false → keyset 推进失败。出错时报 "**keyset 分页失败:cursor 列 ... 在窗口末行为 NULL**",修法:
-  - 在 SQL `WHERE` 加 ` AND cursor_col IS NOT NULL`(确认 NULL 行可丢弃)
-  - 或先跑 `SELECT count() FROM (your_sql) WHERE cursor_col IS NULL` 看丢多少
-  - 或换一个保证 NOT NULL 的列(`contact_id` / 时间戳 + 唯一 ID 等)
-  - 或前端「游标列名」清空,回退 LIMIT/OFFSET(可能少量重叠/漏行)
-
-**重要 — 填别名(v2.14.1 起支持空格/中文)**：
-
-系统把用户 SQL 包装成 `SELECT * FROM (your_sql) AS _ks_q ORDER BY <cursor>`,外层 `_ks_q` 暴露的**只是 SELECT 输出的别名**,不是原表的 `table.column`。所以:
-
-| 用户 SQL 写法 | cursor_column 应填 | 备注 |
-|---------------|--------------------|------|
-| `cr.call_record_id as call_record_id` | `call_record_id` | 最简单,推荐 |
-| `` cr.call_record_id as `Call ID` `` | `Call ID` 或 `` `Call ID` `` | **含空格的别名**,v2.14.1 起原生支持;系统自动反引号包裹 |
-| `cr.order_id as 订单_id` | `订单_id` | 中文别名,同上 |
-| `cr.call_record_id`(无别名) | `call_record_id` | ClickHouse 默认别名 = 最右段 |
-
-**禁止字符**:反引号本身(系统会自动包裹,用户填的反引号会被 strip)、分号、引号等 SQL 注入字符;**起首必须字母/下划线/中文**(数字起首拒)。
-
-**死循环保护**：若某窗口最末 cursor 值 == 上一窗口（cursor 列含重复值且 SQL ORDER BY 不稳定），客户端 fast-fail 抛 `RuntimeError("keyset cursor 死循环")`，避免无穷重发同 query。
-
-**前端操作**：导出 Modal 切换「按日期分块」→ 高级区文本框「游标列名」→ 填入主键列名（如 `id` / `order_id` / `event_time`）。
-
-##### 推荐组合(您下次几小时级千万行导出的最佳配置)
-
-```
-单块天数(chunk_days):  1
-最小再细分粒度:           hour
-游标列名:                 <您的主键列,如 order_id>
-```
-
-效果链路:
-1. 块流式断开 → Task D **原位重试 1 次**（吸收瞬时抖动）→ 仍失败
-2. → Task A **sub-day 拆 12h+12h** → 各子块进入 `_run_single_export`
-3. → 子块若也流式断开 → Task B **走 keyset 而非 LIMIT/OFFSET**(快 + 不漏不重)
-4. → 子块若继续失败 → Task A **递归对半到小时级**(最多 10 层)
-5. 任一层成功完成本块就跳到下一块；用户感知:可能产出比 chunk_days=1 计划多一些子文件,但总能跑完。
-
-##### 验证您的 SQL 是否适合 cursor_column
-
-1. **预览查询**:导出 Modal 顶部「查询」按钮跑预览,确认 cursor 列在结果集中(`SELECT * FROM (...)` 包含此列)
-2. **聚合检测**:若 SQL 含 `GROUP BY / DISTINCT / WITH ROLLUP / WITH CUBE`,**不要填 cursor_column**(运行时会因为 cursor 列在 GROUP BY 后含义改变而 fast-fail 报错)
-3. **NULL 检测**:`SELECT count(*) FROM (your_sql) WHERE cursor_col IS NULL` 应该是 0(否则 ORDER BY NULL 排序不稳)
-
-#### 13.7.6 端到端示例（4 月千万行明细 × 10 天分块）
-
-**场景**：导出 4 月份订单明细（约 1200 万行），按 10 天一个文件分 3 个文件交付。
-
-1. 在数据导出页面 SQL 框输入：
-
-   ```sql
-   SELECT order_id, user_id, sku, amount, status, region, event_date
-   FROM events.order_detail
-   WHERE event_date >= '{{date_start}}'
-     AND event_date <= '{{date_end}}'
-   ORDER BY event_date, order_id
-   ```
-
-2. 选择目标 ClickHouse 连接（如 `sg`），点击「查询」预览前 100 行确认结构正确；
-3. 点击预览区右上角「导出」→ 切换「按日期分块（多文件）」→ 配置：
-   - 任务名称：`订单明细_4月`
-   - 日期范围：`2025-04-01` ~ `2025-04-30`
-   - 单块天数：`10`
-   - 日期列名：（留空，因为 SQL 已含占位符）
-4. 点击「开始导出」，列表新增任务行，状态 `进行中`；
-5. 约数分钟后任务完成，列表行显示「3 个文件」蓝色 Tag；
-6. 点击 `>` 展开行，看到 3 个子文件，逐个点击「下载」按钮即可获得 3 个 xlsx 文件，每个约 400 MB、含 4 个 Sheet 左右。
+| 文件 | 层次 | 规模 |
+|------|------|------|
+| `test_csv_tail.py` | RFC4180 边界扫描（穷举真实字节的每个断点） | 382 |
+| `test_data_export_csv_keyset.py` | CSV keyset 续传集成（核心断言：cursor 集合恰好 == {1..N} 无重复） | 23 |
+| `test_export_capabilities.py` | 能力矩阵 ↔ 真实路由对账（spy client 观测实际调用的通路） | 153 |
+| `test_export_ui_hints.py` | 编码完整性 + 文案与实现自洽 | 17 |
+| 既有 13 个导出测试文件 | 单文件 / 分块 / 下载 / 取消 / 重试 / keepalive | 416 |
 
 ---
 

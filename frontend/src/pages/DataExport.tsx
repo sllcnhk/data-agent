@@ -52,6 +52,7 @@ import {
   dataExportApi,
   ChunkConfig,
   Connection,
+  ExportCapability,
   ExportFileEntry,
   ExportJob,
   ExportJobListResult,
@@ -130,7 +131,18 @@ const ChunkFileList: React.FC<{
       width: 100,
       render: (v: number) => (v ?? 0).toLocaleString(),
     },
-    { title: 'Sheet 数', dataIndex: 'sheets', key: 'sheets', width: 80 },
+    {
+      // CSV 没有 Sheet 概念，后端对 CSV 路径返回 total_sheets=0。
+      // 直接渲染 0 会让人以为「一个 Sheet 都没生成」，实际是这个指标不适用。
+      title: 'Sheet 数',
+      dataIndex: 'sheets',
+      key: 'sheets',
+      width: 80,
+      render: (v: number, f: ExportFileEntry) =>
+        String(f.filename ?? '').toLowerCase().endsWith('.csv')
+          ? <Text type="secondary">—</Text>
+          : (v ?? 0),
+    },
     {
       title: '大小',
       dataIndex: 'file_size',
@@ -207,6 +219,28 @@ const placeholderPairText = (sql: string): string => {
   return pairs.join('，');
 };
 
+// 从后端下发的能力矩阵里查表。
+// 注意：**不要在这里重新推导任何能力字段** —— 这些提示错位的根因就是前端曾经
+// 自己猜后端行为。矩阵由 backend/services/data_export_capabilities.py 计算，
+// 并有 test_export_capabilities.py 逐条与真实代码路径对账。
+function lookupCapability(
+  matrix: ExportCapability[],
+  exportMode: string,
+  outputFormat: string,
+  xlsxEngine: string,
+  hasCursorColumn: boolean,
+): ExportCapability | null {
+  return (
+    matrix.find(
+      (c) =>
+        c.export_mode === exportMode &&
+        c.output_format === outputFormat &&
+        c.xlsx_engine === xlsxEngine &&
+        c.has_cursor_column === hasCursorColumn,
+    ) ?? null
+  );
+}
+
 const DataExport: React.FC = () => {
   // ── 连接 & 查询输入 ─────────────────────────────────────────────────────────
   const [connections, setConnections] = useState<Connection[]>([]);
@@ -226,6 +260,8 @@ const DataExport: React.FC = () => {
   const [exportModalOpen, setExportModalOpen] = useState(false);
   const [exportForm] = Form.useForm();
   const [exporting, setExporting] = useState(false);
+  // 导出能力矩阵（后端下发，单一事实源）
+  const [capabilities, setCapabilities] = useState<ExportCapability[]>([]);
 
   // ── 任务历史 ────────────────────────────────────────────────────────────────
   const [jobList, setJobList] = useState<ExportJobListResult | null>(null);
@@ -278,10 +314,36 @@ const DataExport: React.FC = () => {
     [listPage, listPageSize],
   );
 
+  // Modal 内统一的能力查表入口：从当前表单值算出四元组再查矩阵。
+  // 游标列在两种模式下用的是同一个字段名（单文件走顶层、分块走 chunk_config），
+  // 所以这里统一读 cursor_column 即可。
+  const currentCapability = useCallback(
+    (getFieldValue: (name: string) => any): ExportCapability | null =>
+      lookupCapability(
+        capabilities,
+        getFieldValue('export_mode') || 'single',
+        getFieldValue('output_format') || 'xlsx',
+        getFieldValue('xlsx_engine') || 'auto',
+        Boolean(String(getFieldValue('cursor_column') ?? '').trim()),
+      ),
+    [capabilities],
+  );
+
+  // ── 加载导出能力矩阵 ─────────────────────────────────────────────────────────
+  const loadCapabilities = useCallback(async () => {
+    try {
+      setCapabilities(await dataExportApi.getCapabilities());
+    } catch (e: any) {
+      // 拿不到矩阵不阻塞导出，只是提示区降级为不显示
+      console.warn('加载导出能力矩阵失败，提示信息将不可用', e);
+    }
+  }, []);
+
   // ── 首次加载 ─────────────────────────────────────────────────────────────────
   useEffect(() => {
     loadConnections();
     loadJobList(1);
+    loadCapabilities();
   }, []);
 
   // ── 轮询活跃任务 ─────────────────────────────────────────────────────────────
@@ -370,6 +432,10 @@ const DataExport: React.FC = () => {
         batch_size: values.batch_size || 50000,
         output_format: values.output_format || 'xlsx',
         xlsx_engine: values.xlsx_engine || 'auto',
+        // 单文件模式的游标列走顶层字段；分块模式的在 chunk_config 里
+        cursor_column: isChunked
+          ? undefined
+          : (values.cursor_column?.trim() || null),
         chunk_config,
       });
       message.success(
@@ -850,12 +916,13 @@ const DataExport: React.FC = () => {
               onClick={() => {
                 exportForm.resetFields();
                 exportForm.setFieldsValue({
-            export_mode: 'single',
-            output_format: 'xlsx',
-            xlsx_engine: 'auto',
-            job_name: '',
-            batch_size: 50000,
+                  export_mode: 'single',
+                  output_format: 'xlsx',
+                  xlsx_engine: 'auto',
+                  job_name: '',
+                  batch_size: 50000,
                   chunk_days: 10,
+                  cursor_column: '',
                 });
                 setExportModalOpen(true);
               }}
@@ -959,7 +1026,13 @@ const DataExport: React.FC = () => {
           <Form.Item
             name="output_format"
             label="输出格式"
-            extra="CSV/CSV ZIP 为极速导出；XLSX 支持自动分 Sheet。分块 + CSV ZIP 会把全部 CSV 子文件打包为一个 ZIP 下载。"
+            extra={
+              <span>
+                <b>Excel</b>：给人看、要分 Sheet 时用；注意所有单元格都是文本。
+                <b>CSV</b>：喂程序 / 再入库的首选，最快；分块模式下每块一个 .csv。
+                <b>CSV ZIP</b>：同 CSV 但打成一个包，分块时只需下一次。
+              </span>
+            }
           >
             <Radio.Group>
               <Radio.Button value="xlsx">Excel (.xlsx)</Radio.Button>
@@ -977,13 +1050,21 @@ const DataExport: React.FC = () => {
                 <Form.Item
                   name="xlsx_engine"
                   label="XLSX 写入策略"
-                  extra="auto：系统判断。分块/大数据默认先极速落 CSV 临时文件，再本地转 XLSX，减少远端查询连接占用；小任务可直接写 XLSX。"
+                  extra={
+                    <span>
+                      auto 按<b>导出模式</b>固定选择，不看数据量：
+                      <b>单文件 → 直接写 XLSX</b>；<b>分块 → 先落 CSV 再转 XLSX</b>。
+                      <br />
+                      直接写 XLSX 断流后可自动分批重跑；先落 CSV 更快，但需配合下方
+                      「游标列名」才具备断流续传能力。
+                    </span>
+                  }
                 >
                   <Select
                     options={[
-                      { value: 'auto', label: '自动（推荐）' },
-                      { value: 'csv_staging', label: 'CSV 临时落盘后转 XLSX（更稳）' },
-                      { value: 'direct', label: '直接写 XLSX（少中间文件）' },
+                      { value: 'auto', label: '自动（单文件=直写，分块=先落 CSV）' },
+                      { value: 'csv_staging', label: 'CSV 临时落盘后转 XLSX（更快）' },
+                      { value: 'direct', label: '直接写 XLSX（有分批回退）' },
                     ]}
                   />
                 </Form.Item>
@@ -1162,69 +1243,163 @@ const DataExport: React.FC = () => {
                   >
                     <Input placeholder="如：id、event_time、Call ID、订单_id" maxLength={64} />
                   </Form.Item>
-                  <Form.Item
-                    name="prefer_chunked"
-                    valuePropName="checked"
-                    label="首选分批模式（跳过单流首试）"
-                    extra={
-                      <span>
-                        跨境/不稳网络下，单流常在 5 分钟左右被 LB/NAT 切断，每块先单流试错
-                        5 分钟再回退非常浪费。勾选后<b>跳过单流首试</b>，直接走
-                        keyset（若上方填了游标列）或 LIMIT/OFFSET。
-                        <br />
-                        <b>强烈建议同时填写游标列名</b>——无游标列时走 LIMIT/OFFSET，
-                        后期窗口 OFFSET 重扫开销大且 ClickHouse 并行扫描下结果可能非确定。
-                      </span>
-                    }
-                  >
-                    <Switch checkedChildren="跳过单流" unCheckedChildren="试单流" />
+                  {/* prefer_chunked 只影响「直接写 XLSX」这条路径的首试策略。
+                      CSV / 先落 CSV 的路径压根不走单流首试，此开关无效，必须置灰 ——
+                      否则又是一个看起来能调、实际没用的死配置。 */}
+                  <Form.Item noStyle shouldUpdate={() => true}>
+                    {({ getFieldValue }) => {
+                      const cap = currentCapability(getFieldValue);
+                      const effective = cap ? cap.prefer_chunked_effective : true;
+                      return (
+                        <Form.Item
+                          name="prefer_chunked"
+                          valuePropName="checked"
+                          label="首选分批模式（跳过单流首试）"
+                          extra={
+                            effective ? (
+                              <span>
+                                跨境 / 不稳网络下，单流常在 5 分钟左右被 LB/NAT 切断，
+                                每块先单流试错 5 分钟再回退非常浪费。勾选后
+                                <b>跳过单流首试</b>，直接走 keyset（若填了游标列）或
+                                LIMIT/OFFSET。
+                                <br />
+                                <b>强烈建议同时填写游标列名</b> —— 无游标列时走
+                                LIMIT/OFFSET，后期窗口 OFFSET 重扫开销大，且
+                                ClickHouse 并行扫描下结果可能非确定。
+                              </span>
+                            ) : (
+                              <span style={{ color: '#8c8c8c' }}>
+                                当前输出格式 / 写入策略下<b>此开关不生效</b> —— 该路径
+                                本来就不做「单流首试」。它只影响「直接写 XLSX」策略。
+                              </span>
+                            )
+                          }
+                        >
+                          <Switch
+                            disabled={!effective}
+                            checkedChildren="跳过单流"
+                            unCheckedChildren="试单流"
+                          />
+                        </Form.Item>
+                      );
+                    }}
                   </Form.Item>
                 </>
               ) : null
             }
           </Form.Item>
 
+          {/* 单文件模式的游标列 —— v2.16 新增。
+              此前只有分块模式有这个字段，导致「千万行单文件 CSV」这个最容易被
+              5 分钟断流打死的场景完全无药可救。 */}
           <Form.Item
             noStyle
             shouldUpdate={(prev, cur) => prev.export_mode !== cur.export_mode}
           >
-            {({ getFieldValue }) => (
-              <Form.Item
-                name="batch_size"
-                label="批次大小（高级）"
-                extra={
-                  <span>
-                    每批从数据库读取的行数，影响内存与速度，默认 50,000 行
-                    {getFieldValue('export_mode') !== 'date_chunked' && (
-                      <>
-                        <br />
-                        <span style={{ color: '#fa8c16', fontWeight: 500 }}>
-                          ⚠ 普通导出模式下，若 SQL 未加 ORDER BY，网络抖动触发分批回退时可能出现数据重复或遗漏，建议在 SQL 末尾加 ORDER BY {'<'}主键列{'>'}
-                        </span>
-                      </>
-                    )}
-                  </span>
-                }
-              >
-                <InputNumber min={1000} max={200000} step={1000} style={{ width: '100%' }} />
-              </Form.Item>
-            )}
+            {({ getFieldValue }) =>
+              getFieldValue('export_mode') !== 'date_chunked' ? (
+                <Form.Item
+                  name="cursor_column"
+                  label="游标列名（可选；跨境 / 大数据量强烈建议填）"
+                  extra={
+                    <span>
+                      填了之后：<b>CSV / CSV ZIP</b> 改走 keyset 多窗口 —— 每个窗口是
+                      独立短查询，断流后<b>从已下载的位置继续</b>，已落盘数据不丢；
+                      <b>XLSX</b> 则在流式断开后用 keyset 代替 LIMIT/OFFSET 回退，
+                      消除重复 / 漏行。
+                      <br />
+                      <b>务必选表 ORDER BY 键的前缀</b> —— 每个窗口都带 ORDER BY，
+                      不是排序键前缀就要真排序，压力可能比不填更大。要求单调可排序、
+                      非 NULL；<b>不适用于 GROUP BY / DISTINCT 等聚合 SQL</b>。
+                      <br />
+                      填 SELECT 子句中的<b>别名</b>；支持字母 / 数字 / 下划线 / 空格 / 中文。
+                    </span>
+                  }
+                >
+                  <Input placeholder="如：id、event_time、Call ID、订单_id" maxLength={64} />
+                </Form.Item>
+              ) : null
+            }
           </Form.Item>
 
-          <Alert
-            type="info"
-            showIcon
-            message="导出说明"
-            description={
-              <ul style={{ margin: 0, paddingLeft: 16 }}>
-                <li>每超过 100 万行自动插入新 Sheet，每 Sheet 均含标题行</li>
-                <li>Int64 / UInt64 等大整数列自动转为字符串，避免科学计数法</li>
-                <li>CSV 会使用 UTF-8 BOM，Excel 直接打开中文不乱码；CSV 转 XLSX 使用标准 CSV 解析，避免引号内逗号/换行错误分列</li>
-                <li>分块模式：每块单独生成一个 Excel 文件；优先使用 SQL 占位符以获得最佳查询性能</li>
-                <li>导出过程可随时取消，已完成块/文件保留可下载</li>
-              </ul>
-            }
-          />
+          {/* batch_size：是否生效由后端能力矩阵决定，前端不再自行推导。
+              CSV / xlsx+csv_staging 且未填游标列时该值根本不被读取，必须置灰，
+              否则就是一个会误导人的死配置。 */}
+          <Form.Item noStyle shouldUpdate={() => true}>
+            {({ getFieldValue }) => {
+              const cap = currentCapability(getFieldValue);
+              const effective = cap ? cap.batch_size_effective : true;
+              return (
+                <Form.Item
+                  name="batch_size"
+                  label="批次大小（高级）"
+                  extra={
+                    effective ? (
+                      <span>
+                        {cap?.batch_size_role ?? '每批从数据库读取的行数'}，
+                        影响内存与速度，默认 50,000 行
+                      </span>
+                    ) : (
+                      <span style={{ color: '#8c8c8c' }}>
+                        当前输出格式 / 写入策略下<b>此项不生效</b> —— 该路径是
+                        ClickHouse 原始流直写，不分批。填写上方「游标列名」后，
+                        本项会变成 keyset 窗口行数并开始生效。
+                      </span>
+                    )
+                  }
+                >
+                  <InputNumber
+                    min={1000}
+                    max={200000}
+                    step={1000}
+                    disabled={!effective}
+                    style={{ width: '100%' }}
+                  />
+                </Form.Item>
+              );
+            }}
+          </Form.Item>
+
+          {/* 「你将得到什么」实时摘要 + 只在真实存在风险时出现的警告。
+              旧版是 5 条静态说明，其中 4 条在某些组合下是错的（CSV 下说分 Sheet、
+              csv 分块下说「每块一个 Excel 文件」、单文件取消后其实下载不了等）。 */}
+          <Form.Item noStyle shouldUpdate={() => true}>
+            {({ getFieldValue }) => {
+              const cap = currentCapability(getFieldValue);
+              if (!cap) return null;
+              return (
+                <>
+                  <Alert
+                    type="info"
+                    showIcon
+                    message="你将得到什么"
+                    description={
+                      <ul style={{ margin: 0, paddingLeft: 16 }}>
+                        {cap.summary.map((s, i) => (
+                          <li key={i}>{s}</li>
+                        ))}
+                      </ul>
+                    }
+                  />
+                  {cap.warnings.length > 0 && (
+                    <Alert
+                      type="warning"
+                      showIcon
+                      style={{ marginTop: 8 }}
+                      message="注意事项"
+                      description={
+                        <ul style={{ margin: 0, paddingLeft: 16 }}>
+                          {cap.warnings.map((w, i) => (
+                            <li key={i}>{w}</li>
+                          ))}
+                        </ul>
+                      }
+                    />
+                  )}
+                </>
+              );
+            }}
+          </Form.Item>
         </Form>
       </Modal>
 

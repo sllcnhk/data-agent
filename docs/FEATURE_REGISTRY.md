@@ -425,6 +425,83 @@ superadmin 专属功能（可动态授予其他角色）：执行任意 SQL 查�
 
 **chunk_days 范围**：1-90 天（Pydantic + chunker 双层校验）。覆盖日/周/旬/月级别常见场景。
 
+#### 数据导出提示修正 + CSV keyset 续传 + 独立操作手册（v2.16.0，2026-08-24）
+
+两件事：把「配置项 / 提示文案」与真实实现的 9 处错位修掉并加上防漂移机制；给 CSV
+导出补上「断流后基于已下载数据继续」的能力。
+
+**A 类 — 真 bug**
+
+| 项 | 位置 | 说明 |
+|----|------|------|
+| 进度标签乱码 | `data_export_service.py` | `CSV??` / `CSV?XLSX`（逐字符 `?` 替换）→ `CSV落盘` / `CSV→XLSX`。该破坏在 `5367856` 提交里出生即存在，git 历史无正确版本 |
+| 错误文案说谎 | `_humanize_error` | 无条件声称「已自动尝试 LIMIT/OFFSET 回退」，但 CSV / CSV ZIP / xlsx+csv_staging 三条路径根本没有回退。新增 `_path_has_stream_fallback()` 按真实路径判定；并按 `is_chunked` 给不同建议（单文件模式没有「单块天数」这个概念） |
+| 范围外同类破坏 | `agentic_loop.py:895` / `api/files.py:39` | `文␦␦␦操作规则` → `文件操作规则`（**在 LLM system prompt 里**）、`解␦␦␦后的绝对路径` → `解析后的绝对路径`。全仓 U+FFFD 归零 |
+
+**B 类 — 提示 / 配置项错位（根治手段：能力矩阵）**
+
+新增 [`backend/services/data_export_capabilities.py`](../backend/services/data_export_capabilities.py)
+作为「某组配置的真实能力」单一事实源，经 `GET /data-export/capabilities` 下发 36 条
+矩阵给前端渲染。**前端不再自行推导后端行为** —— 这 9 处错位的根因就是前端硬编码假设、
+没有任何机制保证同步。
+
+| 错位 | 修正 |
+|------|------|
+| `batch_size` 在 CSV / xlsx+csv_staging 下是死配置却可填 | 按 `batch_size_effective` 置灰 + 说明原因；填了游标列后它变成 keyset 窗口行数并真正生效 |
+| ORDER BY 警告条件是 `export_mode !== 'date_chunked'`，两头都错 | 改由 `order_by_risk` 判定（仅「有 LIMIT/OFFSET 回退且无游标列」时显示）。CSV 单文件不再误显示；分块+direct+无游标列不再被隐藏 |
+| 「每超 100 万行分 Sheet」无条件渲染 | 5 条静态说明 → 「你将得到什么」实时摘要 + 按真实风险的警告 |
+| 「分块模式：每块单独生成一个 **Excel** 文件」 | 按 `artifact` 渲染实际产物形态 |
+| 「取消后已完成块/文件保留可下载」 | 单文件取消后下载接口直接拒绝，摘要按模式说真话 |
+| 分块 + CSV 时「Sheet 数」列恒显示 0 | CSV 无 Sheet 概念，改显示 `—` |
+| `auto` 引擎文案称「系统判断、大数据先落 CSV」 | 单文件 auto 永远等于 direct，从不按数据量判断。文案改为「单文件=直写，分块=先落 CSV」 |
+| CSV 下「首选分批模式」是死配置 | 按 `prefer_chunked_effective` 置灰（它只影响 direct 路径） |
+| 单文件模式没有游标列字段 | 新增（顶层 `cursor_column`），千万行单文件 CSV 从此可续传 |
+
+**C 类 — 只写文档的设计事实（IDN 实测确认）**
+
+| 事实 | 影响 |
+|------|------|
+| **XLSX 所有单元格都是文本**（含 Float/Date/小整数），两条引擎一致，无开关可改 | 原以为「direct 写原生数字」，实测推翻。`_format_cell` 的大整数分支当前不触发，但**是尚未触发的安全网而非死代码**（`output_format_json_quote_64bit_integers` 若改为 0 就会生效），已改文档说明真实机制 + `_strip_type_wrappers()` 循环解包 |
+| CSV 的 NULL 是字面量 `\N` | 与 XLSX 的空单元格不一致，下游按数字列读会炸 |
+| CSV 大整数原样输出 | Excel 双击变科学计数法 |
+| CSV 遵循 RFC4180，一条记录可跨物理行 | `wc -l` 不可用于核对行数；禁止 `split(',')` |
+| 预览「默认昨日」按 UTC 算 | 东八区实际取到前天 |
+
+**新功能 — CSV keyset 续传**
+
+| 组件 | 说明 |
+|------|------|
+| [`backend/services/csv_tail.py`](../backend/services/csv_tail.py) | RFC4180 感知的记录边界扫描 + 游标提取。纯逻辑无 IO，支持跨 chunk 携带引号状态、快照/回滚 |
+| `ClickHouseExportClient.fetch_raw_keyset_window` | 取一个 keyset 窗口的原始 CSV 字节；窗口 SQL / 参数化 / 游标校验与 `stream_batches_keyset` 共用（`_normalize_cursor_column` / `_build_keyset_window_sql`） |
+| `_stream_sql_to_csv_file_keyset` | 窗口推进 + 断流截断 + 退避重发 + NULL/死循环 fast-fail。断流三步：truncate 回窗口起点 → 扫描器 restore → 用同一 `last_cursor` 重发 |
+| 覆盖范围 | CSV / CSV ZIP（单文件 + 分块）；xlsx + `csv_staging` 的落盘阶段（= **分块导 Excel 的默认路径**，此前游标列在那里完全无效） |
+
+**关键设计约束**：「先单流、断流后从已下载位置继续」在数学上不成立 —— 单流无
+`ORDER BY`，已落盘的行是任意子集而非「cursor ≤ X 的全部行」，续传必然又重又漏。
+所以唯一自洽的设计是**填了游标列即全程 keyset**。
+
+**测试基础设施修复**：原基线 402 passed / **14 failed**，查明为两类测试腐化 ——
+9 处 `patch("requests.post")` 在 v2.14 改用池化 Session 后拦不住（测试真去连
+`localhost:8123`）、9 处 fake 签名缺 v2.15 新增的 `query_id_prefix`。新增
+`test_utils.patch_ch_export_post()` 统一 mock 目标。修复后 416 passed / 0 failed。
+
+**测试规模**
+
+| 文件 | 层次 | 用例 |
+|------|------|------|
+| `test_csv_tail.py` | RFC4180 边界（穷举真实 ClickHouse 字节的每个断点） | 382 |
+| `test_data_export_csv_keyset.py` | 续传集成，核心断言 **cursor 集合恰好 == {1..N} 且无重复** | 23 |
+| `test_export_capabilities.py` | 能力矩阵 ↔ 真实路由对账（spy client 观测实际调用通路） | 153 |
+| `test_export_ui_hints.py` | 编码完整性 + 文案与实现自洽 | 17 |
+| 既有 13 个导出测试文件 | 回归 | 416 |
+| **合计** | | **991 passed / 0 failed** |
+
+**文档**：新增面向使用者的 [`docs/DATA_EXPORT_GUIDE.md`](DATA_EXPORT_GUIDE.md)；
+`USER_GUIDE.md §13` 由 539 行压缩为 186 行架构 / API 参考并修掉过时内容
+（`partial_failed` 终态、失败块处理、预览默认日期等）。
+
+**RBAC**：无新菜单 / 权限。新增 `GET /data-export/capabilities` 沿用 `data:export`。
+
 #### 数据导出性能与稳定性增强（v2.15，2026-05-12）
 
 针对 90 分钟仅导出约 260 万行、频繁 5 分钟断流、旧查询堆积导致 `TOO_MANY_SIMULTANEOUS_QUERIES` 的生产问题，新增以下能力：

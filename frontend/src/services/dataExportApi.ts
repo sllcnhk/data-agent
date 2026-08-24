@@ -100,6 +100,56 @@ export interface ChunkConfig {
   prefer_chunked?: boolean | null;
 }
 
+/**
+ * 一组配置的真实能力（后端 GET /data-export/capabilities 下发）。
+ *
+ * 为什么由后端算：前端曾把每条提示都硬编码成「对后端行为的假设」，没有任何机制
+ * 保证同步，结果积累了 9 处错位（CSV 下 batch_size 是死配置却可填、ORDER BY 警告
+ * 显示在没有该风险的路径上而在有风险的路径上被隐藏、CSV 分块下写「每块一个 Excel
+ * 文件」等）。现在判定收敛到实现方，前端只渲染。**不要在前端重新推导这些字段。**
+ */
+export interface ExportCapability {
+  export_mode: ExportMode;
+  output_format: OutputFormat;
+  xlsx_engine: XlsxEngine;
+  has_cursor_column: boolean;
+  /** auto 解析后实际生效的引擎；CSV 格式为 null */
+  effective_engine: 'direct' | 'csv_staging' | null;
+
+  /** 产物形态，如「N 个 .csv（每个日期块一个）」 */
+  artifact: string;
+  /** 是否每满 100 万行新建 Sheet（仅 xlsx） */
+  sheet_splitting: boolean;
+  /** xlsx 所有单元格都是文本（两条引擎一致，无开关可改） */
+  all_cells_text: boolean;
+  utf8_bom: boolean;
+  null_representation: string;
+  big_int_excel_safe: boolean;
+
+  /** batch_size 是否真的被读取（否则应置灰） */
+  batch_size_effective: boolean;
+  /** batch_size 在当前路径下的角色说明 */
+  batch_size_role: string | null;
+  cursor_column_effective: boolean;
+  cursor_column_role: string | null;
+  prefer_chunked_effective: boolean;
+
+  /** 断流后是否有自动回退（LIMIT/OFFSET 或 keyset 重跑） */
+  stream_fallback: boolean;
+  /** 断流后能否基于已下载数据继续（keyset 多窗口） */
+  resumable_on_disconnect: boolean;
+  /** 是否存在 LIMIT/OFFSET 导致的重复/漏行风险 */
+  order_by_risk: boolean;
+
+  cancel_partial_downloadable: boolean;
+  retry_failed_chunks: boolean;
+
+  /** 按真实风险生成的警告，逐条渲染 */
+  warnings: string[];
+  /** 「你将得到什么」摘要，逐条渲染 */
+  summary: string[];
+}
+
 export interface ExportFileEntry {
   index: number;
   date_start: string;
@@ -159,6 +209,13 @@ export interface ExecuteExportRequest {
   batch_size?: number;
   output_format?: OutputFormat;
   xlsx_engine?: XlsxEngine;
+  /**
+   * 游标列名（单文件模式；分块模式填在 chunk_config.cursor_column）。
+   * CSV / CSV ZIP 填了此列即启用 keyset 多窗口，断流可基于已下载数据继续；
+   * XLSX 路径下用于流式断开后的 keyset 回退（替代 LIMIT/OFFSET）。
+   * 强烈建议选表 ORDER BY 键的前缀，否则每窗口都要真排序。
+   */
+  cursor_column?: string | null;
   /** 提供则启用按日期分块导出（多文件） */
   chunk_config?: ChunkConfig;
 }
@@ -167,6 +224,15 @@ export interface ExecuteExportRequest {
 // ─── API 方法 ─────────────────────────────────────────────────────────────────
 
 export const dataExportApi = {
+  /**
+   * 获取导出能力矩阵（36 条，覆盖全部配置组合）。
+   * 挂载时取一次即可，按四元组查表，无需随输入实时请求。
+   */
+  getCapabilities: async (): Promise<ExportCapability[]> => {
+    const res = await apiClient.get('/data-export/capabilities');
+    return res.data?.data ?? [];
+  },
+
   /** 获取所有可写连接列表（复用 import 端点） */
   getConnections: async (): Promise<Connection[]> => {
     const res = await apiClient.get('/data-export/connections');
