@@ -177,6 +177,19 @@ class ExecuteExportRequest(BaseModel):
             "direct=直接写 XLSX；csv_staging=先写 CSV 临时文件再本地转换 XLSX。"
         ),
     )
+    cursor_column: Optional[str] = Field(
+        default=None,
+        description=(
+            "游标列名（单文件模式；分块模式请填在 chunk_config.cursor_column）。"
+            "v2.16：CSV / CSV ZIP 填了此列即启用 keyset 多窗口导出 —— 每窗口一个独立"
+            "短查询，窗口内断流可**基于已下载的数据继续**，不必整个文件重来；"
+            "留空则走单流极速模式（断流即整体失败）。"
+            "XLSX 路径下此列用于流式断开后的 keyset 回退（替代 LIMIT/OFFSET）。"
+            "要求列单调可排序，**强烈建议选表 ORDER BY 键的前缀**，否则每窗口都要真排序，"
+            "压力可能比单流更大。不适用于 GROUP BY / DISTINCT 等聚合 SQL。"
+            "填 SELECT 子句中的**别名**；允许字母/数字/下划线/空格/中文。"
+        ),
+    )
     chunk_config: Optional[ChunkConfigSchema] = Field(
         default=None,
         description="按日期分块配置；提供则启用 date_chunked 模式（多文件输出）",
@@ -198,6 +211,30 @@ async def get_connections(
     except Exception as e:
         logger.error("list_writable_connections error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1b. 导出能力矩阵（前端提示文案的单一事实源）
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/capabilities")
+async def get_capabilities(
+    current_user=Depends(require_permission("data", "export")),
+):
+    """返回全部配置组合的真实能力（36 条），供前端查表渲染提示。
+
+    为什么要有这个端点：
+      v2.15 之前前端每条提示都是硬编码的「对后端行为的假设」，没有任何机制保证同步，
+      结果积累了 9 处错位（CSV 下 batch_size 是死配置却可填、ORDER BY 警告显示在
+      没有该风险的路径上而在有风险的路径上被隐藏、CSV 下写「每块一个 Excel 文件」等）。
+      把能力判定收敛到后端并下发，前端不再猜后端行为，也就不会再漂移。
+
+    前端用法：挂载时取一次，按 (export_mode, output_format, xlsx_engine,
+    has_cursor_column) 四元组查表；组合是有限的，不需要随输入实时请求。
+    """
+    from backend.services.data_export_capabilities import build_capability_matrix
+
+    return {"success": True, "data": build_capability_matrix()}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -269,6 +306,15 @@ async def execute_export(
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
 
     is_chunked = req.chunk_config is not None
+    # 单文件模式的游标列走与 chunk_config.cursor_column 相同的校验规则，
+    # 避免同一个概念在两个入口有两套标准
+    single_cursor_column: Optional[str] = None
+    if not is_chunked and req.cursor_column:
+        from backend.services.data_export_chunker import validate_cursor_column
+        try:
+            single_cursor_column = validate_cursor_column(req.cursor_column)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"cursor_column 校验失败: {exc}")
     output_format = req.output_format
     xlsx_engine = req.xlsx_engine
     ext = "zip" if output_format == "csv_zip" else ("csv" if output_format == "csv" else "xlsx")
@@ -310,6 +356,7 @@ async def execute_export(
         "batch_size": req.batch_size,
         "output_format": output_format,
         "xlsx_engine": xlsx_engine,
+        "cursor_column": single_cursor_column,
     }
     if is_chunked:
         config_snapshot["chunk_config"] = req.chunk_config.dict()
@@ -362,6 +409,7 @@ async def execute_export(
             "export_mode": "single",
             "output_path": output_path_for_job,
             "output_filename": output_filename,
+            "cursor_column": single_cursor_column,
         }
     task = asyncio.create_task(run_export_job(job_id, config))
 

@@ -32,6 +32,9 @@ from backend.models.task import (
 from backend.models.import_job import ImportJob
 from backend.models.export_job import ExportJob
 
+# 小工具模块
+from backend.models.merge_excel_job import MergeExcelJob
+
 # Report模块
 from backend.models.report import (
     Report,
@@ -62,6 +65,9 @@ __all__ = [
     # 数据导入/导出
     "ImportJob",
     "ExportJob",
+
+    # 小工具
+    "MergeExcelJob",
 
     # Report
     "Report",

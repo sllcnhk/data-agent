@@ -15,6 +15,7 @@
 """
 import os
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 # ── 统一前缀 ────────────────────────────────────────────
@@ -45,6 +46,38 @@ def is_test_entity(name: str) -> bool:
     """判断名称是否为测试数据（匹配 _xxx_ 前缀格式，与 conftest.py 逻辑一致）。"""
     import re
     return bool(re.match(r'^_[a-z][a-z0-9]*_', name))
+
+
+# ── 导出客户端 HTTP 层 mock ──────────────────────────────
+
+@contextmanager
+def patch_ch_export_post(**post_kwargs):
+    """Patch 导出客户端的 HTTP POST，yield 出被 patch 的 post mock。
+
+    为什么不能用 patch("requests.post")：
+      v2.14 为 TCP keepalive 把 ClickHouseExportClient 从模块级 requests.post
+      改成了池化 Session（_get_export_session().post），module 级 patch 从此
+      拦不住 → 测试会真的去连 localhost:8123 并以 ConnectionError 失败。
+
+    这里 patch 的是 _get_export_session 工厂本身（顺带绕过它的模块级缓存），
+    返回一个 post 属性为 mock 的假 Session。调用签名与原来的 requests.post
+    完全一致（不多出 self），所以断言 call_args 的写法无需改动。
+
+    用法与 patch("requests.post", ...) 一一对应：
+        with patch_ch_export_post(return_value=mock_resp) as mock_post:
+            ...
+        with patch_ch_export_post(side_effect=requests.Timeout()):
+            ...
+    """
+    from unittest.mock import MagicMock, patch
+
+    post = MagicMock(**post_kwargs)
+    session = MagicMock(post=post)
+    with patch(
+        "backend.services.export_clients.clickhouse._get_export_session",
+        return_value=session,
+    ):
+        yield post
 
 
 # ── 标准化清理函数 ───────────────────────────────────────

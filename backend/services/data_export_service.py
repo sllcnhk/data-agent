@@ -49,6 +49,11 @@ CSV_XLSX_CANCEL_CHECK_EVERY_ROWS = 5_000
 CSV_STREAM_PROGRESS_EVERY_MB = 64
 CSV_STREAM_CANCEL_CHECK_EVERY_MB = 16
 
+# CSV keyset 续传（v2.16）：窗口内断流后重发同一窗口的次数上限与退避
+CSV_KEYSET_RETRY_MAX = 3             # env: EXPORT_CSV_KEYSET_RETRY_MAX
+CSV_KEYSET_RETRY_BACKOFF_BASE = 5    # 第 n 次重试退避 = base * n，秒
+CSV_KEYSET_RETRY_BACKOFF_MAX = 30
+
 SUPPORTED_OUTPUT_FORMATS = {"xlsx", "csv", "csv_zip"}
 SUPPORTED_XLSX_ENGINES = {"auto", "direct", "csv_staging"}
 
@@ -112,24 +117,58 @@ def _build_export_client(env: str, connection_type: str = "clickhouse"):
 # 辅助：单元格值格式化
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _strip_type_wrappers(col_type: str) -> str:
+    """反复剥掉 Nullable(...) / LowCardinality(...) 包装，直到裸类型。
+
+    必须循环而非各判一次：两种包装可以任意顺序嵌套，只判一轮会漏掉外层剥完后
+    才暴露出来的内层包装（如 LowCardinality(Nullable(Int64)) 剥成 Nullable(Int64)
+    就停了）。注：这种数值型嵌套被 ClickHouse 默认禁止（Code 455，需
+    allow_suspicious_low_cardinality_types=1），所以这里是防御而非修复实际故障。
+    """
+    t = col_type
+    for _ in range(8):  # 上限防御畸形类型串导致死循环
+        for prefix in ("Nullable(", "LowCardinality("):
+            if t.startswith(prefix) and t.endswith(")"):
+                t = t[len(prefix):-1]
+                break
+        else:
+            break
+    return t
+
+
 def _format_cell(value: Any, col_type: str) -> Any:
     """
-    将数据库原始值转为 Excel 安全值：
-    - 大整数类型（Int64/UInt64/...） → str，避免 Excel 科学计数法
-    - None → None（openpyxl 写入为空单元格）
+    将数据库原始值转为写入前的安全值。
+
+    ⚠️ 关于「避免 Excel 科学计数法」的真实机制（v2.16 实测澄清）：
+      让大整数在 Excel 里保留完整精度的，**不是本函数**，而是两件事叠加：
+        ① 上游到这里的值本来就是 str —— 导出路径经 `_parse_tsv_cell`（TSV 单元格
+           一律返回 str/None），预览路径经 JSONCompact 且服务端
+           `output_format_json_quote_64bit_integers=1`（默认）把 64 位整数序列化
+           成 JSON 字符串；
+        ② xlsxwriter 以 `strings_to_numbers=False` 打开，str 一律 write_string。
+      因此下面的 `isinstance(value, int)` 分支在当前两条路径上都**不会命中**
+      （IDN 实测：Int64/UInt64 到达时均为 str）。
+
+      这**不是死代码**，而是一张尚未触发的安全网：若服务端把
+      `output_format_json_quote_64bit_integers` 设为 0，或将来给 TSV 解析加上类型
+      转换，大整数就会以真 Python int 到达，此时必须转 str —— 否则 JSON 序列化到
+      前端会被 JS Number（安全上限 2^53-1）截断精度。请勿因为"看起来没用"删掉。
+
+      连带事实：正因为一切都以 str 落盘，**XLSX 里所有列（含 Float/Date/小整数）
+      都是文本单元格**，不能在 Excel 里直接求和 —— 这是两条 xlsx 引擎共同的行为，
+      不是 csv_staging 独有。契约由测试锁定，改动前请先看那些测试。
+
+    - 大整数类型（Int64/UInt64/...）且值为真 int → str
+    - None → None（写入为空单元格）
     - 其余保持原值
     """
     if value is None:
         return None
 
-    # 去掉 Nullable(...) 包装，如 "Nullable(Int64)" → "Int64"
-    bare_type = col_type
-    if bare_type.startswith("Nullable(") and bare_type.endswith(")"):
-        bare_type = bare_type[9:-1]
-    # 去掉 LowCardinality(...) 包装
-    if bare_type.startswith("LowCardinality(") and bare_type.endswith(")"):
-        bare_type = bare_type[15:-1]
+    bare_type = _strip_type_wrappers(col_type)
 
+    # 注意 bool 是 int 的子类，但 Bool 不在 _LARGE_INT_TYPES 中，不受影响
     if bare_type in _LARGE_INT_TYPES and isinstance(value, int):
         return str(value)
 
@@ -247,7 +286,67 @@ def preview_query(
 # 2. 单文件导出 — 内核（被单文件路径与分块路径共用）
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _humanize_error(exc: Exception) -> str:
+def _path_has_stream_fallback(
+    output_format: Optional[str], xlsx_engine: Optional[str],
+) -> Optional[bool]:
+    """该输出路径断流时是否真的具备自动回退能力。
+
+    只有 xlsx 的 direct 写入路径会进 `_run_single_export` 的 2-attempt 循环
+    （transient error → LIMIT/OFFSET 或 keyset 重跑）。
+    csv / csv_zip / xlsx+csv_staging 都走 `_stream_sql_to_csv_file` 的 stream_raw
+    单流，除 Code 202 退避外**没有任何回退** —— 断流即失败。
+
+    返回 None 表示调用方没有提供路径信息，此时错误文案不应声称做过回退。
+    """
+    if output_format is None:
+        return None
+    if output_format in {"csv", "csv_zip"}:
+        return False
+    # xlsx：engine 未提供时按单文件默认 direct 处理（auto 在单文件模式等于 direct）
+    return (xlsx_engine or "direct") != "csv_staging"
+
+
+def _stream_error_advice(had_fallback: Optional[bool], is_chunked: bool) -> str:
+    """按输出路径给断流后**真正可执行**的建议，拼成 ①②③… 编号列表。
+
+    旧文案不分路径地统一建议「减小单块天数」，但单文件模式没有「单块天数」这个
+    概念；而无回退能力的路径（csv / csv_zip / xlsx+csv_staging）唯一的自愈手段是
+    把单次查询切小，得单独点出来。
+    """
+    items: List[str] = []
+    if is_chunked:
+        items.append("减小单块天数（如 chunk_days=2~3）让单次查询时长 < 5 分钟")
+        if had_fallback is False:
+            # 已经在分块了，别再劝人分块；这里该说的是把块切得更碎 + 用块级重试
+            items.append(
+                "当前格式断流后不会自动回退，但已完成的块可单独下载，"
+                "失败块可用「重试失败子任务」单独重跑"
+            )
+    else:
+        items.append("改用「按日期分块」模式把单次查询切小，让每段时长 < 5 分钟")
+        if had_fallback is False:
+            items.append(
+                "当前格式断流后不会自动回退，整个文件需重来；"
+                "改用「按日期分块」可让已完成的块留存并单独重试"
+            )
+    items.append("简化 SQL（减少每行 CPU 消耗，如 decrypt/JSONExtract）")
+    items.append("错峰重试")
+    items.append("联系 DBA 检查 ClickHouse 实例资源水位 / 调整云 LB 空闲超时")
+
+    marks = "①②③④⑤⑥⑦⑧⑨"
+    return "".join(
+        f"{marks[i] if i < len(marks) else f'({i + 1})'} {text}；"
+        for i, text in enumerate(items)
+    )
+
+
+def _humanize_error(
+    exc: Exception,
+    *,
+    output_format: Optional[str] = None,
+    xlsx_engine: Optional[str] = None,
+    is_chunked: bool = False,
+) -> str:
     """
     把技术异常翻译为面向用户的可读提示，附可能原因 + 建议处置。
     用于 ExportJob.error_message — 前端直接展示给最终用户。
@@ -256,7 +355,13 @@ def _humanize_error(exc: Exception) -> str:
 
     v2.14:沿 __cause__/__context__ 异常链聚合 message,识别包装层底下的
     原始错误指纹(如 `RuntimeError("分批模式...") from ChunkedEncodingError`)。
+
+    v2.16(A3 修复):断流/Code 160 文案不再无条件声称「已自动尝试 LIMIT/OFFSET
+    回退」—— CSV / CSV ZIP / xlsx+csv_staging 三条路径根本没有回退，旧文案在这些
+    路径下描述了系统没做过的事，把用户的排查方向带偏。现按 output_format /
+    xlsx_engine 判定真实能力，并给出对应路径可执行的建议。
     """
+    had_fallback = _path_has_stream_fallback(output_format, xlsx_engine)
     # 沿异常链拼接所有 message,供下方 fingerprint 匹配
     msgs: List[str] = []
     cur: Optional[BaseException] = exc
@@ -273,23 +378,40 @@ def _humanize_error(exc: Exception) -> str:
         "Response ended prematurely", "Read timed out",
         "Remote end closed connection",
     )):
+        if had_fallback is True:
+            attempted = "（已自动尝试 LIMIT/OFFSET 回退仍未成功）"
+        elif had_fallback is False:
+            attempted = (
+                "（当前输出格式走 ClickHouse 原始流直写，**没有** LIMIT/OFFSET 回退，"
+                "断流即整体失败）"
+            )
+        else:
+            attempted = ""
         return (
-            "ClickHouse 数据流中途断开（已自动尝试 LIMIT/OFFSET 回退仍未成功）。"
+            f"ClickHouse 数据流中途断开{attempted}。"
             "可能原因：① 云上 LB / NAT / 反向代理空闲连接超时（最常见，~5 分钟切断）；"
             "② 跨境网络抖动；③ ClickHouse 服务端 OOM 或主动 abort 查询。"
             "已自动注入服务端心跳设置（send_progress_in_http_headers=1, "
-            "http_headers_progress_interval_ms=10000）；若仍失败，建议："
-            "① 减小单块天数（如 chunk_days=2~3）让单次查询时长 < 5 分钟；"
-            "② 简化 SQL（减少每行 CPU 消耗，如 decrypt/JSONExtract）；"
-            "③ 错峰重试；④ 联系 DBA 检查 ClickHouse 实例资源水位 / 调整云 LB 空闲超时。\n"
-            f"[技术细节] {raw}"
+            "http_headers_progress_interval_ms）；若仍失败，建议："
+            + _stream_error_advice(had_fallback, is_chunked)
+            + f"\n[技术细节] {raw}"
         )
     # Code 160 — 估算超时
     if "Code: 160" in raw or "ESTIMATED_EXECUTION_TIMEOUT_EXCEEDED" in raw:
+        if had_fallback is True:
+            attempted = "（已自动 LIMIT/OFFSET 回退仍未恢复）"
+        elif had_fallback is False:
+            attempted = "（当前输出格式无 LIMIT/OFFSET 回退）"
+        else:
+            attempted = ""
+        scope_advice = (
+            "① 减小单块天数；" if is_chunked
+            else "① 缩小 SQL 的时间范围，或改用「按日期分块」模式；"
+        )
         return (
-            "ClickHouse 估算查询执行时间超出 max_execution_time 限制（已自动 "
-            "LIMIT/OFFSET 回退仍未恢复）。建议：① 减小单块天数；② 在数据库层"
-            "增加索引/分区；③ 调高 EXPORT_QUERY_MAX_EXECUTION_TIME 环境变量。\n"
+            f"ClickHouse 估算查询执行时间超出 max_execution_time 限制{attempted}。"
+            f"建议：{scope_advice}② 在数据库层增加索引/分区；"
+            "③ 调高 EXPORT_QUERY_MAX_EXECUTION_TIME 环境变量。\n"
             f"[技术细节] {raw}"
         )
     if "Code: 202" in raw or "TOO_MANY_SIMULTANEOUS_QUERIES" in raw or "Too many simultaneous queries" in raw:
@@ -679,6 +801,318 @@ def _stream_sql_to_csv_file(
     raise RuntimeError("CSV stream export failed after retries")
 
 
+def _read_first_record(fp, start_offset: int) -> bytes:
+    """从 start_offset 起读出**第一条**完整 CSV 记录的字节（用于解析 CSV 表头）。
+
+    不能简单 readline()：表头的列名也可能被引号包裹并内含换行。
+    也不能读一块就取 `last_record_span` —— 一次 64KB 读入往往包含成百上千条记录，
+    那时 last_* 指向的是最后一条，会把数据行当成表头（v2.16 开发期实测踩过）。
+    所以用 `first_record_end` 精确定位第一条。
+    """
+    from backend.services.csv_tail import CsvRecordBoundaryScanner
+
+    saved = fp.tell()
+    try:
+        fp.flush()               # "w+b" 下读写交替，先把缓冲刷盘
+        fp.seek(start_offset)
+        scanner = CsvRecordBoundaryScanner(start_offset=start_offset)
+        buf = bytearray()
+        while True:
+            chunk = fp.read(65536)
+            if not chunk:
+                break
+            buf += chunk
+            scanner.feed(chunk)
+            if scanner.first_record_end is not None:
+                break
+        end = scanner.first_record_end
+        if end is None:
+            return b""
+        return bytes(buf[:end - start_offset])
+    finally:
+        fp.seek(saved)
+
+
+def _read_byte_span(fp, start: int, end: int) -> bytes:
+    """读取 [start, end) 区间字节，保持文件指针不变。"""
+    saved = fp.tell()
+    try:
+        fp.flush()               # 同上：读之前确保已写入的字节可见
+        fp.seek(start)
+        return fp.read(end - start)
+    finally:
+        fp.seek(saved)
+
+
+def _stream_sql_to_csv_file_keyset(
+    *,
+    job_id: str,
+    sql: str,
+    env: str,
+    conn_type: str,
+    csv_path: str,
+    query_id_prefix: str,
+    cursor_column: str,
+    window_rows: int,
+    on_cancel: Optional[Any] = None,
+    progress_label: Optional[str] = None,
+) -> Dict[str, Any]:
+    """CSV 导出的**可续传**路径（v2.16）：keyset 多窗口 + 窗口级断流续传。
+
+    与单流 `_stream_sql_to_csv_file` 的关键差别：
+      · 单流一个长查询，断流 → 整个文件作废重来（无回退能力）
+      · 本函数每个窗口是一个独立短查询
+        （`WHERE cursor > last ORDER BY cursor LIMIT N`），窗口内断流时：
+            ① 把文件 truncate 回**上一条完整记录**的边界（RFC4180 感知，
+               绝不留半条残记录）
+            ② 退避后用**同一个 last_cursor** 重发该窗口
+            ③ 已落盘的几 GB 一个字节都不丢
+
+    为什么不能"先单流、断流后再用 keyset 续"：
+      单流没有 ORDER BY，已落盘的行是任意子集而非「cursor ≤ X 的全部行」，
+      续传必然同时漏行和重复。数学上不成立，所以只有全程 keyset 一条路。
+      详见 ClickHouseExportClient.fetch_raw_keyset_window 的文档。
+
+    文件结构保证：
+      首窗口 `FORMAT CSVWithNames`（带表头），后续窗口 `FORMAT CSV`（无表头）
+      → 最终文件恰好一个 UTF-8 BOM + 一个表头。
+
+    行数统计免费：
+      RFC4180 扫描器本来就在数完整记录，所以不需要像单流路径那样回头再
+      `_count_csv_records()` 全文件重扫一遍。
+    """
+    from backend.config.settings import settings as app_settings
+    from backend.services.csv_tail import (
+        CsvRecordBoundaryScanner,
+        extract_cursor_from_record,
+        split_record_fields,
+    )
+    from backend.services.export_clients.clickhouse import (
+        KEYSET_FALLBACK_SINGLE_STREAM,
+        is_ch_too_many_queries_error,
+        is_transient_stream_error,
+        keyset_deadloop_message,
+        keyset_null_cursor_message,
+    )
+
+    export_settings = {"max_execution_time": app_settings.export_query_max_execution_time}
+    export_client = _build_export_client(env, conn_type)
+    sem = _get_export_query_semaphore(env)
+
+    retry_max = _env_int("EXPORT_CSV_KEYSET_RETRY_MAX", CSV_KEYSET_RETRY_MAX, min_value=0)
+    too_many_max = int(os.getenv("EXPORT_TOO_MANY_RETRY_MAX", "5"))
+    too_many_base = int(os.getenv("EXPORT_TOO_MANY_RETRY_BACKOFF", "10"))
+    cancel_check_every_bytes = (
+        _env_int("CSV_STREAM_CANCEL_CHECK_EVERY_MB", CSV_STREAM_CANCEL_CHECK_EVERY_MB)
+        * 1024 * 1024
+    )
+    progress_every_bytes = (
+        _env_int("CSV_STREAM_PROGRESS_EVERY_MB", CSV_STREAM_PROGRESS_EVERY_MB)
+        * 1024 * 1024
+    )
+
+    Path(csv_path).parent.mkdir(parents=True, exist_ok=True)
+
+    def _cancelled() -> bool:
+        return bool((on_cancel and on_cancel()) or _is_cancelling(job_id))
+
+    def _progress(window_idx: int, total_bytes: int, note: str = "") -> None:
+        if not progress_label:
+            return
+        _update_job(
+            job_id,
+            current_sheet=(
+                f"{progress_label} · 窗口 {window_idx + 1}"
+                f" · {total_bytes / 1024 / 1024:.1f} MB{note}"
+            ),
+        )
+
+    # "w+b"：需要回读（解析表头 / 取末行游标）+ truncate（截掉残记录）
+    with open(csv_path, "w+b") as fp:
+        fp.write(b"\xef\xbb\xbf")          # UTF-8 BOM，仅文件层，下游用 utf-8-sig 吞掉
+        body_start = fp.tell()
+        scanner = CsvRecordBoundaryScanner(start_offset=body_start)
+
+        cursor_idx: Optional[int] = None
+        last_cursor: Optional[str] = None
+        window_idx = 0
+        retry = 0
+        too_many_retry = 0
+
+        while True:
+            records_before = scanner.record_count
+            # 每个窗口开始前，文件必须正好停在记录边界上
+            assert fp.tell() == scanner.last_complete_end, (
+                f"窗口 {window_idx} 起点未对齐记录边界: "
+                f"tell={fp.tell()} boundary={scanner.last_complete_end}"
+            )
+            window_start = fp.tell()
+            scanner_snapshot = scanner.snapshot()
+            _progress(window_idx, window_start)
+
+            try:
+                with sem:
+                    last_cancel_check = window_start
+                    last_progress = window_start
+                    for chunk in export_client.fetch_raw_keyset_window(
+                        sql,
+                        cursor_column,
+                        last_cursor=last_cursor,
+                        window_rows=window_rows,
+                        extra_settings=export_settings,
+                        query_id_prefix=query_id_prefix,
+                        window_idx=window_idx,
+                    ):
+                        fp.write(chunk)
+                        scanner.feed(chunk)
+                        pos = fp.tell()
+                        if pos - last_cancel_check >= cancel_check_every_bytes:
+                            last_cancel_check = pos
+                            if _cancelled():
+                                # 截到最后一条完整记录，取消后的文件仍是合法 CSV
+                                fp.truncate(scanner.last_complete_end)
+                                return {
+                                    "exported_rows": max(0, scanner.record_count - 1),
+                                    "total_sheets": 0,
+                                    "done_batches": window_idx,
+                                    "total_sql_chunks": None,
+                                    "file_size": scanner.last_complete_end,
+                                    "cancelled": True,
+                                }
+                        if pos - last_progress >= progress_every_bytes:
+                            last_progress = pos
+                            _progress(window_idx, pos)
+            except Exception as exc:
+                is_too_many = is_ch_too_many_queries_error(exc)
+                is_transient = is_transient_stream_error(exc)
+                can_retry = (
+                    (is_too_many and too_many_retry < too_many_max)
+                    or (is_transient and retry < retry_max)
+                )
+                if not can_retry:
+                    raise
+
+                # ── 续传的核心三步 ──
+                # ① 截回窗口起点（= 上一条完整记录的边界），丢弃本窗口写入的
+                #    全部字节，包括任何半条残记录
+                fp.truncate(window_start)
+                fp.seek(window_start)
+                # ② 扫描器回滚到窗口起点，否则本窗口已计入的记录会重复累加
+                scanner.restore(scanner_snapshot)
+
+                if is_too_many:
+                    too_many_retry += 1
+                    sleep_s = min(60, too_many_base * too_many_retry)
+                    logger.warning(
+                        "[ExportJob %s] CSV keyset 窗口 %d 遇 ClickHouse 并发上限,"
+                        "%ds 后重发同一窗口 (attempt %d/%d)",
+                        job_id, window_idx, sleep_s, too_many_retry, too_many_max,
+                    )
+                else:
+                    retry += 1
+                    sleep_s = min(
+                        CSV_KEYSET_RETRY_BACKOFF_MAX,
+                        CSV_KEYSET_RETRY_BACKOFF_BASE * retry,
+                    )
+                    logger.warning(
+                        "[ExportJob %s] CSV keyset 窗口 %d 断流 (%s),已落盘 %.1f MB 保留,"
+                        "%ds 后从 cursor=%r 重发同一窗口 (attempt %d/%d)",
+                        job_id, window_idx, type(exc).__name__,
+                        window_start / 1024 / 1024, sleep_s, last_cursor,
+                        retry, retry_max,
+                    )
+                _progress(window_idx, window_start, note=f" · {sleep_s}s 后重试")
+                # ③ 退避（期间可取消）后重发**同一个**窗口（last_cursor 不变）
+                if _sleep_with_cancel_check_job(job_id, sleep_s, on_cancel):
+                    return {
+                        "exported_rows": max(0, scanner.record_count - 1),
+                        "total_sheets": 0,
+                        "done_batches": window_idx,
+                        "total_sql_chunks": None,
+                        "file_size": scanner.last_complete_end,
+                        "cancelled": True,
+                    }
+                continue
+
+            # ── 窗口正常读完 ──
+            rows_this_window = scanner.record_count - records_before
+            if window_idx == 0:
+                # 首窗口含表头，表头不算数据行
+                header_bytes = _read_first_record(fp, body_start)
+                header = split_record_fields(header_bytes)
+                bare = cursor_column.strip().strip("`").strip()
+                try:
+                    cursor_idx = header.index(bare)
+                except ValueError:
+                    raise RuntimeError(
+                        f"cursor_column {bare!r} 未在 CSV 表头({header!r})中找到 — "
+                        f"用户 SQL 可能 SELECT 了子集或把该列改名,无法用作 keyset 游标。"
+                        f"请填 SELECT 子句中的**别名**。"
+                    ) from None
+                rows_this_window = max(0, rows_this_window - 1)
+
+            if rows_this_window == 0:
+                # 本窗口无数据行 → 数据已耗尽，正常终止
+                break
+
+            span = scanner.last_record_span
+            new_cursor = (
+                extract_cursor_from_record(
+                    _read_byte_span(fp, span[0], span[1]), cursor_idx,
+                )
+                if span is not None and cursor_idx is not None
+                else None
+            )
+            # ClickHouse CSV 里 NULL 是字面量 \N（IDN 实测），必须当 NULL 处理，
+            # 否则会拿字符串 "\N" 去比较，静默产生错误窗口
+            if new_cursor is None or new_cursor == "\\N":
+                raise RuntimeError(
+                    keyset_null_cursor_message(
+                        cursor_column, window_idx=window_idx,
+                        fallback_hint=KEYSET_FALLBACK_SINGLE_STREAM,
+                    )
+                )
+            if last_cursor is not None and new_cursor == last_cursor:
+                raise RuntimeError(keyset_deadloop_message(cursor_column, new_cursor))
+
+            last_cursor = new_cursor
+            window_idx += 1
+            retry = 0
+            too_many_retry = 0
+
+            if rows_this_window < window_rows:
+                # 不足一整窗 → 后面没有更多行了，省掉一次空查询
+                break
+
+        total_rows = max(0, scanner.record_count - 1)   # 扣掉表头
+        file_size = scanner.last_complete_end
+        fp.truncate(file_size)
+
+    logger.info(
+        "[ExportJob %s] CSV keyset 导出完成: %d 行, %d 个窗口, %.1f MB (cursor=%s)",
+        job_id, total_rows, window_idx, file_size / 1024 / 1024, cursor_column,
+    )
+    return {
+        "exported_rows": total_rows,
+        "total_sheets": 0,
+        "done_batches": max(1, window_idx),
+        "total_sql_chunks": None,
+        "file_size": file_size,
+        "cancelled": False,
+    }
+
+
+def _sleep_with_cancel_check_job(
+    job_id: str, seconds: int, on_cancel: Optional[Any] = None,
+) -> bool:
+    """按秒睡眠，每秒检查一次取消；返回 True 表示被取消。"""
+    for _ in range(max(0, seconds)):
+        if (on_cancel and on_cancel()) or _is_cancelling(job_id):
+            return True
+        time.sleep(1)
+    return False
+
+
 def _run_csv_export(
     *,
     job_id: str,
@@ -689,33 +1123,51 @@ def _run_csv_export(
     output_format: str,
     query_id_prefix: str,
     on_cancel: Optional[Any] = None,
+    cursor_column: Optional[str] = None,
+    window_rows: int = DEFAULT_BATCH_SIZE,
+    progress_label: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """CSV / CSV ZIP 极速导出路径。"""
-    if output_format == "csv":
+    """CSV / CSV ZIP 导出路径。
+
+    路由（v2.16）：
+      cursor_column 有值 → keyset 多窗口，**断流可续传**（低 ClickHouse 压力，
+                            每窗口独立短查询，避开 LB ~5 分钟空闲切断）
+      cursor_column 为空 → 单流 stream_raw 极速，**断流即整体失败**（老行为）
+    """
+    def _dump(csv_target: str) -> Dict[str, Any]:
+        if cursor_column:
+            return _stream_sql_to_csv_file_keyset(
+                job_id=job_id,
+                sql=sql,
+                env=env,
+                conn_type=conn_type,
+                csv_path=csv_target,
+                query_id_prefix=query_id_prefix,
+                cursor_column=cursor_column,
+                window_rows=window_rows,
+                on_cancel=on_cancel,
+                progress_label=progress_label,
+            )
         return _stream_sql_to_csv_file(
             job_id=job_id,
             sql=sql,
             env=env,
             conn_type=conn_type,
-            csv_path=output_path,
+            csv_path=csv_target,
             query_id_prefix=query_id_prefix,
             on_cancel=on_cancel,
+            progress_label=progress_label,
         )
+
+    if output_format == "csv":
+        return _dump(output_path)
 
     # csv_zip:先落 CSV 临时文件，再 zip。避免把 zip 写入失败与 ClickHouse 查询耦合。
     tmp_dir = tempfile.mkdtemp(prefix=f"dataagent_export_{job_id}_")
     try:
         csv_name = Path(output_path).with_suffix(".csv").name
         tmp_csv = str(Path(tmp_dir) / csv_name)
-        result = _stream_sql_to_csv_file(
-            job_id=job_id,
-            sql=sql,
-            env=env,
-            conn_type=conn_type,
-            csv_path=tmp_csv,
-            query_id_prefix=query_id_prefix,
-            on_cancel=on_cancel,
-        )
+        result = _dump(tmp_csv)
         if result.get("cancelled"):
             return result
         file_size = _zip_single_file(tmp_csv, output_path, arcname=csv_name)
@@ -841,6 +1293,10 @@ def _run_single_export(
     query_id_prefix = query_id_prefix or f"dataagent_export:{job_id}"
 
     if output_format in {"csv", "csv_zip"}:
+        # v2.16: cursor_column 有值 → CSV 走 keyset 多窗口，断流可续传；
+        #        为空 → 单流极速（老行为，断流即整体失败）。
+        #        window_rows 复用 batch_size —— 这也让 batch_size 在 CSV+keyset 下
+        #        第一次真正生效（此前 CSV 路径完全不读它，是个死配置）。
         return _run_csv_export(
             job_id=job_id,
             sql=sql,
@@ -850,26 +1306,49 @@ def _run_single_export(
             output_format=output_format,
             query_id_prefix=query_id_prefix,
             on_cancel=on_cancel,
+            cursor_column=cursor_column,
+            window_rows=batch_size,
+            progress_label=(f"{chunk_label} - CSV" if chunk_label else "CSV"),
         )
 
     if output_format == "xlsx" and xlsx_engine == "csv_staging":
         tmp_dir = tempfile.mkdtemp(prefix=f"dataagent_xlsx_stage_{job_id}_")
         try:
             tmp_csv = str(Path(tmp_dir) / (Path(output_path).stem + ".csv"))
-            csv_result = _stream_sql_to_csv_file(
-                job_id=job_id,
-                sql=sql,
-                env=env,
-                conn_type=conn_type,
-                csv_path=tmp_csv,
-                query_id_prefix=f"{query_id_prefix}:stage",
-                on_cancel=on_cancel,
-                count_rows=False,
-                progress_label=(f"{chunk_label} - CSV??" if chunk_label else "CSV??"),
-            )
+            stage_label = f"{chunk_label} - CSV落盘" if chunk_label else "CSV落盘"
+            # v2.16: 落盘阶段也尊重游标列。
+            #   此前这里硬走单流 _stream_sql_to_csv_file，而 csv_staging 恰恰是
+            #   **分块 + XLSX 的默认引擎**（auto → csv_staging），于是「分块导 Excel」
+            #   这个主路径下游标列是死配置、断流也没有任何回退。
+            #   接上 keyset 后，落盘阶段获得与 CSV 导出同等的窗口级续传能力。
+            if cursor_column:
+                csv_result = _stream_sql_to_csv_file_keyset(
+                    job_id=job_id,
+                    sql=sql,
+                    env=env,
+                    conn_type=conn_type,
+                    csv_path=tmp_csv,
+                    query_id_prefix=f"{query_id_prefix}:stage",
+                    cursor_column=cursor_column,
+                    window_rows=batch_size,
+                    on_cancel=on_cancel,
+                    progress_label=stage_label,
+                )
+            else:
+                csv_result = _stream_sql_to_csv_file(
+                    job_id=job_id,
+                    sql=sql,
+                    env=env,
+                    conn_type=conn_type,
+                    csv_path=tmp_csv,
+                    query_id_prefix=f"{query_id_prefix}:stage",
+                    on_cancel=on_cancel,
+                    count_rows=False,
+                    progress_label=stage_label,
+                )
             if csv_result.get("cancelled"):
                 return csv_result
-            _update_job(job_id, current_sheet=(f"{chunk_label} - CSV?XLSX" if chunk_label else "CSV?XLSX"))
+            _update_job(job_id, current_sheet=(f"{chunk_label} - CSV→XLSX" if chunk_label else "CSV→XLSX"))
             return _csv_to_xlsx(
                 tmp_csv,
                 output_path,
@@ -1328,6 +1807,9 @@ def _run_single_job_sync(job_id: str, config: Dict[str, Any]) -> None:
     # v2.14.6: 单文件模式仅由 env var 控制(无 chunk_config 路径);chunked 模式还可
     # 从 chunk_config.prefer_chunked 单独覆盖。
     prefer_chunked = os.getenv("EXPORT_PREFER_CHUNKED", "0") == "1"
+    # v2.16: 单文件模式新增游标列 —— 此前只有分块模式有这个字段，导致
+    # 「千万行单文件 CSV」这个最容易被 5 分钟断流打死的场景完全无药可救。
+    cursor_column = (config.get("cursor_column") or "").strip() or None
 
     if not _mark_running(job_id):
         return
@@ -1337,7 +1819,10 @@ def _run_single_job_sync(job_id: str, config: Dict[str, Any]) -> None:
         client = _build_export_client(env, conn_type)
         client.get_columns(sql)
     except Exception as e:
-        msg = f"获取列信息失败: {_humanize_error(e)}"
+        msg = "获取列信息失败: " + _humanize_error(
+            e, output_format=output_format, xlsx_engine=xlsx_engine,
+            is_chunked=False,
+        )
         logger.error("[ExportJob %s] %s", job_id, msg)
         _mark_failed(job_id, msg)
         return
@@ -1353,6 +1838,7 @@ def _run_single_job_sync(job_id: str, config: Dict[str, Any]) -> None:
                     batch_size=batch_size, output_path=output_path,
                     output_format=output_format,
                     xlsx_engine=xlsx_engine,
+                    cursor_column=cursor_column,
                     query_id_prefix=f"dataagent_export:{job_id}:single:{attempt}",
                     prefer_chunked=prefer_chunked,
                 )
@@ -1373,7 +1859,10 @@ def _run_single_job_sync(job_id: str, config: Dict[str, Any]) -> None:
                     continue
                 raise
     except Exception as exc:
-        msg = f"导出执行失败：{_humanize_error(exc)}"
+        msg = "导出执行失败：" + _humanize_error(
+            exc, output_format=output_format, xlsx_engine=xlsx_engine,
+            is_chunked=False,
+        )
         logger.error("[ExportJob %s] %s", job_id, msg, exc_info=True)
         _mark_failed(job_id, msg)
         try:
@@ -1513,7 +2002,10 @@ def _run_chunked_export_sync(job_id: str, config: Dict[str, Any]) -> None:
         client = _build_export_client(env, conn_type)
         client.get_columns(first_sql)
     except Exception as e:
-        msg = f"获取列信息失败：{_humanize_error(e)}"
+        msg = "获取列信息失败：" + _humanize_error(
+            e, output_format=output_format, xlsx_engine=xlsx_engine,
+            is_chunked=True,
+        )
         logger.error("[ExportJob %s] %s", job_id, msg)
         _mark_failed(job_id, msg)
         return
@@ -1866,7 +2358,10 @@ def _run_chunked_export_sync(job_id: str, config: Dict[str, Any]) -> None:
 
             # 不可重试 / 不可再分 → 老行为是整 Job failed;v2.14.7 起默认改成
             # 「跳过这块继续做剩下」,job 终态在 while 退出后按计数判定 partial_failed/failed/completed。
-            err_msg = _humanize_error(exc)
+            err_msg = _humanize_error(
+                exc, output_format=output_format, xlsx_engine=xlsx_engine,
+                is_chunked=True,
+            )
             msg = (
                 f"块 {cur_idx + 1}/{len(output_files)} "
                 f"({chunk_start}~{chunk_end}) 执行失败：{err_msg}"
@@ -2198,7 +2693,10 @@ def _retry_failed_chunks_sync(job_id: str, batch_size: int) -> None:
                 job_id, entry["index"], entry["rows"],
             )
         except Exception as exc:
-            err_msg = _humanize_error(exc)
+            err_msg = _humanize_error(
+                exc, output_format=output_format, xlsx_engine=xlsx_engine,
+                is_chunked=True,
+            )
             entry["status"] = "failed"
             entry["error_summary"] = err_msg[:200]
             logger.warning(

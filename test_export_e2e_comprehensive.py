@@ -55,6 +55,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(1, os.path.join(os.path.dirname(__file__), "backend"))
 os.environ.setdefault("ENABLE_AUTH", "False")
 
+from test_utils import patch_ch_export_post  # noqa: E402
+
 _PREFIX = f"_t_e2ec_{uuid.uuid4().hex[:6]}_"
 
 
@@ -135,7 +137,7 @@ def _run_export(
 
     batch_call_count = [0]
 
-    def fake_stream_batches(sql, batch_size=50000, extra_settings=None):
+    def fake_stream_batches(sql, batch_size=50000, extra_settings=None, query_id_prefix=None):
         def _gen():
             if isinstance(stream_effect, Exception):
                 raise stream_effect
@@ -445,7 +447,7 @@ class TestCancelDuringChunked(unittest.TestCase):
 
         cancelling_set = [False]
 
-        def fake_stream_batches(sql, batch_size=50000, extra_settings=None):
+        def fake_stream_batches(sql, batch_size=50000, extra_settings=None, query_id_prefix=None):
             """第 1 批正常，yield 前将任务设为 cancelling，第 2 批检测到取消"""
             def _gen():
                 yield [(1, "x"), (2, "y")]
@@ -492,7 +494,7 @@ class TestSQLSafetyInChunkedWrappers(unittest.TestCase):
         client = self._make_client()
         emitted_sqls = []
 
-        def fake_stream_batches(sql, batch_size=50000, extra_settings=None):
+        def fake_stream_batches(sql, batch_size=50000, extra_settings=None, query_id_prefix=None):
             emitted_sqls.append(sql)
             return iter([])
 
@@ -521,7 +523,7 @@ class TestSQLSafetyInChunkedWrappers(unittest.TestCase):
         client = self._make_client()
         emitted_sqls = []
 
-        def fake_stream_batches(sql, batch_size=50000, extra_settings=None):
+        def fake_stream_batches(sql, batch_size=50000, extra_settings=None, query_id_prefix=None):
             emitted_sqls.append(sql)
             return iter([])
 
@@ -550,7 +552,7 @@ class TestSQLSafetyInChunkedWrappers(unittest.TestCase):
             captured_sqls.append(kwargs.get("data", b"").decode("utf-8"))
             return mock_resp
 
-        with patch("requests.post", side_effect=capture_post):
+        with patch_ch_export_post(side_effect=capture_post):
             result = client.count_rows("SELECT * FROM big_table;  ")
 
         self.assertEqual(result, 42)

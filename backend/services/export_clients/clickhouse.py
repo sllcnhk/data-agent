@@ -17,6 +17,7 @@ ClickHouse 导出客户端
 """
 import logging
 import os
+import re
 import socket
 import sys
 import uuid
@@ -202,6 +203,59 @@ def _build_default_streaming_settings() -> Dict[str, str]:
         ),
         "wait_end_of_query": "0",
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# keyset 分页的两个致命状态 — 报错文案（TSV 路径与 CSV 路径共用）
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 抽成模块级函数而不是各自内联：两条 keyset 路径
+# （stream_batches_keyset → xlsx；服务层 CSV keyset 续传）必须给出**同一套**
+# 可执行建议，否则用户在两种格式下遇到同一个问题会看到不同说法。
+
+#: 清空游标列后的回退目标 —— 两条 keyset 路径不同，必须各说各自的真话：
+#:   xlsx 路径 → 回退 LIMIT/OFFSET（可能少量重复/漏行）
+#:   CSV 路径  → 回退单流极速模式（无回退能力，断流即整体重来）
+KEYSET_FALLBACK_LIMIT_OFFSET = "回退 LIMIT/OFFSET(注意:可能有少量重复/漏行)"
+KEYSET_FALLBACK_SINGLE_STREAM = (
+    "回退单流极速模式(注意:该模式断流后无法续传,整个文件需重来)"
+)
+
+
+def keyset_null_cursor_message(
+    cursor_column: str,
+    *,
+    window_idx: Optional[int] = None,
+    fallback_hint: str = KEYSET_FALLBACK_LIMIT_OFFSET,
+) -> str:
+    """游标列在窗口末行为 NULL —— keyset 的致命状态。
+
+    ClickHouse 默认 `ORDER BY col ASC` 把 NULL 排在最后，于是窗口末行 cursor=NULL，
+    而 `WHERE cursor > NULL` 恒为 false → 永远推进不动，且 NULL 行必然漏掉。
+
+    Args:
+        fallback_hint: 「清空游标列会退回到什么」。调用方必须传自己路径的真实回退，
+                       不要让 xlsx 的用户以为 CSV 也会走 LIMIT/OFFSET。
+    """
+    where = f"窗口 {window_idx} " if window_idx is not None else ""
+    return (
+        f"keyset 分页失败:cursor 列 '{cursor_column}' 在{where}末行为 NULL 或无法解析。"
+        f"ClickHouse 默认 ORDER BY ASC 将 NULL 排到最后,导致 WHERE cursor > last "
+        f"无法继续推进。解决方案(任选其一):"
+        f"① SQL WHERE 加 `{cursor_column} IS NOT NULL` 显式过滤 NULL 行(确认数据丢弃可接受;"
+        f"先跑 SELECT count() FROM (your_sql) WHERE {cursor_column} IS NULL 看丢多少);"
+        f"② 换一个保证 NOT NULL 的列作 cursor(主键 / 时间戳 + 唯一 ID);"
+        f"③ 前端「游标列名」清空,{fallback_hint}。"
+    )
+
+
+def keyset_deadloop_message(cursor_column: str, value: Any) -> str:
+    """相邻两窗口的末行游标值相同 —— 说明推进不动，必须 fast-fail 而不是无限重发。"""
+    return (
+        f"keyset cursor 死循环(last==new=={value!r})"
+        f" — cursor_column {cursor_column!r} 可能含重复值,"
+        f"请改用主键列或时间戳+ID 复合列"
+    )
 
 
 def _parse_tsv_cell(raw: str):
@@ -551,22 +605,163 @@ class ClickHouseExportClient(BaseExportClient):
         extra_settings: Optional[Dict[str, Any]] = None,
         query_id_prefix: Optional[str] = None,
     ) -> Generator[bytes, None, None]:
-        """直接流式输出 ClickHouse FORMAT 原始字节，用于 CSV/Parquet 等极速导出路径。"""
-        stripped = sql.rstrip().rstrip(";")
-        stream_sql = f"{stripped} FORMAT {format_name}"
+        """直接流式输出 ClickHouse FORMAT 原始字节，用于 CSV/Parquet 等极速导出路径。
 
+        单流、无回退：断流即抛异常。需要「断流后基于已下载数据继续」的场景请用
+        `stream_raw_keyset`（要求调用方提供单调游标列）。
+        """
+        stripped = sql.rstrip().rstrip(";")
+        yield from self._stream_raw_request(
+            f"{stripped} FORMAT {format_name}",
+            chunk_bytes=chunk_bytes,
+            extra_settings=extra_settings,
+            query_id_prefix=query_id_prefix,
+            query_id_suffix=f"raw_{format_name.lower()}",
+        )
+
+    # ── keyset 游标列校验（stream_batches_keyset / stream_raw_keyset 共用） ──
+    _CURSOR_IDENT_RE = re.compile(r"^[A-Za-z_一-鿿][A-Za-z0-9_ 一-鿿]*$")
+
+    @classmethod
+    def _normalize_cursor_column(cls, cursor_column: str) -> Tuple[str, str]:
+        """校验并归一化游标列名，返回 (裸列名, 反引号包裹版)。
+
+        裸列名用于在 CSVWithNames / TSV 表头里 index() 定位；
+        反引号版用于拼 SQL（列名可能含空格 / 中文）。
+        列名本身禁止含反引号，否则可越出引号注入。
+        """
+        cleaned = cursor_column.strip().strip("`").strip()
+        if not cls._CURSOR_IDENT_RE.match(cleaned):
+            raise ValueError(
+                f"cursor_column 含非法字符(允许:字母/数字/下划线/空格/中文): {cursor_column!r}"
+            )
+        return cleaned, f"`{cleaned}`"
+
+    @staticmethod
+    def _build_keyset_window_sql(
+        stripped_sql: str,
+        cursor_quoted: str,
+        limit: int,
+        *,
+        first_window: bool,
+        format_clause: str = "",
+    ) -> str:
+        """构造单个 keyset 窗口 SQL。
+
+        首窗口无 WHERE；后续窗口用 `> {cursor_val:String}` 参数化推进（值走 HTTP
+        URL 参数 param_cursor_val，不做字符串拼接，杜绝注入）。
+        """
+        where = "" if first_window else f" WHERE {cursor_quoted} > {{cursor_val:String}}"
+        return (
+            f"SELECT * FROM ({stripped_sql}) AS _ks_q"
+            f"{where}"
+            f" ORDER BY {cursor_quoted}"
+            f" LIMIT {limit}"
+            f"{format_clause}"
+        )
+
+    def fetch_raw_keyset_window(
+        self,
+        sql: str,
+        cursor_column: str,
+        *,
+        last_cursor: Optional[str] = None,
+        window_rows: int = 50_000,
+        extra_settings: Optional[Dict[str, Any]] = None,
+        query_id_prefix: Optional[str] = None,
+        window_idx: int = 0,
+    ) -> Generator[bytes, None, None]:
+        """取**一个** keyset 窗口的原始 CSV 字节流（v2.16 CSV 可续传路径）。
+
+        与 `stream_batches_keyset` 的关系：
+            窗口 SQL、参数化方式、游标列校验完全同构（共用
+            `_normalize_cursor_column` / `_build_keyset_window_sql`），区别只在于本
+            方法直通 ClickHouse `FORMAT CSV*` 的原始字节（保住 stream_raw 的极速），
+            不把每个单元格解析成 Python 值。
+
+        为什么 CSV 必须全程 keyset 才能续传（不能"先单流、断流后再续"）：
+            单流 `SELECT ... FORMAT CSVWithNames` 没有 ORDER BY，ClickHouse 并行扫描
+            下输出顺序任意。断流时已落盘的 N 行只是任意子集，**不是**「cursor ≤ X 的
+            全部行」。此时用 `WHERE cursor > X` 续传会同时漏行（已落盘集合未覆盖、
+            cursor ≤ X 的行）和重复（已落盘集合里 cursor > X 的行）。只有全程
+            `ORDER BY cursor` + `WHERE cursor > last` 才保证窗口互斥连续、可续传。
+
+        性能前提（必须写进用户文档）：
+            每个窗口都带 `ORDER BY cursor`。游标列若是表 ORDER BY 键的前缀，
+            ClickHouse 走 read-in-order 几乎零成本；否则每窗口都要真排序，
+            压力可能比单流更大。
+
+        为什么把「一个窗口」而不是「整个循环」暴露给调用方：
+            窗口内断流后要重发**同一个**窗口，而「重发前该把文件截到哪里」「本窗口
+            末行的游标值是多少」只有持有落盘字节和 RFC4180 扫描器的服务层知道。
+            所以窗口推进、重试、截断、游标提取都由服务层 own，本方法只负责发一次
+            请求。
+
+        Args:
+            last_cursor: None → 首窗口（`FORMAT CSVWithNames`，带表头）；
+                         非 None → 后续窗口（`FORMAT CSV`，无表头），确保最终文件
+                         只有一个 BOM + 一个表头。
+            window_idx:  仅用于 query_id 命名，便于在 system.query_log 里对账。
+
+        Yields:
+            原始响应字节块。断流时抛异常，并对该窗口的 query_id 发起
+            best-effort `KILL QUERY`。
+        """
+        _cursor_bare, cursor_quoted = self._normalize_cursor_column(cursor_column)
+        stripped = sql.rstrip().rstrip(";")
+        first_window = last_cursor is None
+
+        fmt = "CSVWithNames" if first_window else "CSV"
+        window_sql = self._build_keyset_window_sql(
+            stripped, cursor_quoted, window_rows,
+            first_window=first_window,
+            format_clause=f" FORMAT {fmt}",
+        )
+        extra_url_params: Dict[str, str] = (
+            {} if first_window else {"param_cursor_val": last_cursor}
+        )
+
+        logger.debug(
+            "RawKeysetWindow idx=%d format=%s last_cursor=%s",
+            window_idx, fmt, last_cursor,
+        )
+
+        yield from self._stream_raw_request(
+            window_sql,
+            extra_settings=extra_settings,
+            extra_url_params=extra_url_params,
+            query_id_prefix=query_id_prefix,
+            query_id_suffix=f"raw_keyset_{window_idx}",
+        )
+
+    def _stream_raw_request(
+        self,
+        sql: str,
+        *,
+        chunk_bytes: int = 1024 * 1024,
+        extra_settings: Optional[Dict[str, Any]] = None,
+        extra_url_params: Optional[Dict[str, str]] = None,
+        query_id_prefix: Optional[str] = None,
+        query_id_suffix: str = "raw",
+    ) -> Generator[bytes, None, None]:
+        """发一次 HTTP 请求，逐块 yield 原始响应字节。
+
+        `stream_raw` 与 `stream_raw_keyset` 共用的底层；SQL 里已含 FORMAT 子句。
+        """
         params = self._base_params()
         params.update(_build_default_streaming_settings())
         if extra_settings:
             params.update(extra_settings)
-        query_id = self._make_query_id(query_id_prefix, f"raw_{format_name.lower()}")
+        if extra_url_params:
+            params.update(extra_url_params)
+        query_id = self._make_query_id(query_id_prefix, query_id_suffix)
         if query_id:
             params["query_id"] = query_id
 
         try:
             resp = _get_export_session().post(
                 self._base_url,
-                data=stream_sql.encode("utf-8"),
+                data=sql.encode("utf-8"),
                 params=params,
                 timeout=self.timeout,
                 stream=True,
@@ -589,6 +784,7 @@ class ClickHouseExportClient(BaseExportClient):
                 if chunk:
                     yield chunk
         except Exception:
+            # 断流时 best-effort 杀掉服务端残留查询，避免占满用户级并发上限
             if query_id:
                 self.kill_query(query_id)
             raise
@@ -698,38 +894,24 @@ class ClickHouseExportClient(BaseExportClient):
           extra_settings — 同 stream_batches.extra_settings
         """
         # 防御:cursor_column 仍校验一次(防被绕过)。
-        # 策略与 chunker 一致:strip 反引号 + 允许字母/数字/下划线/空格/中文,
-        # 拼接 SQL 时统一反引号包裹。
-        import re
-        cursor_column = cursor_column.strip().strip("`").strip()
-        if not re.match(r"^[A-Za-z_一-鿿][A-Za-z0-9_ 一-鿿]*$", cursor_column):
-            raise ValueError(
-                f"cursor_column 含非法字符(允许:字母/数字/下划线/空格/中文): {cursor_column!r}"
-            )
-        # 反引号包裹版本用于 SQL 拼接(防空格/中文列名解析失败);
-        # 裸字符串版本用于 col_names.index() 查找(TSV header 返回的列名不含反引号)
-        cursor_quoted = f"`{cursor_column}`"
+        # 与 stream_raw_keyset 共用 _normalize_cursor_column,保证两条 keyset 路径
+        # 的校验规则和引号包裹方式不会各自漂移。
+        #   裸列名   → col_names.index() 查找(TSV header 的列名不含反引号)
+        #   反引号版 → SQL 拼接(防空格/中文列名解析失败)
+        cursor_column, cursor_quoted = self._normalize_cursor_column(cursor_column)
 
         stripped = sql.rstrip().rstrip(";")
         last_cursor: Optional[str] = None
         window_idx = 0
 
         while True:
-            if last_cursor is None:
-                window_sql = (
-                    f"SELECT * FROM ({stripped}) AS _ks_q"
-                    f" ORDER BY {cursor_quoted}"
-                    f" LIMIT {batch_size}"
-                )
-                extra_params: Dict[str, str] = {}
-            else:
-                window_sql = (
-                    f"SELECT * FROM ({stripped}) AS _ks_q"
-                    f" WHERE {cursor_quoted} > {{cursor_val:String}}"
-                    f" ORDER BY {cursor_quoted}"
-                    f" LIMIT {batch_size}"
-                )
-                extra_params = {"param_cursor_val": last_cursor}
+            first_window = last_cursor is None
+            window_sql = self._build_keyset_window_sql(
+                stripped, cursor_quoted, batch_size, first_window=first_window,
+            )
+            extra_params: Dict[str, str] = (
+                {} if first_window else {"param_cursor_val": last_cursor}
+            )
 
             logger.debug(
                 "KeysetExtract window=%d cursor=%s",
@@ -775,19 +957,11 @@ class ClickHouseExportClient(BaseExportClient):
                 # NULL cursor 是 keyset 致命问题:WHERE cursor > NULL 永远 false,
                 # 推进不动 + 漏 NULL 行。给用户清晰可执行的建议。
                 raise RuntimeError(
-                    f"keyset 分页失败:cursor 列 '{cursor_column}' 在窗口末行为 NULL。"
-                    f"ClickHouse 默认 ORDER BY ASC 将 NULL 排到最后,导致 WHERE cursor > last "
-                    f"无法继续推进。解决方案(任选其一):"
-                    f"① SQL WHERE 加 `{cursor_column} IS NOT NULL` 显式过滤 NULL 行(确认数据丢弃可接受;"
-                    f"先跑 SELECT count() FROM (your_sql) WHERE {cursor_column} IS NULL 看丢多少);"
-                    f"② 换一个保证 NOT NULL 的列作 cursor(主键 / 时间戳 + 唯一 ID);"
-                    f"③ 前端「游标列名」清空,回退 LIMIT/OFFSET(注意:可能有少量重复/漏行)。"
+                    keyset_null_cursor_message(cursor_column, window_idx=window_idx)
                 )
             if last_cursor is not None and str(new_cursor) == str(last_cursor):
                 raise RuntimeError(
-                    f"keyset cursor 死循环(last==new=={new_cursor!r})"
-                    f" — cursor_column {cursor_column!r} 可能含重复值,"
-                    f"请改用主键列或时间戳+ID 复合列"
+                    keyset_deadloop_message(cursor_column, new_cursor)
                 )
             last_cursor = str(new_cursor)
             window_idx += 1

@@ -36,7 +36,7 @@ def _resolve_download_path(file_path: str, username: str) -> Path:
     - 禁止目录穿越（.. 等）
 
     Returns:
-        解���后的绝对路径
+        解析后的绝对路径
 
     Raises:
         HTTPException 403/404

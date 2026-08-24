@@ -441,6 +441,37 @@ def build_chunk_filename(
 # 4. 配置校验
 # ─────────────────────────────────────────────────────────────────────────────
 
+def validate_cursor_column(value) -> Optional[str]:
+    """校验并归一化游标列名，返回裸列名（或 None）。
+
+    规则（与 `ClickHouseExportClient._normalize_cursor_column` 保持一致）：
+      - 自动 strip 首尾空白与用户可能填的反引号
+      - 允许字母 / 数字 / 下划线 / 空格 / 中文；须以字母 / 下划线 / 中文起首
+      - **列名本身不能含反引号** —— 拼 SQL 时统一由系统加反引号包裹，
+        列名里的反引号会越出引号造成注入
+
+    v2.16 抽成公共函数：单文件模式（顶层 cursor_column）与分块模式
+    （chunk_config.cursor_column）两个入口必须用同一套规则，否则同一个概念
+    在两处有两套标准。
+
+    Raises:
+        ValueError: 类型错误或含非法字符
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("cursor_column 必须是字符串")
+    cleaned = value.strip().strip("`").strip() or None
+    if cleaned is None:
+        return None
+    if not _CURSOR_IDENT_RE.match(cleaned):
+        raise ValueError(
+            f"cursor_column 含非法字符(允许:字母/数字/下划线/空格/中文,"
+            f"不允许反引号本身;须以字母/下划线/中文起首): {cleaned!r}"
+        )
+    return cleaned
+
+
 def _parse_iso_date(value) -> date:
     """把 'YYYY-MM-DD' 字符串或 date 实例转为 date；其他类型/格式抛 ValueError"""
     if isinstance(value, date) and not isinstance(value, datetime):
@@ -535,17 +566,7 @@ def validate_chunk_config(raw: dict, sql: str) -> NormalizedChunkConfig:
     #   - 用户可填裸列名(`Call ID`)或带反引号(\`Call ID\`),自动 strip 反引号 + 首尾空白
     #   - 校验放宽到 _CURSOR_IDENT_RE(允许空格 + 中文 + 字母/数字/下划线)
     #   - 拼接 SQL 时统一加反引号(在 stream_batches_keyset 内),所以列名本身不能含反引号
-    cursor_column = raw.get("cursor_column") or None
-    if cursor_column is not None:
-        if not isinstance(cursor_column, str):
-            raise ValueError("cursor_column 必须是字符串")
-        # 自动剥用户可能填的反引号 + 首尾空白
-        cursor_column = cursor_column.strip().strip("`").strip() or None
-    if cursor_column is not None and not _CURSOR_IDENT_RE.match(cursor_column):
-        raise ValueError(
-            f"cursor_column 含非法字符(允许:字母/数字/下划线/空格/中文,"
-            f"不允许反引号本身;须以字母/下划线/中文起首): {cursor_column!r}"
-        )
+    cursor_column = validate_cursor_column(raw.get("cursor_column") or None)
 
     mode: InjectMode = "placeholder" if use_placeholder else "wrapper"
 

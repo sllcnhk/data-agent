@@ -53,6 +53,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(1, os.path.join(os.path.dirname(__file__), "backend"))
 os.environ.setdefault("ENABLE_AUTH", "False")
 
+from test_utils import patch_ch_export_post  # noqa: E402
+
 _PREFIX = f"_t_chk_{uuid.uuid4().hex[:6]}_"
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -112,7 +114,7 @@ class TestCountRows(unittest.TestCase):
         client = self._make_client()
         mock_resp = Mock(status_code=200, text="3901410\n")
 
-        with patch("requests.post", return_value=mock_resp) as mock_post:
+        with patch_ch_export_post(return_value=mock_resp) as mock_post:
             result = client.count_rows("SELECT * FROM t", timeout=60)
 
         self.assertEqual(result, 3901410, "B1 应返回 3901410")
@@ -132,7 +134,7 @@ class TestCountRows(unittest.TestCase):
         client = self._make_client()
         mock_resp = Mock(status_code=500, text="Code: 160, ...")
 
-        with patch("requests.post", return_value=mock_resp):
+        with patch_ch_export_post(return_value=mock_resp):
             with self.assertRaises(RuntimeError, msg="B2 应抛出 RuntimeError"):
                 client.count_rows("SELECT * FROM t")
 
@@ -141,7 +143,7 @@ class TestCountRows(unittest.TestCase):
         import requests as req_lib
         client = self._make_client()
 
-        with patch("requests.post", side_effect=req_lib.Timeout()):
+        with patch_ch_export_post(side_effect=req_lib.Timeout()):
             with self.assertRaises(TimeoutError, msg="B3 应抛出 TimeoutError"):
                 client.count_rows("SELECT * FROM t")
 
@@ -150,7 +152,7 @@ class TestCountRows(unittest.TestCase):
         import requests as req_lib
         client = self._make_client()
 
-        with patch("requests.post", side_effect=req_lib.ConnectionError()):
+        with patch_ch_export_post(side_effect=req_lib.ConnectionError()):
             with self.assertRaises(ConnectionError, msg="B4 应抛出 ConnectionError"):
                 client.count_rows("SELECT * FROM t")
 
@@ -189,7 +191,7 @@ class TestStreamBatchesExtraSettings(unittest.TestCase):
             captured_params.update(kwargs.get("params", {}))
             return mock_resp
 
-        with patch("requests.post", side_effect=capture):
+        with patch_ch_export_post(side_effect=capture):
             list(client.stream_batches(
                 "SELECT 1",
                 extra_settings={"max_execution_time": 300, "max_memory_usage": 10000000000},
@@ -204,7 +206,7 @@ class TestStreamBatchesExtraSettings(unittest.TestCase):
         mock_resp = self._mock_tsv_response([])
 
         captured_params = {}
-        with patch("requests.post", side_effect=lambda *a, **kw: (captured_params.update(kw.get("params", {})) or mock_resp)):
+        with patch_ch_export_post(side_effect=lambda *a, **kw: (captured_params.update(kw.get("params", {})) or mock_resp)):
             list(client.stream_batches("SELECT 1", extra_settings={"max_execution_time": 300}))
 
         self.assertIn("max_execution_time", captured_params)
@@ -215,7 +217,7 @@ class TestStreamBatchesExtraSettings(unittest.TestCase):
         client = self._make_client()
         mock_resp = self._mock_tsv_response([("x", 42)])
 
-        with patch("requests.post", return_value=mock_resp):
+        with patch_ch_export_post(return_value=mock_resp):
             batches = list(client.stream_batches("SELECT 1", extra_settings=None))
 
         self.assertEqual(len(batches), 1)
@@ -232,7 +234,7 @@ class TestStreamBatchesExtraSettings(unittest.TestCase):
         )
         mock_resp = Mock(status_code=500, content=code160_body.encode())
 
-        with patch("requests.post", return_value=mock_resp):
+        with patch_ch_export_post(return_value=mock_resp):
             with self.assertRaises(RuntimeError) as ctx:
                 list(client.stream_batches("SELECT * FROM huge_table"))
 
@@ -262,7 +264,7 @@ class TestStreamBatchesChunked(unittest.TestCase):
         client = self._make_client()
         emitted_sqls = []
 
-        def fake_stream_batches(sql, batch_size=50000, extra_settings=None):
+        def fake_stream_batches(sql, batch_size=50000, extra_settings=None, query_id_prefix=None):
             emitted_sqls.append(sql)
             # 返回空批次（只测窗口逻辑）
             return iter([])
@@ -280,7 +282,7 @@ class TestStreamBatchesChunked(unittest.TestCase):
         client = self._make_client()
         emitted_sqls = []
 
-        def fake_stream_batches(sql, batch_size=50000, extra_settings=None):
+        def fake_stream_batches(sql, batch_size=50000, extra_settings=None, query_id_prefix=None):
             emitted_sqls.append(sql)
             return iter([])
 
@@ -299,7 +301,7 @@ class TestStreamBatchesChunked(unittest.TestCase):
         # 模拟 5 行数据，chunk_size=2 → 3 个窗口
         all_data = [(i, f"v{i}") for i in range(5)]
 
-        def fake_stream_batches(sql, batch_size=50000, extra_settings=None):
+        def fake_stream_batches(sql, batch_size=50000, extra_settings=None, query_id_prefix=None):
             # 从 SQL 提取 LIMIT 和 OFFSET
             import re
             m = re.search(r"LIMIT (\d+) OFFSET (\d+)", sql)
@@ -337,7 +339,7 @@ class TestStreamBatchesChunked(unittest.TestCase):
         client = self._make_client()
         received_settings = []
 
-        def fake_stream_batches(sql, batch_size=50000, extra_settings=None):
+        def fake_stream_batches(sql, batch_size=50000, extra_settings=None, query_id_prefix=None):
             received_settings.append(extra_settings)
             return iter([])
 
@@ -416,7 +418,7 @@ class TestRunExportJobChunkedFallback(unittest.TestCase):
 
         call_idx = [0]
 
-        def fake_stream_batches(sql, batch_size=50000, extra_settings=None):
+        def fake_stream_batches(sql, batch_size=50000, extra_settings=None, query_id_prefix=None):
             idx = call_idx[0]
             call_idx[0] += 1
             effect = stream_side_effect[idx] if idx < len(stream_side_effect) else iter([])

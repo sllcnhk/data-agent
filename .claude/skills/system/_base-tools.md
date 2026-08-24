@@ -25,6 +25,12 @@ always_inject: true
 - **SELECT 加 LIMIT 保护**：首次查询数据时默认加 `LIMIT 100`，避免全表扫描
 - **禁止无 WHERE 的 DELETE/UPDATE**：必须有明确过滤条件，执行前向用户展示影响行数估计
 - **DDL 变更二次确认**：`CREATE TABLE` / `ALTER TABLE` / `DROP` 执行前明确向用户描述变更影响
+- **⚠ 明细表默认假设有重复数据**：`*_ods_*` / `*_dwd_*` / `*_record*` / `*_history` / `*_extend` 及任何 `ReplacingMergeTree` 表，未经本次会话实测验证前一律当作**可能有重复**。
+  出任何数字结论前必须三选一，不许跳过：
+  1. 先跑重复性探查并把结果告诉用户 —— `SELECT count() AS rows, uniqExact(<业务主键>) AS uniq_pk FROM <tbl> WHERE <单天条件>`；ReplacingMergeTree 再比一次 `count()` 与 `count() FINAL`
+  2. 用天然去重写法（`uniqExact` / `groupBitmap` / `argMax` 取最新 / `FINAL`），并在结论中写明去重口径
+  3. 无法验证时明确声明"此数未去重，可能偏高"，不得默默给出数字
+  常见重复来源：ReplacingMergeTree 未 merge 时不带 `FINAL` 会重复计数；ETL 并发跑批把同一天插两遍（HTTP 连接被 kill 后服务端 INSERT 仍继续）；同一业务 ID 在明细表有多条；JOIN 键不足导致扇出放大。拿不准就问用户，别猜。
 
 ## 3. 工具调用顺序
 

@@ -892,7 +892,7 @@ class AgenticLoop:
                     path_rule = ""
 
                 tools_info += (
-                    "\n\n文���操作规则（重要）：\n"
+                    "\n\n文件操作规则（重要）：\n"
                     "- 当用户要求将内容写入文件、保存文件、新建文件时，"
                     "必须调用 filesystem__write_file 工具，而不是在回复中直接输出文字。\n"
                     f"{path_rule}"

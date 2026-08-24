@@ -284,6 +284,27 @@ def _cleanup_test_data(label: str = ""):
         except Exception as exc:
             print(f"\n[conftest] ExportJob cleanup skipped (non-fatal): {exc}")
 
+        try:
+            import os as _os
+            from backend.models.merge_excel_job import MergeExcelJob
+            test_merge_jobs = [
+                j for j in db.query(MergeExcelJob).all()
+                if _is_test_entity(j.username)
+            ]
+            for j in test_merge_jobs:
+                # 同时删除磁盘上的合并结果文件
+                if j.file_path:
+                    try:
+                        _os.unlink(j.file_path)
+                    except OSError:
+                        pass
+                db.delete(j)
+            if test_merge_jobs:
+                tag = f"[{label}] " if label else ""
+                print(f"\n[conftest] {tag}Cleanup: deleted {len(test_merge_jobs)} merge excel job(s).")
+        except Exception as exc:
+            print(f"\n[conftest] MergeExcelJob cleanup skipped (non-fatal): {exc}")
+
         test_users = [
             u for u in db.query(User).all()
             if u.username not in _PROTECTED_USERS and _is_test_entity(u.username)
