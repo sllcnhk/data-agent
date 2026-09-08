@@ -324,6 +324,9 @@ superadmin 专属功能：将 Excel 文件（`.xlsx`/`.xls`）直接导入到 Cl
 | Excel 上传端点 | `data_import.py:POST /data-import/upload` | 文件类型检查（.xlsx/.xls）；1MB 分块流式写盘（上限 100MB，超限返回 413）；openpyxl 预览解析在线程池中运行（`run_in_executor`，避免阻塞事件循环）；返回 `upload_id` + Sheet 预览（前 5 行 + `max_row` O(1) 行数估算） |
 | 执行导入端点 | `data_import.py:POST /data-import/execute` | 创建 `ImportJob` DB 记录（status=pending）；`asyncio.create_task(run_import_job(...))` 后台启动；立即返回 `job_id` |
 | `run_import_job` 后台协程 | `backend/services/data_import_service.py` | 逐 Sheet 分批读取 Excel（openpyxl read_only+data_only）；`insert_tsv()` TabSeparated 格式插入 ClickHouse（3-5x 性能提升 vs VALUES 字符串）；每 10 批写一次 DB 进度；每批检查 `cancelling` 状态实现协作式取消；abort-on-first-failure 策略 |
+| TOO_MANY 退避重试（v2.17.1） | `data_import_service.py:_insert_with_retry()` | 复用导出侧 `is_ch_too_many_queries_error`；**仅** ClickHouse `Code: 202 TOO_MANY_SIMULTANEOUS_QUERIES` 固定间隔退避重试（`IMPORT_TOO_MANY_RETRY_MAX` 默认 5 次 / `IMPORT_TOO_MANY_RETRY_BACKOFF` 默认 15 秒，不递增），其他错误（含超时/连接错误）立即终止任务；重试记录以 `level: "warning"` 追加进 `import_jobs.errors` 并立即落库供前端展示 |
+| 批插入超时可配（v2.17.1） | `data_import_service.py:DEFAULT_INSERT_TIMEOUT` + `_build_ch_client(env, timeout=)` | 批插入 HTTP 超时由 60s 放宽到 **180s**（`IMPORT_INSERT_TIMEOUT` 覆盖）；`_build_ch_client` 新增 `timeout` 参数，默认仍 60 → schema 查询（连接/库/表列表）路径行为不变 |
+| batch_size 1000 → 5000（v2.17.1） | `frontend/src/pages/DataImport.tsx:119` | 前端写死值由 1000 改为 5000（UI 仍不可调）；同一文件的 INSERT 次数降 5 倍 → 撞 `Code: 202` 的机会同比降 5 倍。后端 `ExecuteImportRequest.batch_size` 校验范围 100–50000 未变 |
 | 任务状态端点 | `data_import.py:GET /data-import/jobs/{job_id}` | 前端轮询进度（sheet/row/batch 三层进度条） |
 | 历史任务列表端点 | `data_import.py:GET /data-import/jobs` | 分页（page/page_size），按 created_at 倒序 |
 | 取消任务端点 | `data_import.py:POST /data-import/jobs/{job_id}/cancel` | 将 pending/running 任务状态置为 cancelling；后台协程下一批次检测后干净退出；已完成/失败任务返回 400 |
@@ -338,6 +341,10 @@ superadmin 专属功能：将 Excel 文件（`.xlsx`/`.xls`）直接导入到 Cl
 **性能说明**：`insert_tsv` 格式下每批 5000 行的 HTTP 往返次数是 VALUES 格式的 1/5，60MB Excel（~50 万行）预计导入时间约 3-10 分钟，取决于 ClickHouse 写入延迟和网络带宽。
 
 **协作式取消设计**：取消信号通过 DB 状态字段（`cancelling`）传递（而非 asyncio.Event），确保跨进程/重启场景下也能正确检测。每个 Sheet 开始前 + 每批次完成后各检查一次，最大响应延迟 = 一批写入时间（通常 < 2 秒）。
+
+**TOO_MANY 退避重试设计（已完成，v2.17.1，2026-09-08）**：目标 CH 并发被占满时（常见于与导出任务共用同一 env），`Code: 202` 由 CH 准入控制在**查询注册阶段**抛出，服务端尚未写入任何数据块 → 失败批次 0 行入库，重发同一批天然安全（openpyxl 行迭代器不回退，游标停在原地，等价于断点续传）。因此**只对该错误码重试**：超时（`TimeoutError`）与连接错误刻意不重试，客户端超时只是单方面放弃等待、服务端可能正在成功写入，重发会产生无法事后察觉的重复行。退避用 `await asyncio.sleep(1)` 按秒切片（与 FastAPI 共用 event loop，禁止 `time.sleep` 阻塞整个后端），每秒检查一次 `cancelling`，取消最多 1 秒生效而非等满 `RETRY_MAX × RETRY_BACKOFF`（默认 75 秒）。重试期间 `done_batches` 不动，故 warning 必须立即写库，否则用户无法分辨「正在退避」和「卡死」；最终失败消息附带「已重试 N 次仍失败」+ 断点信息（已入库行数 / 未入库批次）。环境变量参考见 [`DEPLOYMENT.md §9`](DEPLOYMENT.md) 「可选：数据导入并发重试与插入超时」与 `USER_GUIDE.md §12.5`。
+
+**批大小 5000 与超时 180s 的耦合权衡（v2.17.1，2026-09-08）**：这两项必须一起看。把 `batch_size` 从 1000 提到 5000 是为了把 INSERT 次数降 5 倍、从源头减少撞 `Code: 202` 的机会；但代价是单批 body 变大——含长文本列时（`call_record_imported` 的 `Call Record Text Detail Masked` 对话详情）可达约 **20 MB**。THAI 环境实测 19.62 MB 单批插入**典型 6.3 秒、最差 19.8 秒**（跨公网抖动，双峰分布），已吃掉原 60 秒超时的 33%，余量偏薄。而超时抛出的 `TimeoutError` 正是**唯一不可重试**的错误码，一次假超时 = 任务 failed 且无法自愈。因此批大小提升必须同步放宽 `IMPORT_INSERT_TIMEOUT`（60 → 180），否则等于把「可自愈的 202」换成了「不可自愈的超时」，净收益为负。`_build_ch_client` 的 `timeout` 参数默认保持 60，只有批插入路径显式传 180，避免 schema 查询（库/表列表）超时被无谓拉长。
 
 ---
 
@@ -424,6 +431,76 @@ superadmin 专属功能（可动态授予其他角色）：执行任意 SQL 查�
 **输出目录布局**：分块模式下 Job 输出到 `customer_data/{username}/exports/{job_name}_{ts}/{job_name}_{YYYYMMDD}_to_{YYYYMMDD}.xlsx`；单文件模式不变。
 
 **chunk_days 范围**：1-90 天（Pydantic + chunker 双层校验）。覆盖日/周/旬/月级别常见场景。
+
+### 小工具 · 合并 CSV 文件（已完成，v2.17.0，2026-08-24）
+
+把多个字段相同的 CSV 按文件名排序拼成一个文件，表头只保留一份。典型来源是数据导出的
+`date_chunked` 按日产物。设计与测试计划见 [MERGE_CSV_PLAN.md](MERGE_CSV_PLAN.md)。
+
+**核心手法：numpy 引号奇偶扫描**
+
+RFC4180 的 `""` 转义是**两个**引号、不改变奇偶性，因此「截至字节 i 的引号累计数为奇数
+⟺ 字节 i 在引号内」恒成立。于是 `np.bitwise_xor.accumulate(bytes == 0x22)` 一次向量化
+运算就得到引号内外状态，**记录数 = 引号外 `\n` 的个数**，跨 chunk 只需携带 1 bit。
+
+- **实测 200 MB/s**，且与字节拷贝同一遍完成 → 精确行数**实质免费**
+- 对比 [`csv_tail.py`](../backend/services/csv_tail.py) 的 Python 逐字节循环（5–15 MB/s）快 20–50 倍。
+  该模块**保持原样不动**（CSV keyset 续传仍在用）
+- 白捡三个副产品：表头边界定位、**尾部引号未闭合 → 截断/仍在写入检测**、字段内换行条数诊断
+- **已知限制**：奇偶模型无法区分「`""` 转义」与「先闭合再重开」（这正是它计数正确的原因），
+  故对畸形 CSV（引号出现在非引号字段中间）计数会与 Python `csv` 模块的宽容解读分歧。
+  用 `locate_header()` 里的 **csv 模块精确交叉校验**硬挡唯一有真实损坏风险的路径（表头边界错位）
+
+**四个并列的选文件入口**（共用一个已选清单，可混合来源）
+
+| 入口 | 端点 | 说明 |
+|---|---|---|
+| ① 导出任务 | `GET /tools/merge-csv/export-jobs` | 从 `export_jobs.output_files` 取分块，顺序/完整性/行数三者均为权威来源 |
+| ② 目录 | `GET /tools/merge-csv/dirs` | 列 `customer_data/{username}/` 下含 CSV 的目录 |
+| ③ 手工选择 | `GET /tools/merge-csv/files` | 按 glob 过滤；**只列 `.csv`**，忽略 `.zip` |
+| ④ 本地上传 | `POST /tools/merge-csv/upload` | 上限 **1 GB**，落到 `uploads/{upload_id}/{原文件名}/` |
+
+**双向行数对账**：`export_jobs.output_files[].rows` 是导出侧自报的数据行数，与本工具的
+RFC4180 扫描是两条完全独立的计数路径。合并完成后自动比对，`matched` / `mismatched`
+（附逐文件差异）/ `unavailable`。真实验证：84 文件 4.57 GiB，导出侧 5,329,303 行 =
+合并 5,329,303 行，23.5 s。
+
+**校验管线**（提交时 V1–V10 / 运行时 R1–R9，详见计划文档 §4）
+
+- 表头文字不一致 **默认阻断**（比 Excel 工具更严）—— 列顺序变了按位置合并会静默串列
+- 口径是**编码一致性**而非「必须 UTF-8」：全 GBK 可放行（附推测不可当真的 warning）；
+  混合阻断；UTF-16/32 硬阻断（该编码下 `\n` 是 `0A 00`，字节级边界判定不成立）
+- 三层「仍在写入」防护：`export_jobs` 反查非终态 → 阻断；**锚定 size**（只读提交时记录的
+  字节数）；运行时引号闭合检测
+- 磁盘空间预检 ×1.1；**自然排序**为默认（对定长日期名与字典排序逐字节一致，同时修掉
+  `part1/part10/part2` 静默错序）
+
+**取消语义**：chunk 边界即时响应，`truncate` 回**上一个文件边界** → 结果 100% 是有效 CSV；
+取消保留、失败删除；`last_merged_file` 明确告知合并到哪个文件为止（续传起点）。
+
+**结果取回**：本地部署下主路径是**显示绝对路径 + 复制**（零拷贝）；下载走原生 `<a href>`
+流式落盘，**刻意不用 blob**（几十 GB 会打爆标签页）。
+
+| 层 | 文件 |
+|---|---|
+| 纯逻辑核心 | [`backend/services/csv_merge_core.py`](../backend/services/csv_merge_core.py) |
+| 服务层 | [`backend/services/csv_merge_service.py`](../backend/services/csv_merge_service.py) |
+| API | [`backend/api/tools_merge_csv.py`](../backend/api/tools_merge_csv.py) |
+| Model | [`backend/models/merge_csv_job.py`](../backend/models/merge_csv_job.py) |
+| 迁移 | `backend/scripts/migrate_merge_csv.py` |
+| 前端 | `frontend/src/pages/tools/MergeCsv.tsx` + `services/mergeCsvApi.ts` |
+| 权限 | `tools:merge_csv`（superadmin 专属） |
+| 测试 | `test_merge_csv.py` — **169 passed**（A–M 段） |
+
+**实现中发现并修掉的 4 个问题**（含 1 个既有 bug 未修）
+
+| # | 问题 | 处理 |
+|---|---|---|
+| 1 | 用了 `asyncio.to_thread`（Python 3.9+），本环境是 **3.8.20** | 换成 `run_in_executor` + `functools.partial` |
+| 2 | 误用 `export_jobs.chunk_files`，实际字段是 **`output_files`** | 修正；实测形状写进 docstring |
+| 3 | 上传文件存成 `{uuid}.csv` → 排序变成**按 UUID 随机排序**，直接违背核心需求 | 改存 `uploads/{upload_id}/{原文件名}`；回归用例 K10b 故意倒序上传验证 |
+| 4 | 首文件表头也喂进扫描器再减 1 → `physical_lines - rows`（「字段内换行」诊断）**恒定虚高 1**，假阳性 | 改为**表头只写不扫**，对多行表头也精确；回归 F9b/F9c |
+| — | **既有 bug，未修**：合并 Excel 工具同样把上传文件存成 `{upload_id}{suffix}` 并按该名排序（[tools_merge_excel.py:143](../backend/api/tools_merge_excel.py#L143)），上传的 Excel 也是按 UUID 排序 | 不在本次范围，已记录 |
 
 #### 数据导出提示修正 + CSV keyset 续传 + 独立操作手册（v2.16.0，2026-08-24）
 

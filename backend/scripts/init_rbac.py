@@ -44,6 +44,7 @@ PERMISSIONS = [
     ("data",            "import",       "Excel 数据导入 ClickHouse"),
     ("data",            "export",       "SQL 结果导出为 Excel"),
     ("tools",           "merge_excel",  "合并Excel文件工具"),
+    ("tools",           "merge_csv",    "合并CSV文件工具"),
     ("reports",         "read",         "查看/列出图表报告"),
     ("reports",         "create",       "生成图表报告"),
     ("reports",         "delete",       "删除图表报告"),

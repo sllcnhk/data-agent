@@ -15,6 +15,7 @@ import Roles from './pages/Roles';
 import DataImport from './pages/DataImport';
 import DataExport from './pages/DataExport';
 import MergeExcel from './pages/tools/MergeExcel';
+import MergeCsv from './pages/tools/MergeCsv';
 import Reports from './pages/Reports';
 import DataCenterLayout from './components/DataCenterLayout';
 import DataCenterDashboards from './pages/DataCenterDashboards';
@@ -107,6 +108,7 @@ function App() {
                   <Route path="/data-import" element={<DataImport />} />
                   <Route path="/data-export" element={<DataExport />} />
                   <Route path="/tools/merge-excel" element={<MergeExcel />} />
+                  <Route path="/tools/merge-csv" element={<MergeCsv />} />
                   <Route path="/reports" element={<Reports />} />
                 </Routes>
               </Content>

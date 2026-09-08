@@ -115,7 +115,8 @@ const DataImportPage: React.FC = () => {
   const [fileList, setFileList] = useState<UploadFile[]>([]);
 
   // ── Step 3: 配置 ─────────────────────────────────────────────────────────────
-  const [batchSize] = useState(1000);
+  // 固定批大小（UI 不可调）；后端默认 5000，允许范围 100~50000
+  const batchSize = 5000;
 
   // ── Step 4: 执行/进度 ────────────────────────────────────────────────────────
   const [executing, setExecuting] = useState(false);
@@ -344,24 +345,50 @@ const DataImportPage: React.FC = () => {
     },
     {
       title: '错误',
-      width: 60,
-      render: (_: any, r: ImportJobStatus) =>
-        r.errors?.length ? (
+      width: 90,
+      render: (_: any, r: ImportJobStatus) => {
+        const entries = r.errors ?? [];
+        if (entries.length === 0) return null;
+        // level 缺省 / 'error' 均按真失败处理；只有显式 'warning' 才算重试警告
+        const warnings = entries.filter((e) => e.level === 'warning');
+        const errors = entries.filter((e) => e.level !== 'warning');
+        return (
           <Popover
-            title="错误详情"
+            title="错误与重试详情"
             content={
               <div style={{ maxWidth: 400, maxHeight: 200, overflow: 'auto' }}>
-                {r.errors.map((e, i) => (
-                  <div key={i} style={{ marginBottom: 4 }}>
-                    <Text type="danger">[{e.sheet} 批次{e.batch}]</Text> {e.message}
+                {errors.length > 0 && (
+                  <div style={{ marginBottom: warnings.length > 0 ? 8 : 0 }}>
+                    <Text strong type="danger">失败 {errors.length} 批</Text>
+                    {errors.map((e, i) => (
+                      <div key={`err-${i}`} style={{ marginBottom: 4 }}>
+                        <Text type="danger">[{e.sheet} 批次{e.batch}]</Text> {e.message}
+                      </div>
+                    ))}
                   </div>
-                ))}
+                )}
+                {warnings.length > 0 && (
+                  <div>
+                    <Text strong type="warning">重试警告 {warnings.length} 次（任务仍在继续，不代表数据丢失）</Text>
+                    {warnings.map((e, i) => (
+                      <div key={`warn-${i}`} style={{ marginBottom: 4 }}>
+                        <Text type="warning">[{e.sheet} 批次{e.batch}]</Text> {e.message}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             }
           >
-            <Badge count={r.errors.length} style={{ cursor: 'pointer' }} />
+            <Space size={4} style={{ cursor: 'pointer' }}>
+              {errors.length > 0 && <Badge count={errors.length} title={`失败 ${errors.length} 批`} />}
+              {warnings.length > 0 && (
+                <Badge count={warnings.length} color="orange" title={`重试警告 ${warnings.length} 次`} />
+              )}
+            </Space>
           </Popover>
-        ) : null,
+        );
+      },
     },
     {
       title: '操作',

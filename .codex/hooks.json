@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "D:/ProgramData/Anaconda3/envs/dataagent/python.exe c:/Users/shiguangping/data-agent/backend/scripts/cleanup_test_data.py"
+          }
+        ]
+      }
+    ]
+  }
+}

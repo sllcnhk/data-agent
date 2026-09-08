@@ -34,6 +34,7 @@ from backend.models.export_job import ExportJob
 
 # 小工具模块
 from backend.models.merge_excel_job import MergeExcelJob
+from backend.models.merge_csv_job import MergeCsvJob
 
 # Report模块
 from backend.models.report import (
@@ -68,6 +69,7 @@ __all__ = [
 
     # 小工具
     "MergeExcelJob",
+    "MergeCsvJob",
 
     # Report
     "Report",

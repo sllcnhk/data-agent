@@ -831,6 +831,36 @@ EXPORT_INPLACE_RETRY_MAX=1                # 单块失败后原位重试次数,�
 
 > v2.14 提供两个 opt-in 用户配置(`chunk_config.min_subdivide_unit` + `chunk_config.cursor_column`),通过前端 Modal 由用户按导出任务设置,**无环境变量等价物**(因为是 per-job 决策,非全局)。详见 USER_GUIDE.md 13.7.8 节。
 
+### 可选：数据导入并发重试与插入超时（Excel → ClickHouse，v2.17.1）
+
+导入任务分批 `INSERT` 时，若目标 ClickHouse 已被其他查询占满并发额度，会收到
+`Code: 202 TOO_MANY_SIMULTANEOUS_QUERIES`。该错误由 CH 准入控制在查询注册阶段抛出，
+此时服务端尚未开始写入数据块，失败批次 0 行入库，重发同一批不会产生重复行。
+
+```ini
+# ── 导入分批插入的 TOO_MANY 退避重试 ───────────────────────────
+IMPORT_TOO_MANY_RETRY_MAX=5                # Code 202 最大重试次数，默认 5；0=禁用重试，遇 202 立即失败
+IMPORT_TOO_MANY_RETRY_BACKOFF=15           # 每次重试前等待秒数（固定值，不递增），默认 15
+
+# ── 导入分批插入的 HTTP 超时 ───────────────────────────────────
+IMPORT_INSERT_TIMEOUT=180                  # 批插入 HTTP 超时（秒），默认 180；schema 查询类操作仍固定 60s
+```
+
+- **仅** `Code: 202` 触发重试，其他错误（含超时与连接错误）立即终止任务：客户端超时时服务端可能仍在成功写入，重发会产生无法事后察觉的重复行
+- 单批最长阻塞 = `IMPORT_TOO_MANY_RETRY_MAX × IMPORT_TOO_MANY_RETRY_BACKOFF`（默认 75 秒）；等待期间**每秒**检查一次任务是否被取消，取消最多 1 秒生效
+- 每次重试都以 `level: "warning"` 追加到 `import_jobs.errors` 并立即落库，前端轮询即可看到「正在退避重试」而非误判卡死
+- 目标 CH 并发压力大时（例如与导出任务共用同一 env）可上调重试次数或退避秒数；参见 `EXPORT_MAX_CONCURRENT_QUERIES_PER_ENV` 对导出侧的并发闸门
+
+**`IMPORT_INSERT_TIMEOUT` 为什么从 60 放宽到 180（关键权衡）**：v2.17.1 同时把导入批大小
+从 1000 提到 5000。含长文本列时（如 `call_record_imported` 的 `Call Record Text Detail
+Masked` 对话详情）单批 body 可达约 **20 MB**；THAI 环境实测 19.62 MB 单批插入**典型 6.3 秒、
+最差 19.8 秒**（跨公网抖动，双峰分布），已占原 60 秒超时的 33%，余量偏薄。而超时抛出的是
+`TimeoutError`，恰恰是**唯一不能重试**的错误——客户端放弃等待时服务端可能已写入成功，重发
+会产生无法事后察觉的重复行，因此一次**假超时**会让任务直接失败且无法自愈。放宽到 180 秒是
+为了避免批大小提升把「可自愈的 202」转化成「不可自愈的超时」。跨境链路更差或单行文本更长时
+可继续上调；只影响批插入路径，`_build_ch_client(env)` 默认值 60 秒不变，schema 查询（库表
+列表）行为不受影响。
+
 ### 可选：CORS
 
 ```ini

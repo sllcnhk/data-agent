@@ -200,6 +200,7 @@ from api import agents, skills, conversations, llm_configs, mcp, groups, approva
 from api.users import roles_router, permissions_router
 from api import scheduled_reports
 from api import tools_merge_excel
+from api import tools_merge_csv
 
 
 # 健康检查端点
@@ -233,6 +234,7 @@ app.include_router(data_export.router, prefix="/api/v1")
 app.include_router(reports.router, prefix="/api/v1")
 app.include_router(scheduled_reports.router, prefix="/api/v1")
 app.include_router(tools_merge_excel.router, prefix="/api/v1")
+app.include_router(tools_merge_csv.router, prefix="/api/v1")
 
 
 # 全局异常处理器

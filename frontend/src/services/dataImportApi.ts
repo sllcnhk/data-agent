@@ -87,7 +87,13 @@ export interface ImportJobStatus {
   total_batches: number;
   done_batches: number;
   error_message: string | null;
-  errors: Array<{ sheet: string; batch: number; message: string }>;
+  /**
+   * 导入过程日志条目。
+   * `level` 为可选字段：
+   *   - 'warning' → 重试警告（任务仍在继续，最终可能成功）
+   *   - 'error' / 缺省 → 真失败（历史数据无此字段，一律按 error 处理）
+   */
+  errors: Array<{ sheet: string; batch: number; message: string; level?: 'warning' | 'error' }>;
   created_at: string | null;
   started_at: string | null;
   finished_at: string | null;

@@ -53,6 +53,7 @@ const ALL_MENU_ITEMS: MenuItem[] = [
     key: '/tools', icon: <AppstoreOutlined />, label: '小工具',
     children: [
       { key: '/tools/merge-excel', icon: <MergeCellsOutlined />, label: '合并Excel文件', perm: 'tools:merge_excel' },
+      { key: '/tools/merge-csv', icon: <MergeCellsOutlined />, label: '合并CSV文件', perm: 'tools:merge_csv' },
     ],
   },
   { key: '/logs',        icon: <FileTextOutlined />,      label: '日志查看' },

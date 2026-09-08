@@ -15,6 +15,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# 复用导出侧已在生产验证过的 Code 202 判错逻辑（三种报错写法都覆盖），
+# 不另写一套。该模块只依赖 stdlib + requests，无循环导入风险。
+from backend.services.export_clients.clickhouse import is_ch_too_many_queries_error
+
 logger = logging.getLogger(__name__)
 
 # 每批默认行数（TabSeparated 格式下 5000 行仍是小请求，HTTP 往返次数少 5 倍）
@@ -23,6 +27,34 @@ DEFAULT_BATCH_SIZE = 5000
 MAX_FILE_SIZE = 100 * 1024 * 1024
 # 预览行数
 PREVIEW_ROWS = 5
+
+# ClickHouse Code 202 (TOO_MANY_SIMULTANEOUS_QUERIES) 退避重试默认值。
+# 该错误由 CH 的准入控制在查询注册阶段抛出，此时服务端尚未开始写入数据块，
+# 因此失败批次 0 行入库，重发同一批是安全的（不会产生重复行）。
+# 可用 IMPORT_TOO_MANY_RETRY_MAX / IMPORT_TOO_MANY_RETRY_BACKOFF 覆盖。
+DEFAULT_TOO_MANY_RETRY_MAX = 5
+DEFAULT_TOO_MANY_RETRY_BACKOFF = 15
+
+# 导入批插入的 HTTP 超时（秒）。查询类操作仍用 60s。
+# 理由：batch_size 提到 5000 后，含长文本列（如 call_record 的对话详情）的单批
+# body 可达 ~20 MB。THAI 实测（2026-09-08，19.62 MB）典型 6.3s、最差 19.8s，
+# 跨公网抖动明显，60s 余量偏薄。而超时抛出的是 TimeoutError —— 这是唯一**不能**
+# 重试的错误（客户端放弃等待时服务端可能已写入成功，重发会产生无法察觉的重复
+# 行），因此一次假超时会直接让任务失败且无法自愈。放宽到 180s 换取余量。
+DEFAULT_INSERT_TIMEOUT = 180
+
+
+class _ImportCancelled(Exception):
+    """内部信号：重试等待期间收到取消请求，需按 cancelled 而非 failed 收尾。"""
+
+
+class _BatchInsertFailed(Exception):
+    """一批插入最终失败，携带原始异常与已重试次数，便于写入断点信息。"""
+
+    def __init__(self, cause: BaseException, attempts: int) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.attempts = attempts
 
 # ─────────────────────────────────────────────────────────────────────────────
 # call_record_imported 常量
@@ -136,8 +168,13 @@ def transform_call_record_batch(
 # 辅助：构建 ClickHouseHTTPClient
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _build_ch_client(env: str):
-    """根据 env 构建 ClickHouseHTTPClient（admin 级别）"""
+def _build_ch_client(env: str, timeout: int = 60):
+    """
+    根据 env 构建 ClickHouseHTTPClient（admin 级别）。
+
+    timeout 默认 60s 适用于 schema 查询；批插入请传更大的值
+    （见 DEFAULT_INSERT_TIMEOUT 的说明）。
+    """
     from backend.config.settings import settings
     from backend.mcp.clickhouse.http_client import ClickHouseHTTPClient
 
@@ -148,7 +185,7 @@ def _build_ch_client(env: str):
         user=cfg["user"],
         password=cfg["password"],
         database=cfg["database"],
-        timeout=60,
+        timeout=timeout,
     )
 
 
@@ -277,6 +314,18 @@ def parse_excel_preview(file_path: str) -> List[Dict[str, Any]]:
 # 4. 核心导入逻辑
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _env_int(name: str, default: int) -> int:
+    """读取整数型环境变量，缺失或非法时回退默认值。"""
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(str(raw).strip())
+    except ValueError:
+        logger.warning("环境变量 %s=%r 不是整数，回退默认值 %d", name, raw, default)
+        return default
+
+
 def _rows_to_values_clause(rows: List[Tuple]) -> str:
     """将行列表转换为 INSERT VALUES 子句"""
     def _fmt(v) -> str:
@@ -326,6 +375,10 @@ async def run_import_job(job_id: str, config: Dict[str, Any]) -> None:
     batch_size = config.get("batch_size", DEFAULT_BATCH_SIZE)
     sheet_configs = [s for s in config["sheets"] if s.get("enabled", True)]
 
+    # 每次运行时读取，便于运维改 env 后重启即生效、也便于测试注入
+    retry_max = max(0, _env_int("IMPORT_TOO_MANY_RETRY_MAX", DEFAULT_TOO_MANY_RETRY_MAX))
+    retry_backoff = max(0, _env_int("IMPORT_TOO_MANY_RETRY_BACKOFF", DEFAULT_TOO_MANY_RETRY_BACKOFF))
+
     def _get_job(db) -> Optional[ImportJob]:
         return db.query(ImportJob).filter(ImportJob.id == job_id).first()
 
@@ -354,7 +407,9 @@ async def run_import_job(job_id: str, config: Dict[str, Any]) -> None:
     finally:
         db.close()
 
-    client = _build_ch_client(env)
+    client = _build_ch_client(
+        env, timeout=_env_int("IMPORT_INSERT_TIMEOUT", DEFAULT_INSERT_TIMEOUT)
+    )
     errors: List[Dict] = []
     total_imported = 0
     total_batches_all = 0
@@ -408,6 +463,57 @@ async def run_import_job(job_id: str, config: Dict[str, Any]) -> None:
         finally:
             db.close()
 
+    def _fail_job(err_msg: str) -> None:
+        """按 abort 策略把任务标记为 failed 并落盘当前进度与错误列表。"""
+        db = SessionLocal()
+        try:
+            j = _get_job(db)
+            if j:
+                j.status = "failed"
+                j.error_message = err_msg
+                j.errors = list(errors)
+                j.imported_rows = total_imported
+                j.done_batches = done_batches_all
+                j.finished_at = datetime.utcnow()
+                _save(db, j)
+        finally:
+            db.close()
+
+    def _persist_errors() -> None:
+        """仅落盘 errors 与进度（任务仍在运行，不改 status）。
+
+        重试期间会原地停留 retry_max × retry_backoff 秒，前端轮询到的
+        done_batches 一动不动。必须把 warning 立刻写库，否则用户分辨不出
+        「正在退避重试」和「真的卡死」。
+        """
+        db = SessionLocal()
+        try:
+            j = _get_job(db)
+            if j:
+                j.errors = list(errors)
+                j.imported_rows = total_imported
+                j.done_batches = done_batches_all
+                _save(db, j)
+        finally:
+            db.close()
+
+    def _batch_fail_message(
+        sheet: str, batch_num: int, batch_len: int, exc: BaseException
+    ) -> str:
+        """构造带断点信息的失败消息，让用户一眼知道已入库多少、要清理多少。"""
+        attempts = getattr(exc, "attempts", 0)
+        cause = getattr(exc, "cause", exc)
+        retried = f"（已重试 {attempts} 次仍失败）" if attempts else ""
+        if batch_num > 1:
+            done_desc = f"当前 Sheet '{sheet}' 第 1~{batch_num - 1} 批已入库"
+        else:
+            done_desc = f"当前 Sheet '{sheet}' 尚无批次入库"
+        return (
+            f"Sheet '{sheet}' 第 {batch_num} 批插入失败{retried}: {cause}\n"
+            f"断点信息：本任务已成功导入 {total_imported} 行（{done_desc}），"
+            f"第 {batch_num} 批的 {batch_len} 行未入库。重导前需清理已入库的数据。"
+        )
+
     for sc in sheet_configs:
         if abort_flag:
             break
@@ -448,6 +554,60 @@ async def run_import_job(job_id: str, config: Dict[str, Any]) -> None:
             else:
                 client.insert_tsv(database, table, batch)
 
+        async def _insert_with_retry(batch: List[Tuple], batch_num: int) -> int:
+            """
+            插入一批数据；**仅**对 ClickHouse Code 202
+            (TOO_MANY_SIMULTANEOUS_QUERIES) 做固定间隔退避重试。
+
+            重发的是同一批同一份数据，openpyxl 行迭代器不回退，游标停在原地，
+            因此天然是断点续传：已成功的批次不会重发，失败的批次不会跳过。
+
+            超时（TimeoutError）与连接错误（ConnectionError）**刻意不重试**：
+            客户端超时只是单方面放弃等待，服务端可能正在成功写入，重发会产生
+            无法事后察觉的重复行。
+
+            Returns:
+                实际重试次数（0 表示首次即成功）
+            Raises:
+                _ImportCancelled:   重试等待期间任务被请求取消
+                _BatchInsertFailed: 非 202 错误，或 202 但重试次数已用尽
+            """
+            attempt = 0
+            while True:
+                try:
+                    _do_insert(batch)
+                    return attempt
+                except Exception as exc:
+                    if not is_ch_too_many_queries_error(exc) or attempt >= retry_max:
+                        raise _BatchInsertFailed(exc, attempt)
+
+                    attempt += 1
+                    logger.warning(
+                        "[ImportJob %s] Sheet '%s' 第 %d 批遇 ClickHouse 并发上限，"
+                        "%ds 后重试 (%d/%d): %s",
+                        job_id, sheet_name, batch_num, retry_backoff,
+                        attempt, retry_max, exc,
+                    )
+                    errors.append({
+                        "sheet": sheet_name,
+                        "batch": batch_num,
+                        "level": "warning",
+                        "message": (
+                            f"ClickHouse 并发上限，{retry_backoff}s 后重试 "
+                            f"({attempt}/{retry_max}): {exc}"
+                        ),
+                    })
+                    _persist_errors()
+
+                    # 必须 await asyncio.sleep 而非 time.sleep：本协程与 FastAPI
+                    # 共用 event loop，阻塞式 sleep 会冻住整个后端。
+                    # 按秒切片是为了让「取消」最多 1 秒生效，而不是等满
+                    # retry_max × retry_backoff 秒。
+                    for _ in range(retry_backoff):
+                        await asyncio.sleep(1)
+                        if _is_cancelling():
+                            raise _ImportCancelled()
+
         try:
             wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
             ws = wb[sheet_name]
@@ -471,32 +631,35 @@ async def run_import_job(job_id: str, config: Dict[str, Any]) -> None:
                 if len(batch_rows) >= batch_size:
                     sheet_batch_num += 1
                     try:
-                        _do_insert(batch_rows)
+                        await _insert_with_retry(batch_rows, sheet_batch_num)
                         sheet_imported += len(batch_rows)
                         total_imported += len(batch_rows)
                         done_batches_all += 1
+                    except _ImportCancelled:
+                        # 重试等待期间被取消：按 cancelled 收尾，不是 failed
+                        logger.info(
+                            "[ImportJob %s] Cancelled during retry wait, sheet '%s' "
+                            "batch %d, after %d rows.",
+                            job_id, sheet_name, sheet_batch_num, sheet_imported,
+                        )
+                        _row_iter.close()
+                        wb.close()
+                        _mark_cancelled()
+                        return
                     except Exception as e:
-                        err_msg = f"Sheet '{sheet_name}' 第 {sheet_batch_num} 批插入失败: {e}"
+                        err_msg = _batch_fail_message(
+                            sheet_name, sheet_batch_num, len(batch_rows), e
+                        )
                         logger.error("[ImportJob %s] %s", job_id, err_msg)
                         errors.append({
                             "sheet": sheet_name,
                             "batch": sheet_batch_num,
-                            "message": str(e),
+                            "level": "error",
+                            "message": str(getattr(e, "cause", e)),
                         })
                         abort_flag = True
                         # abort 策略：立即终止
-                        db = SessionLocal()
-                        try:
-                            job = _get_job(db)
-                            job.status = "failed"
-                            job.error_message = err_msg
-                            job.errors = errors
-                            job.imported_rows = total_imported
-                            job.done_batches = done_batches_all
-                            job.finished_at = datetime.utcnow()
-                            _save(db, job)
-                        finally:
-                            db.close()
+                        _fail_job(err_msg)
                         _row_iter.close()  # 显式关闭生成器，释放 Windows 文件锁
                         wb.close()
                         break
@@ -533,49 +696,55 @@ async def run_import_job(job_id: str, config: Dict[str, Any]) -> None:
             if batch_rows:
                 sheet_batch_num += 1
                 try:
-                    _do_insert(batch_rows)
+                    await _insert_with_retry(batch_rows, sheet_batch_num)
                     sheet_imported += len(batch_rows)
                     total_imported += len(batch_rows)
                     done_batches_all += 1
+                except _ImportCancelled:
+                    logger.info(
+                        "[ImportJob %s] Cancelled during retry wait, sheet '%s' "
+                        "tail batch %d, after %d rows.",
+                        job_id, sheet_name, sheet_batch_num, sheet_imported,
+                    )
+                    wb.close()
+                    _mark_cancelled()
+                    return
                 except Exception as e:
-                    err_msg = f"Sheet '{sheet_name}' 第 {sheet_batch_num} 批插入失败: {e}"
+                    err_msg = _batch_fail_message(
+                        sheet_name, sheet_batch_num, len(batch_rows), e
+                    )
                     logger.error("[ImportJob %s] %s", job_id, err_msg)
-                    errors.append({"sheet": sheet_name, "batch": sheet_batch_num, "message": str(e)})
+                    errors.append({
+                        "sheet": sheet_name,
+                        "batch": sheet_batch_num,
+                        "level": "error",
+                        "message": str(getattr(e, "cause", e)),
+                    })
                     abort_flag = True
-                    db = SessionLocal()
-                    try:
-                        job = _get_job(db)
-                        job.status = "failed"
-                        job.error_message = err_msg
-                        job.errors = errors
-                        job.imported_rows = total_imported
-                        job.done_batches = done_batches_all
-                        job.finished_at = datetime.utcnow()
-                        _save(db, job)
-                    finally:
-                        db.close()
+                    _fail_job(err_msg)
                     wb.close()
                     break
 
             wb.close()
 
+        except _ImportCancelled:
+            # 兜底：两处批次调用点已各自处理，此分支正常不会命中，
+            # 但必须在 except Exception 之前，避免取消被误报成「解析失败」
+            logger.info("[ImportJob %s] Cancelled during retry wait (sheet '%s').",
+                        job_id, sheet_name)
+            _mark_cancelled()
+            return
         except Exception as e:
             err_msg = f"Sheet '{sheet_name}' 解析失败: {e}"
             logger.error("[ImportJob %s] %s", job_id, err_msg)
-            errors.append({"sheet": sheet_name, "batch": 0, "message": str(e)})
+            errors.append({
+                "sheet": sheet_name,
+                "batch": 0,
+                "level": "error",
+                "message": str(e),
+            })
             abort_flag = True
-            db = SessionLocal()
-            try:
-                job = _get_job(db)
-                job.status = "failed"
-                job.error_message = err_msg
-                job.errors = errors
-                job.imported_rows = total_imported
-                job.done_batches = done_batches_all
-                job.finished_at = datetime.utcnow()
-                _save(db, job)
-            finally:
-                db.close()
+            _fail_job(err_msg)
             break
 
         if not abort_flag:
